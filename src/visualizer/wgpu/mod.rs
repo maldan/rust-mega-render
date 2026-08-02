@@ -541,37 +541,21 @@ impl WgpuVisualizer {
         self.post_fx.resize(&self.device, w, h);
         true
     }
-}
 
-impl Visualizer for WgpuVisualizer {
-    fn sync(&mut self, scene: &Scene) {
-        let mut live = HashMap::new();
-        for (h, mesh) in scene.meshes.iter() {
-            let key = h.key();
-            live.insert(key, ());
-            if self.meshes.get(&key).map(|g| g.synced) != Some(mesh.version) {
-                self.meshes.insert(key, upload_mesh(&self.device, mesh));
-            }
-        }
-        self.meshes.retain(|k, _| live.contains_key(k));
-
-        live.clear();
-        for (h, tex) in scene.textures.iter() {
-            let key = h.key();
-            live.insert(key, ());
-            if self.textures.get(&key).map(|g| g.synced) != Some(tex.version) {
-                self.textures
-                    .insert(key, upload_texture(&self.device, &self.queue, tex));
-            }
-        }
-        self.textures.retain(|k, _| live.contains_key(k));
+    /// Render into an external color target (e.g. swapchain).
+    ///
+    /// `color` must be `Rgba8UnormSrgb` (same as the mesh pipeline).
+    /// Depth / post intermediates still use the internal targets from `ensure_target`.
+    pub fn render_to(&mut self, scene: &Scene, aspect: f32, color: &wgpu::TextureView) {
+        self.render_inner(scene, aspect, Some(color));
     }
 
-    fn post_process(&mut self) -> &mut PostProcessSettings {
-        &mut self.post
-    }
-
-    fn render(&mut self, scene: &Scene, aspect: f32) {
+    fn render_inner(
+        &mut self,
+        scene: &Scene,
+        aspect: f32,
+        external: Option<&wgpu::TextureView>,
+    ) {
         let shadow_dir = scene
             .shadow_directional()
             .map(|d| d.direction.normalize_or_zero());
@@ -759,6 +743,8 @@ impl Visualizer for WgpuVisualizer {
         {
             let scene_color_view = if use_post {
                 &self.scene_color_view
+            } else if let Some(ext) = external {
+                ext
             } else {
                 &self.target_view
             };
@@ -862,7 +848,7 @@ impl Visualizer for WgpuVisualizer {
             );
         }
 
-        // Post: scene_color → SSAO / Bloom → target
+        // Post: scene_color → SSAO / Bloom → output
         if use_post {
             let proj = glam::camera::lh::proj::directx::perspective(
                 scene.camera.fov_y,
@@ -870,6 +856,7 @@ impl Visualizer for WgpuVisualizer {
                 scene.camera.near,
                 scene.camera.far,
             );
+            let post_dst = external.unwrap_or(&self.target_view);
             self.post_fx.apply(
                 &self.device,
                 &self.queue,
@@ -877,13 +864,46 @@ impl Visualizer for WgpuVisualizer {
                 &self.post,
                 &self.scene_color_view,
                 &self.depth_view,
-                &self.target_view,
+                post_dst,
                 proj,
                 self.size,
             );
         }
 
         self.queue.submit(Some(encoder.finish()));
+    }
+}
+
+impl Visualizer for WgpuVisualizer {
+    fn sync(&mut self, scene: &Scene) {
+        let mut live = HashMap::new();
+        for (h, mesh) in scene.meshes.iter() {
+            let key = h.key();
+            live.insert(key, ());
+            if self.meshes.get(&key).map(|g| g.synced) != Some(mesh.version) {
+                self.meshes.insert(key, upload_mesh(&self.device, mesh));
+            }
+        }
+        self.meshes.retain(|k, _| live.contains_key(k));
+
+        live.clear();
+        for (h, tex) in scene.textures.iter() {
+            let key = h.key();
+            live.insert(key, ());
+            if self.textures.get(&key).map(|g| g.synced) != Some(tex.version) {
+                self.textures
+                    .insert(key, upload_texture(&self.device, &self.queue, tex));
+            }
+        }
+        self.textures.retain(|k, _| live.contains_key(k));
+    }
+
+    fn post_process(&mut self) -> &mut PostProcessSettings {
+        &mut self.post
+    }
+
+    fn render(&mut self, scene: &Scene, aspect: f32) {
+        self.render_inner(scene, aspect, None);
     }
 }
 
