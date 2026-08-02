@@ -1,0 +1,11 @@
+[package]
+name = "mega-render"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wgpu = "30"
+glam = "0.33.2"
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25.10", default-features = false, features = ["webp", "png", "jpeg"] }
+gltf = { version = "1.4", features = ["import", "utils"] }
