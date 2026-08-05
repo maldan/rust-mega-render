@@ -1,13 +1,40 @@
+use super::scene::PendingLoad;
+use super::store::Store;
 use super::{
     AnimChannel, AnimPath, AnimValues, AnimationClip, Animator, Handle, Material, Mesh, Node,
     Scene, Skin, Texture, Transform,
 };
 use glam::{Mat4, Quat, Vec3};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::mpsc;
+use std::thread;
 
 const FLIP_Z: Mat4 = Mat4::from_cols_array(&[
     1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
 ]);
+
+impl Scene {
+    /// Spawn background glTF load; result is merged on `poll_loads`.
+    pub fn load_gltf_async(
+        &mut self,
+        path: impl AsRef<Path>,
+        parent: Option<Handle<Node>>,
+        on_ready: impl FnOnce(&mut Scene, Handle<Node>) + Send + 'static,
+    ) {
+        let path = path.as_ref().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut tmp = Scene::new();
+            let _ = tx.send(load_gltf(&mut tmp, &path, None).map(|root| (tmp, root)));
+        });
+        self.pending_loads.push(PendingLoad::Gltf {
+            rx,
+            parent,
+            on_ready: Box::new(on_ready),
+        });
+    }
+}
 
 /// Load glTF/GLB into the scene under `parent`. Returns the import root node.
 pub fn load_gltf(
@@ -190,6 +217,130 @@ pub fn load_gltf(
 
     fit_root(scene, root, 2.0);
     Ok(root)
+}
+
+/// Merge a temp scene (from background `load_gltf`) into `dst`.
+pub(crate) fn absorb_gltf(
+    dst: &mut Scene,
+    mut src: Scene,
+    src_root: Handle<Node>,
+    parent: Option<Handle<Node>>,
+) -> Handle<Node> {
+    let mut tex_map = HashMap::new();
+    for (h, tex) in take_all(&mut src.textures) {
+        tex_map.insert(h.key(), dst.textures.insert(tex));
+    }
+
+    let mut mat_map = HashMap::new();
+    for (h, mut mat) in take_all(&mut src.materials) {
+        mat.albedo_map = mat.albedo_map.and_then(|t| tex_map.get(&t.key()).copied());
+        mat.normal_map = mat.normal_map.and_then(|t| tex_map.get(&t.key()).copied());
+        mat.metallic_roughness_map = mat
+            .metallic_roughness_map
+            .and_then(|t| tex_map.get(&t.key()).copied());
+        mat_map.insert(h.key(), dst.materials.insert(mat));
+    }
+
+    let mut mesh_map = HashMap::new();
+    for (h, mesh) in take_all(&mut src.meshes) {
+        mesh_map.insert(h.key(), dst.meshes.insert(mesh));
+    }
+
+    let src_nodes = take_all(&mut src.nodes);
+    let mut node_map = HashMap::new();
+    for (h, _) in &src_nodes {
+        node_map.insert(
+            h.key(),
+            dst.nodes.insert(Node {
+                name: String::new(),
+                parent: None,
+                local: Transform::default(),
+                mesh: None,
+                material: None,
+                skin: None,
+                visible: true,
+            }),
+        );
+    }
+
+    let mut pending_skins = Vec::new();
+    for (h, n) in src_nodes {
+        let Some(&new_h) = node_map.get(&h.key()) else {
+            continue;
+        };
+        let new_parent = if h.key() == src_root.key() {
+            parent
+        } else {
+            n.parent.and_then(|p| node_map.get(&p.key()).copied())
+        };
+        if let Some(skin) = n.skin {
+            pending_skins.push((new_h, skin));
+        }
+        if let Some(node) = dst.nodes.get_mut(new_h) {
+            *node = Node {
+                name: n.name,
+                parent: new_parent,
+                local: n.local,
+                mesh: n.mesh.and_then(|m| mesh_map.get(&m.key()).copied()),
+                material: n.material.and_then(|m| mat_map.get(&m.key()).copied()),
+                skin: None,
+                visible: n.visible,
+            };
+        }
+    }
+
+    let mut skin_map = HashMap::new();
+    for (h, skin) in take_all(&mut src.skins) {
+        let joints: Vec<_> = skin
+            .joints
+            .iter()
+            .filter_map(|j| node_map.get(&j.key()).copied())
+            .collect();
+        skin_map.insert(
+            h.key(),
+            dst.skins.insert(Skin {
+                joints,
+                inverse_bind: skin.inverse_bind,
+            }),
+        );
+    }
+    for (new_h, old_skin) in pending_skins {
+        if let Some(node) = dst.nodes.get_mut(new_h) {
+            node.skin = skin_map.get(&old_skin.key()).copied();
+        }
+    }
+
+    let mut anim_map = HashMap::new();
+    for (h, mut clip) in take_all(&mut src.animations) {
+        for ch in &mut clip.channels {
+            if let Some(&t) = node_map.get(&ch.target.key()) {
+                ch.target = t;
+            }
+        }
+        anim_map.insert(h.key(), dst.animations.insert(clip));
+    }
+    for anim in src.animators.drain(..) {
+        let Some(&clip) = anim_map.get(&anim.clip.key()) else {
+            continue;
+        };
+        dst.animators.push(Animator {
+            clip,
+            time: anim.time,
+            speed: anim.speed,
+            playing: anim.playing,
+            looping: anim.looping,
+        });
+    }
+
+    *node_map.get(&src_root.key()).expect("gltf root")
+}
+
+fn take_all<T>(store: &mut Store<T>) -> Vec<(Handle<T>, T)> {
+    let handles: Vec<_> = store.iter().map(|(h, _)| h).collect();
+    handles
+        .into_iter()
+        .filter_map(|h| store.remove(h).map(|v| (h, v)))
+        .collect()
 }
 
 fn clip_has_motion(channels: &[AnimChannel]) -> bool {

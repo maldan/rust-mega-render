@@ -12,7 +12,8 @@ mod framework;
 use framework::{Demo, Host};
 use glam::Vec3;
 use mega_render::{
-    cube, plane, sphere, Light, Material, Node, PointLight, Scene, Transform,
+    cube, plane, sphere, Light, Material, Node, PointLight, Scene, Transform, Visualizer,
+    WgpuVisualizer,
 };
 
 fn build_demo_scene() -> Scene {
@@ -127,6 +128,28 @@ impl Demo for MaterialDemo {
 
     fn build_scene() -> Scene {
         build_demo_scene()
+    }
+
+    fn configure(visualizer: &mut WgpuVisualizer) {
+        let post = visualizer.post_process();
+        // Subtle polish — enough to look nicer, not "filter overload".
+        post.ssao.enabled = true;
+        post.ssao.radius = 0.7;
+        post.ssao.intensity = 0.45;
+        post.bloom.enabled = true;
+        post.bloom.threshold = 1.2;
+        post.bloom.intensity = 0.2;
+        post.tonemap.enabled = true;
+        post.tonemap.aces = true;
+        // ACES fitted curve is dark without exposure lift.
+        post.tonemap.exposure = 1.6;
+        post.color_grade.enabled = false;
+        post.vignette.enabled = true;
+        post.vignette.intensity = 0.15;
+        post.vignette.smoothness = 0.7;
+        post.grain.enabled = false;
+        post.fxaa.enabled = true;
+        post.fog.enabled = false;
     }
 
     fn update(scene: &mut Scene, _dt: f32) -> bool {

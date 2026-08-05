@@ -9,6 +9,15 @@ use super::skin::Skin;
 use super::store::{Handle, Store};
 use super::texture::Texture;
 use glam::{Mat4, Vec3};
+use std::sync::mpsc::{Receiver, TryRecvError};
+
+pub(crate) enum PendingLoad {
+    Gltf {
+        rx: Receiver<Result<(Scene, Handle<Node>), String>>,
+        parent: Option<Handle<Node>>,
+        on_ready: Box<dyn FnOnce(&mut Scene, Handle<Node>) + Send>,
+    },
+}
 
 pub struct Scene {
     pub meshes: Store<Mesh>,
@@ -22,6 +31,7 @@ pub struct Scene {
     pub lights: Vec<Light>,
     pub ambient: [f32; 3],
     pub debug: DebugDraw,
+    pub(crate) pending_loads: Vec<PendingLoad>,
 }
 
 impl Scene {
@@ -38,6 +48,35 @@ impl Scene {
             lights: vec![Light::Directional(DirectionalLight::default())],
             ambient: [0.03, 0.03, 0.04],
             debug: DebugDraw::default(),
+            pending_loads: Vec::new(),
+        }
+    }
+
+    /// Apply finished background loads (gltf and future asset types).
+    pub fn poll_loads(&mut self) {
+        let mut i = 0;
+        while i < self.pending_loads.len() {
+            let ready = match &self.pending_loads[i] {
+                PendingLoad::Gltf { rx, .. } => match rx.try_recv() {
+                    Ok(r) => Some(r),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => Some(Err("load worker disconnected".into())),
+                },
+            };
+            let Some(result) = ready else {
+                i += 1;
+                continue;
+            };
+            let PendingLoad::Gltf {
+                parent, on_ready, ..
+            } = self.pending_loads.swap_remove(i);
+            match result {
+                Ok((src, root)) => {
+                    let h = super::gltf_load::absorb_gltf(self, src, root, parent);
+                    on_ready(self, h);
+                }
+                Err(e) => eprintln!("asset load failed: {e}"),
+            }
         }
     }
 

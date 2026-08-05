@@ -19,6 +19,8 @@ pub trait Demo {
         (1280.0, 800.0)
     }
     fn build_scene() -> Scene;
+    /// Optional post-process / visualizer tweaks after GPU init.
+    fn configure(_visualizer: &mut WgpuVisualizer) {}
     /// Optional per-frame update. Return `true` to keep animating.
     fn update(_scene: &mut Scene, _dt: f32) -> bool {
         false
@@ -265,6 +267,7 @@ impl<D: Demo> Host<D> {
 
         let mut visualizer = WgpuVisualizer::new(&device, &queue);
         visualizer.ensure_target(width, height);
+        D::configure(&mut visualizer);
 
         self.gpu = Some(Gpu {
             device,

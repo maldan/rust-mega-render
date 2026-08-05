@@ -24,7 +24,10 @@ pub use light::{DirectionalLight, Light, PointLight};
 pub use material::Material;
 pub use mesh::Mesh;
 pub use node::{Node, Transform};
-pub use post_process::{BloomSettings, PostProcessSettings, SsaoSettings};
+pub use post_process::{
+    BloomSettings, ColorGradeSettings, FogSettings, FxaaSettings, GrainSettings,
+    PostProcessSettings, SsaoSettings, TonemapSettings, VignetteSettings,
+};
 pub use primitives::{cube, plane, sphere};
 pub use scene::Scene;
 pub use skin::Skin;

@@ -37,8 +37,29 @@ struct BloomUniforms {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CompositeUniforms {
+    inv_view_proj: [[f32; 4]; 4],
+    camera_pos: [f32; 4],
+    fog_color: [f32; 4],
+    fog_height: f32,
+    fog_height_falloff: f32,
+    fog_enabled: f32,
     ao_intensity: f32,
     bloom_intensity: f32,
+    exposure: f32,
+    tonemap_mode: f32,
+    contrast: f32,
+    saturation: f32,
+    brightness: f32,
+    vignette_intensity: f32,
+    vignette_smoothness: f32,
+    grain_intensity: f32,
+    _pad: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FxaaUniforms {
+    texel: [f32; 2],
     _pad: [f32; 2],
 }
 
@@ -55,16 +76,19 @@ pub struct PostFx {
     bloom_down_pipe: wgpu::RenderPipeline,
     bloom_up_pipe: wgpu::RenderPipeline,
     composite_pipe: wgpu::RenderPipeline,
+    fxaa_pipe: wgpu::RenderPipeline,
 
     ssao_bgl: wgpu::BindGroupLayout,
     blur_bgl: wgpu::BindGroupLayout,
     bloom_bgl: wgpu::BindGroupLayout,
     composite_bgl: wgpu::BindGroupLayout,
+    fxaa_bgl: wgpu::BindGroupLayout,
 
     ssao_ubo: wgpu::Buffer,
     blur_ubo: wgpu::Buffer,
     bloom_ubo: wgpu::Buffer,
     composite_ubo: wgpu::Buffer,
+    fxaa_ubo: wgpu::Buffer,
 
     kernel: [[f32; 4]; SSAO_KERNEL],
     noise_view: wgpu::TextureView,
@@ -76,6 +100,7 @@ pub struct PostFx {
     ao: Rt,
     ao_temp: Rt,
     bloom: Vec<Rt>,
+    composite_temp: Rt,
     white_view: wgpu::TextureView,
     _white: wgpu::Texture,
     black_view: wgpu::TextureView,
@@ -88,6 +113,7 @@ impl PostFx {
         let blur_shader = device.create_shader_module(wgpu::include_wgsl!("blur.wgsl"));
         let bloom_shader = device.create_shader_module(wgpu::include_wgsl!("bloom.wgsl"));
         let composite_shader = device.create_shader_module(wgpu::include_wgsl!("composite.wgsl"));
+        let fxaa_shader = device.create_shader_module(wgpu::include_wgsl!("fxaa.wgsl"));
 
         let ssao_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ssao"),
@@ -124,7 +150,17 @@ impl PostFx {
                 tex_entry(1, true),
                 tex_entry(2, true),
                 tex_entry(3, true),
-                filter_samp_entry(4),
+                depth_entry(4),
+                filter_samp_entry(5),
+                nearest_samp_entry(6),
+            ],
+        });
+        let fxaa_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("fxaa"),
+            entries: &[
+                ubo_entry(0, wgpu::ShaderStages::FRAGMENT),
+                tex_entry(1, true),
+                filter_samp_entry(2),
             ],
         });
 
@@ -189,6 +225,15 @@ impl PostFx {
             wgpu::TextureFormat::Rgba8UnormSrgb,
             None,
         );
+        let fxaa_pipe = fullscreen_pipe(
+            device,
+            "fxaa",
+            &fxaa_bgl,
+            &fxaa_shader,
+            "fs",
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            None,
+        );
 
         let ssao_ubo = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ssao_ubo"),
@@ -211,6 +256,12 @@ impl PostFx {
         let composite_ubo = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("composite_ubo"),
             size: std::mem::size_of::<CompositeUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let fxaa_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fxaa_ubo"),
+            size: std::mem::size_of::<FxaaUniforms>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -243,6 +294,8 @@ impl PostFx {
         let bloom = (0..BLOOM_LEVELS)
             .map(|i| make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, &format!("bloom{i}")))
             .collect();
+        let composite_temp =
+            make_rt(device, 1, 1, wgpu::TextureFormat::Rgba8UnormSrgb, "composite_temp");
 
         Self {
             ssao_pipe,
@@ -251,14 +304,17 @@ impl PostFx {
             bloom_down_pipe,
             bloom_up_pipe,
             composite_pipe,
+            fxaa_pipe,
             ssao_bgl,
             blur_bgl,
             bloom_bgl,
             composite_bgl,
+            fxaa_bgl,
             ssao_ubo,
             blur_ubo,
             bloom_ubo,
             composite_ubo,
+            fxaa_ubo,
             kernel,
             noise_view,
             _noise: noise,
@@ -268,6 +324,7 @@ impl PostFx {
             ao,
             ao_temp,
             bloom,
+            composite_temp,
             white_view,
             _white: white,
             black_view,
@@ -281,6 +338,8 @@ impl PostFx {
         if self.ao.size != (w, h) {
             self.ao = make_rt(device, w, h, wgpu::TextureFormat::R8Unorm, "ao");
             self.ao_temp = make_rt(device, w, h, wgpu::TextureFormat::R8Unorm, "ao_temp");
+            self.composite_temp =
+                make_rt(device, w, h, wgpu::TextureFormat::Rgba8UnormSrgb, "composite_temp");
         }
         let mut bw = (w / 2).max(1);
         let mut bh = (h / 2).max(1);
@@ -309,6 +368,8 @@ impl PostFx {
         depth: &wgpu::TextureView,
         target: &wgpu::TextureView,
         proj: Mat4,
+        view_proj: Mat4,
+        camera_pos: [f32; 3],
         size: (u32, u32),
     ) {
         let (w, h) = size;
@@ -354,7 +415,8 @@ impl PostFx {
                 ],
             });
             {
-                let mut pass = color_pass(encoder, "ssao", &self.ao.view, wgpu::LoadOp::Clear(wgpu::Color::WHITE));
+                let mut pass =
+                    color_pass(encoder, "ssao", &self.ao.view, wgpu::LoadOp::Clear(wgpu::Color::WHITE));
                 pass.set_pipeline(&self.ssao_pipe);
                 pass.set_bind_group(0, &bg, &[]);
                 pass.draw(0..3, 0..1);
@@ -384,7 +446,6 @@ impl PostFx {
 
         if settings.bloom.enabled {
             let thr = settings.bloom.threshold;
-            // extract → bloom[0]
             self.bloom_pass(
                 device,
                 queue,
@@ -396,7 +457,6 @@ impl PostFx {
                 thr,
                 true,
             );
-            // downsample
             for i in 0..BLOOM_LEVELS - 1 {
                 self.bloom_pass(
                     device,
@@ -410,7 +470,6 @@ impl PostFx {
                     true,
                 );
             }
-            // upsample (additive into larger level)
             for i in (0..BLOOM_LEVELS - 1).rev() {
                 self.bloom_pass(
                     device,
@@ -421,7 +480,7 @@ impl PostFx {
                     &self.bloom[i].view,
                     self.bloom[i + 1].size,
                     thr,
-                    false, // load existing
+                    false,
                 );
             }
         }
@@ -436,10 +495,48 @@ impl PostFx {
         } else {
             &self.black_view
         };
+
+        let tonemap_mode = if settings.tonemap.enabled {
+            if settings.tonemap.aces {
+                2.0
+            } else {
+                1.0
+            }
+        } else {
+            // Scene was rendered linear because post is on — still need a curve.
+            1.0
+        };
+        let (contrast, saturation, brightness) = if settings.color_grade.enabled {
+            (
+                settings.color_grade.contrast,
+                settings.color_grade.saturation,
+                settings.color_grade.brightness,
+            )
+        } else {
+            (1.0, 1.0, 0.0)
+        };
+        let (vig_i, vig_s) = if settings.vignette.enabled {
+            (settings.vignette.intensity, settings.vignette.smoothness)
+        } else {
+            (0.0, 0.5)
+        };
+        let grain = if settings.grain.enabled {
+            settings.grain.intensity
+        } else {
+            0.0
+        };
+        let fog = &settings.fog;
+
         queue.write_buffer(
             &self.composite_ubo,
             0,
             bytemuck::bytes_of(&CompositeUniforms {
+                inv_view_proj: view_proj.inverse().to_cols_array_2d(),
+                camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2], 0.0],
+                fog_color: [fog.color[0], fog.color[1], fog.color[2], fog.density],
+                fog_height: fog.height,
+                fog_height_falloff: fog.height_falloff,
+                fog_enabled: if fog.enabled { 1.0 } else { 0.0 },
                 ao_intensity: if settings.ssao.enabled {
                     settings.ssao.intensity
                 } else {
@@ -450,9 +547,27 @@ impl PostFx {
                 } else {
                     0.0
                 },
-                _pad: [0.0; 2],
+                exposure: if settings.tonemap.enabled {
+                    settings.tonemap.exposure
+                } else {
+                    1.0
+                },
+                tonemap_mode,
+                contrast,
+                saturation,
+                brightness,
+                vignette_intensity: vig_i,
+                vignette_smoothness: vig_s,
+                grain_intensity: grain,
+                _pad: [0.0; 3],
             }),
         );
+
+        let composite_dst = if settings.fxaa.enabled {
+            &self.composite_temp.view
+        } else {
+            target
+        };
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("composite"),
             layout: &self.composite_bgl,
@@ -475,13 +590,56 @@ impl PostFx {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
+                    resource: wgpu::BindingResource::TextureView(depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
                     resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
                 },
             ],
         });
         {
-            let mut pass = color_pass(encoder, "composite", target, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
+            let mut pass =
+                color_pass(encoder, "composite", composite_dst, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
             pass.set_pipeline(&self.composite_pipe);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        if settings.fxaa.enabled {
+            queue.write_buffer(
+                &self.fxaa_ubo,
+                0,
+                bytemuck::bytes_of(&FxaaUniforms {
+                    texel: [1.0 / w as f32, 1.0 / h as f32],
+                    _pad: [0.0; 2],
+                }),
+            );
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("fxaa"),
+                layout: &self.fxaa_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.fxaa_ubo.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.composite_temp.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                    },
+                ],
+            });
+            let mut pass =
+                color_pass(encoder, "fxaa", target, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
+            pass.set_pipeline(&self.fxaa_pipe);
             pass.set_bind_group(0, &bg, &[]);
             pass.draw(0..3, 0..1);
         }
@@ -682,7 +840,6 @@ fn make_kernel() -> [[f32; 4]; SSAO_KERNEL] {
     let mut kernel = [[0.0; 4]; SSAO_KERNEL];
     for i in 0..SSAO_KERNEL {
         let t = (i as f32 + 1.0) / SSAO_KERNEL as f32;
-        // Deterministic hemisphere directions (no RNG dependency).
         let z = t;
         let a = i as f32 * 2.399963;
         let r = (1.0 - z * z).max(0.0).sqrt() * t * t;

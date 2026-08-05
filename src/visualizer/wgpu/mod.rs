@@ -98,11 +98,16 @@ pub struct WgpuVisualizer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
+    pipeline_hdr: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     line_overlay_pipeline: wgpu::RenderPipeline,
     point_pipeline: wgpu::RenderPipeline,
     point_overlay_pipeline: wgpu::RenderPipeline,
+    line_pipeline_hdr: wgpu::RenderPipeline,
+    line_overlay_pipeline_hdr: wgpu::RenderPipeline,
+    point_pipeline_hdr: wgpu::RenderPipeline,
+    point_overlay_pipeline_hdr: wgpu::RenderPipeline,
     frame_bind_group: wgpu::BindGroup,
     debug_bind_group: wgpu::BindGroup,
     shadow_frame_bind_group: wgpu::BindGroup,
@@ -363,36 +368,24 @@ impl WgpuVisualizer {
             bias: wgpu::DepthBiasState::default(),
         };
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mesh"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &mesh_buffers,
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Cw,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(depth_stencil.clone()),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let pipeline = mesh_pipeline(
+            device,
+            &pipeline_layout,
+            &shader,
+            &mesh_buffers,
+            &depth_stencil,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            "mesh",
+        );
+        let pipeline_hdr = mesh_pipeline(
+            device,
+            &pipeline_layout,
+            &shader,
+            &mesh_buffers,
+            &depth_stencil,
+            wgpu::TextureFormat::Rgba16Float,
+            "mesh_hdr",
+        );
 
         let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("shadow"),
@@ -444,6 +437,7 @@ impl WgpuVisualizer {
             wgpu::PrimitiveTopology::LineList,
             wgpu::CompareFunction::Less,
             &depth_stencil,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
         );
         let line_overlay_pipeline = debug_pipeline(
             device,
@@ -454,6 +448,7 @@ impl WgpuVisualizer {
             wgpu::PrimitiveTopology::LineList,
             wgpu::CompareFunction::Always,
             &depth_stencil,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
         );
         let point_pipeline = debug_pipeline(
             device,
@@ -464,6 +459,7 @@ impl WgpuVisualizer {
             wgpu::PrimitiveTopology::TriangleList,
             wgpu::CompareFunction::Less,
             &depth_stencil,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
         );
         let point_overlay_pipeline = debug_pipeline(
             device,
@@ -474,6 +470,51 @@ impl WgpuVisualizer {
             wgpu::PrimitiveTopology::TriangleList,
             wgpu::CompareFunction::Always,
             &depth_stencil,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+        let line_pipeline_hdr = debug_pipeline(
+            device,
+            &debug_layout,
+            &debug_shader,
+            "vs_main",
+            &line_buffers,
+            wgpu::PrimitiveTopology::LineList,
+            wgpu::CompareFunction::Less,
+            &depth_stencil,
+            wgpu::TextureFormat::Rgba16Float,
+        );
+        let line_overlay_pipeline_hdr = debug_pipeline(
+            device,
+            &debug_layout,
+            &debug_shader,
+            "vs_main",
+            &line_buffers,
+            wgpu::PrimitiveTopology::LineList,
+            wgpu::CompareFunction::Always,
+            &depth_stencil,
+            wgpu::TextureFormat::Rgba16Float,
+        );
+        let point_pipeline_hdr = debug_pipeline(
+            device,
+            &debug_layout,
+            &debug_shader,
+            "vs_point",
+            &point_buffers,
+            wgpu::PrimitiveTopology::TriangleList,
+            wgpu::CompareFunction::Less,
+            &depth_stencil,
+            wgpu::TextureFormat::Rgba16Float,
+        );
+        let point_overlay_pipeline_hdr = debug_pipeline(
+            device,
+            &debug_layout,
+            &debug_shader,
+            "vs_point",
+            &point_buffers,
+            wgpu::PrimitiveTopology::TriangleList,
+            wgpu::CompareFunction::Always,
+            &depth_stencil,
+            wgpu::TextureFormat::Rgba16Float,
         );
 
         let (target, target_view, scene_color, scene_color_view, depth, depth_view) =
@@ -487,11 +528,16 @@ impl WgpuVisualizer {
             device: device.clone(),
             queue: queue.clone(),
             pipeline,
+            pipeline_hdr,
             shadow_pipeline,
             line_pipeline,
             line_overlay_pipeline,
             point_pipeline,
             point_overlay_pipeline,
+            line_pipeline_hdr,
+            line_overlay_pipeline_hdr,
+            point_pipeline_hdr,
+            point_overlay_pipeline_hdr,
             frame_bind_group,
             debug_bind_group,
             shadow_frame_bind_group,
@@ -564,6 +610,7 @@ impl WgpuVisualizer {
 
         let eye = scene.camera.eye;
         let view_proj = scene.camera.view_proj(aspect);
+        let use_post = self.post.any_enabled();
         self.queue.write_buffer(
             &self.frame_uniform_buf,
             0,
@@ -576,7 +623,8 @@ impl WgpuVisualizer {
                     scene.ambient[2],
                     light_count as f32,
                 ],
-                camera_pos: [eye.x, eye.y, eye.z, 1.0],
+                // w > 0.5 → linear output for post tonemap
+                camera_pos: [eye.x, eye.y, eye.z, if use_post { 1.0 } else { 0.0 }],
                 lights: gpu_lights,
             }),
         );
@@ -709,7 +757,6 @@ impl WgpuVisualizer {
         );
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        let use_post = self.post.any_enabled();
 
         if scene.shadow_directional().is_some() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -776,7 +823,11 @@ impl WgpuVisualizer {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(if use_post {
+                &self.pipeline_hdr
+            } else {
+                &self.pipeline
+            });
             pass.set_bind_group(0, &self.frame_bind_group, &[]);
 
             for (i, (mesh_key, albedo_key, normal_key, mr_key, _, _, _, _)) in draws.iter().enumerate()
@@ -824,31 +875,46 @@ impl WgpuVisualizer {
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
             }
 
-            draw_debug_lines(&mut pass, &self.line_pipeline, &self.debug_bind_group, &line_buf, debug.lines.len());
+            let (line_pipe, line_overlay_pipe, point_pipe, point_overlay_pipe) = if use_post {
+                (
+                    &self.line_pipeline_hdr,
+                    &self.line_overlay_pipeline_hdr,
+                    &self.point_pipeline_hdr,
+                    &self.point_overlay_pipeline_hdr,
+                )
+            } else {
+                (
+                    &self.line_pipeline,
+                    &self.line_overlay_pipeline,
+                    &self.point_pipeline,
+                    &self.point_overlay_pipeline,
+                )
+            };
+            draw_debug_lines(&mut pass, line_pipe, &self.debug_bind_group, &line_buf, debug.lines.len());
             draw_debug_points(
                 &mut pass,
-                &self.point_pipeline,
+                point_pipe,
                 &self.debug_bind_group,
                 &point_buf,
                 debug.points.len(),
             );
             draw_debug_lines(
                 &mut pass,
-                &self.line_overlay_pipeline,
+                line_overlay_pipe,
                 &self.debug_bind_group,
                 &line_overlay_buf,
                 debug.lines_overlay.len(),
             );
             draw_debug_points(
                 &mut pass,
-                &self.point_overlay_pipeline,
+                point_overlay_pipe,
                 &self.debug_bind_group,
                 &point_overlay_buf,
                 debug.points_overlay.len(),
             );
         }
 
-        // Post: scene_color → SSAO / Bloom → output
+        // Post: scene_color → SSAO / Bloom / composite / FXAA → output
         if use_post {
             let proj = glam::camera::lh::proj::directx::perspective(
                 scene.camera.fov_y,
@@ -866,6 +932,8 @@ impl WgpuVisualizer {
                 &self.depth_view,
                 post_dst,
                 proj,
+                view_proj,
+                [eye.x, eye.y, eye.z],
                 self.size,
             );
         }
@@ -1057,6 +1125,47 @@ fn draw_debug_points(
     pass.draw(0..6, 0..count as u32);
 }
 
+fn mesh_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
+    depth_stencil: &wgpu::DepthStencilState,
+    format: wgpu::TextureFormat,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers,
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Cw,
+            cull_mode: Some(wgpu::Face::Back),
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_stencil.clone()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn debug_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -1066,6 +1175,7 @@ fn debug_pipeline(
     topology: wgpu::PrimitiveTopology,
     depth_compare: wgpu::CompareFunction,
     depth_stencil: &wgpu::DepthStencilState,
+    format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("debug"),
@@ -1080,7 +1190,7 @@ fn debug_pipeline(
             module: shader,
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                format,
                 blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
@@ -1262,14 +1372,14 @@ fn create_targets(
         height: h,
         depth_or_array_layers: 1,
     };
-    let color = |label, usage| {
+    let color = |label, format, usage| {
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format,
             usage,
             view_formats: &[],
         });
@@ -1278,10 +1388,12 @@ fn create_targets(
     };
     let (target, target_view) = color(
         "scene_rt",
+        wgpu::TextureFormat::Rgba8UnormSrgb,
         wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
     );
     let (scene_color, scene_color_view) = color(
         "scene_color",
+        wgpu::TextureFormat::Rgba16Float,
         wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
     );
     let depth = device.create_texture(&wgpu::TextureDescriptor {

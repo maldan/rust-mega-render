@@ -189,6 +189,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     for (var i = 0u; i < count; i++) {
         lit += light_contrib(frame.lights[i], in.world_pos, n, v, albedo, metallic, roughness);
     }
-    lit = lit / (lit + vec3<f32>(1.0));
+    // camera_pos.w > 0.5 → linear HDR for post tonemap; else Reinhard for direct output.
+    if frame.camera_pos.w < 0.5 {
+        lit = lit / (lit + vec3<f32>(1.0));
+    }
     return vec4<f32>(lit, base.a);
 }
