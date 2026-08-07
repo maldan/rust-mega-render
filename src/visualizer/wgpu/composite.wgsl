@@ -34,9 +34,9 @@ struct CompositeUniforms {
     vignette_intensity: f32,
     vignette_smoothness: f32,
     grain_intensity: f32,
+    contact_intensity: f32,
     _pad0: f32,
     _pad1: f32,
-    _pad2: f32,
 }
 
 @group(0) @binding(0) var<uniform> u: CompositeUniforms;
@@ -46,6 +46,7 @@ struct CompositeUniforms {
 @group(0) @binding(4) var depth_tex: texture_depth_2d;
 @group(0) @binding(5) var samp: sampler;
 @group(0) @binding(6) var depth_samp: sampler;
+@group(0) @binding(7) var contact_tex: texture_2d<f32>;
 
 fn world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
@@ -86,6 +87,10 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
         let ao = textureSample(ao_tex, samp, i.uv).r;
         // intensity 0 = off, 1 = full AO, >1 = stronger darkening.
         color *= mix(1.0, ao, clamp(u.ao_intensity, 0.0, 2.0));
+    }
+    if u.contact_intensity > 0.0 {
+        let cs = textureSample(contact_tex, samp, i.uv).r;
+        color *= mix(1.0, cs, clamp(u.contact_intensity, 0.0, 2.0));
     }
     if u.bloom_intensity > 0.0 {
         color += textureSample(bloom_tex, samp, i.uv).rgb * u.bloom_intensity;

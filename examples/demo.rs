@@ -23,8 +23,9 @@ use mega_ui::{DockNode, DockState, ScrollAxes, TextStyle, Ui};
 fn build_demo_scene() -> Scene {
     let mut scene = Scene::new();
     if let Some(Light::Directional(d)) = scene.lights.first_mut() {
-        d.intensity = 2.5;
-        d.color = [1.0, 0.98, 0.92];
+        d.intensity = 3.3;
+        d.color = [1.0, 1.0, 1.0];
+        d.direction = Vec3::new(0.28, -0.30, 0.93);
     }
     scene.ambient = [0.03, 0.03, 0.04];
     scene.ibl_intensity = 1.0;
@@ -40,14 +41,14 @@ fn build_demo_scene() -> Scene {
         color: [1.0, 0.55, 0.25],
         intensity: 5.0,
         range: 12.0,
-        enabled: true,
+        enabled: false,
     }));
     scene.lights.push(Light::Point(PointLight {
         position: Vec3::new(0.0, 2.0, 3.0),
         color: [0.85, 0.9, 1.0],
         intensity: 4.0,
         range: 10.0,
-        enabled: true,
+        enabled: false,
     }));
 
     let mesh_plane = scene.meshes.insert(plane(14.0, 14.0));
@@ -177,11 +178,16 @@ impl Demo for MaterialDemo {
         let post = visualizer.post_process();
         post.ao.enabled = true;
         post.ao.method = AoMethod::Gtao;
-        post.ao.radius = 0.55;
-        post.ao.intensity = 0.4;
-        post.ao.directions = 6;
-        post.ao.steps = 8;
-        post.ao.thickness = 1.0;
+        post.ao.radius = 1.96;
+        post.ao.intensity = 0.97;
+        post.ao.directions = 2;
+        post.ao.steps = 3;
+        post.ao.thickness = 1.13;
+        post.contact_shadow.enabled = true;
+        post.contact_shadow.length = 0.35;
+        post.contact_shadow.thickness = 0.08;
+        post.contact_shadow.intensity = 0.85;
+        post.contact_shadow.samples = 12;
         post.bloom.enabled = true;
         post.bloom.threshold = 1.2;
         post.bloom.intensity = 0.2;
@@ -205,6 +211,7 @@ impl Demo for MaterialDemo {
 
     fn build_ui(ui: &mut Ui, ctx: &mut UiCtx<'_>) -> bool {
         let fps = ctx.fps;
+        let frame_ms = ctx.frame_ms;
         let status_h = 24.0 * ui.scale();
         let dock_size = Vec2::new(ctx.window_size.x, (ctx.window_size.y - status_h).max(1.0));
 
@@ -301,10 +308,31 @@ impl Demo for MaterialDemo {
                         }
                     });
                 });
+                ui.collapsing_header("Contact Shadows", |ui| {
+                    ui.checkbox("Enabled", &mut post.contact_shadow.enabled);
+                    ui.label("Короткие SS-тени вдоль directional light.");
+                    ui.add_enabled(post.contact_shadow.enabled, |ui| {
+                        ui.label("Length — длина луча (мир)");
+                        ui.slider("Length", &mut post.contact_shadow.length, 0.05..=1.5);
+                        ui.label("Thickness — допуск по глубине");
+                        ui.slider("Thickness", &mut post.contact_shadow.thickness, 0.01..=2.0);
+                        ui.label("Intensity — сила затемнения");
+                        ui.slider("Intensity", &mut post.contact_shadow.intensity, 0.0..=2.0);
+                        let mut samples = post.contact_shadow.samples as f32;
+                        ui.label("Samples — шагов марша");
+                        if ui.slider("Samples", &mut samples, 4.0..=32.0).changed() {
+                            post.contact_shadow.samples = samples.round() as u32;
+                        }
+                        ui.label("Bias — отступ от поверхности");
+                        ui.slider("Bias", &mut post.contact_shadow.bias, 0.0..=0.05);
+                    });
+                });
                 ui.collapsing_header("Bloom", |ui| {
                     ui.checkbox("Enabled", &mut post.bloom.enabled);
                     ui.add_enabled(post.bloom.enabled, |ui| {
+                        ui.label("Threshold — порог яркости");
                         ui.slider("Threshold", &mut post.bloom.threshold, 0.0..=4.0);
+                        ui.label("Intensity — сила свечения");
                         ui.slider("Intensity", &mut post.bloom.intensity, 0.0..=2.0);
                     });
                 });
@@ -312,27 +340,34 @@ impl Demo for MaterialDemo {
                     ui.checkbox("Enabled", &mut post.tonemap.enabled);
                     ui.add_enabled(post.tonemap.enabled, |ui| {
                         ui.checkbox("ACES", &mut post.tonemap.aces);
+                        ui.label("Exposure — экспозиция");
                         ui.slider("Exposure", &mut post.tonemap.exposure, 0.1..=4.0);
                     });
                 });
                 ui.collapsing_header("Color Grade", |ui| {
                     ui.checkbox("Enabled", &mut post.color_grade.enabled);
                     ui.add_enabled(post.color_grade.enabled, |ui| {
+                        ui.label("Contrast — контраст");
                         ui.slider("Contrast", &mut post.color_grade.contrast, 0.0..=2.0);
+                        ui.label("Saturation — насыщенность");
                         ui.slider("Saturation", &mut post.color_grade.saturation, 0.0..=2.0);
+                        ui.label("Brightness — яркость");
                         ui.slider("Brightness", &mut post.color_grade.brightness, -0.5..=0.5);
                     });
                 });
                 ui.collapsing_header("Vignette", |ui| {
                     ui.checkbox("Enabled", &mut post.vignette.enabled);
                     ui.add_enabled(post.vignette.enabled, |ui| {
+                        ui.label("Intensity — затемнение краёв");
                         ui.slider("Intensity", &mut post.vignette.intensity, 0.0..=1.0);
+                        ui.label("Smoothness — мягкость перехода");
                         ui.slider("Smoothness", &mut post.vignette.smoothness, 0.05..=1.5);
                     });
                 });
                 ui.collapsing_header("Film Grain", |ui| {
                     ui.checkbox("Enabled", &mut post.grain.enabled);
                     ui.add_enabled(post.grain.enabled, |ui| {
+                        ui.label("Intensity — сила зерна");
                         ui.slider("Intensity", &mut post.grain.intensity, 0.0..=0.2);
                     });
                 });
@@ -343,6 +378,7 @@ impl Demo for MaterialDemo {
                 ui.collapsing_header("Fog", |ui| {
                     ui.checkbox("Enabled", &mut post.fog.enabled);
                     ui.add_enabled(post.fog.enabled, |ui| {
+                        ui.label("Color — цвет тумана");
                         let mut fog_col = [
                             post.fog.color[0],
                             post.fog.color[1],
@@ -352,15 +388,19 @@ impl Demo for MaterialDemo {
                         if ui.color_edit("fog_color", &mut fog_col).changed() {
                             post.fog.color = [fog_col[0], fog_col[1], fog_col[2]];
                         }
+                        ui.label("Density — плотность");
                         ui.slider("Density", &mut post.fog.density, 0.0..=0.2);
+                        ui.label("Height — высота пола тумана");
                         ui.slider("Height", &mut post.fog.height, -5.0..=5.0);
+                        ui.label("Height falloff — затухание вверх");
                         ui.slider("Height falloff", &mut post.fog.height_falloff, 0.0..=2.0);
                     });
                 });
             }),
             "Lights" => effect_panel(ui, "Lights", |ui| {
-                ui.label("Ambient / IBL");
+                ui.label("IBL intensity — сила IBL / sky");
                 ui.slider("IBL intensity", &mut scene.ibl_intensity, 0.0..=3.0);
+                ui.label("Ambient — плоский ambient");
                 let mut amb = [scene.ambient[0], scene.ambient[1], scene.ambient[2], 1.0];
                 if ui.color_edit("ambient", &mut amb).changed() {
                     scene.ambient = [amb[0], amb[1], amb[2]];
@@ -372,7 +412,9 @@ impl Demo for MaterialDemo {
                         ui.checkbox("Enabled", &mut d.enabled);
                         ui.checkbox("Cast shadows", &mut d.cast_shadows);
                         ui.add_enabled(d.enabled, |ui| {
+                            ui.label("Intensity — яркость");
                             ui.slider("Intensity", &mut d.intensity, 0.0..=8.0);
+                            ui.label("Color");
                             let mut col = [d.color[0], d.color[1], d.color[2], 1.0];
                             if ui.color_edit("sun_color", &mut col).changed() {
                                 d.color = [col[0], col[1], col[2]];
@@ -402,8 +444,11 @@ impl Demo for MaterialDemo {
                     ui.collapsing_header(&header, |ui| {
                         ui.checkbox("Enabled", &mut p.enabled);
                         ui.add_enabled(p.enabled, |ui| {
+                            ui.label("Intensity — яркость");
                             ui.slider("Intensity", &mut p.intensity, 0.0..=20.0);
+                            ui.label("Range — дальность");
                             ui.slider("Range", &mut p.range, 1.0..=30.0);
+                            ui.label("Color");
                             let mut col = [p.color[0], p.color[1], p.color[2], 1.0];
                             if ui.color_edit("color", &mut col).changed() {
                                 p.color = [col[0], col[1], col[2]];
@@ -423,6 +468,8 @@ impl Demo for MaterialDemo {
             ui.label("RMB look · WASD move · Esc quit");
             ui.label("·");
             ui.label(&format!("FPS {:.0}", fps));
+            ui.label("·");
+            ui.label(&format!("{:.1} ms", frame_ms));
             ui.label("·");
             ui.label(&format!("ui {} / {}", stats.batches, stats.quads));
         });

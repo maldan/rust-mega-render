@@ -34,6 +34,8 @@ pub struct UiCtx<'a> {
     pub dt: f32,
     /// Frames-per-second averaged over the last ~1 second.
     pub fps: f32,
+    /// Mean frame time in milliseconds over the last ~1 second.
+    pub frame_ms: f32,
     pub stats: DrawStats,
 }
 
@@ -332,6 +334,7 @@ pub struct Host<D: Demo> {
     fps_accum_dt: f32,
     fps_frames: u32,
     fps: f32,
+    frame_ms: f32,
     animating: bool,
     cursor: CursorIcon,
     draw_stats: DrawStats,
@@ -360,6 +363,7 @@ impl<D: Demo> Host<D> {
             fps_accum_dt: 0.0,
             fps_frames: 0,
             fps: 0.0,
+            frame_ms: 0.0,
             animating: true,
             cursor: CursorIcon::Default,
             draw_stats: DrawStats::default(),
@@ -525,6 +529,7 @@ impl<D: Demo> Host<D> {
         self.fps_frames += 1;
         if self.fps_accum_dt >= 1.0 {
             self.fps = self.fps_frames as f32 / self.fps_accum_dt;
+            self.frame_ms = (self.fps_accum_dt / self.fps_frames.max(1) as f32) * 1000.0;
             self.fps_accum_dt = 0.0;
             self.fps_frames = 0;
         }
@@ -572,6 +577,7 @@ impl<D: Demo> Host<D> {
                     viewport_size: &mut viewport_size,
                     dt,
                     fps: self.fps,
+                    frame_ms: self.frame_ms,
                     stats: self.draw_stats,
                 };
                 D::build_ui(&mut self.ui, &mut ctx)

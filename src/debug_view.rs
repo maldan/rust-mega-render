@@ -21,6 +21,8 @@ pub enum DebugView {
     Depth,
     /// SSAO / AO buffer (requires AO pass; white if unavailable).
     Ao,
+    /// Screen-space contact shadow buffer (white if unavailable).
+    ContactShadow,
 }
 
 impl DebugView {
@@ -32,6 +34,7 @@ impl DebugView {
         DebugView::Metallic,
         DebugView::Depth,
         DebugView::Ao,
+        DebugView::ContactShadow,
     ];
 
     pub fn label(self) -> &'static str {
@@ -43,6 +46,7 @@ impl DebugView {
             DebugView::Metallic => "Metallic",
             DebugView::Depth => "Depth",
             DebugView::Ao => "AO",
+            DebugView::ContactShadow => "Contact shadow",
         }
     }
 
@@ -55,6 +59,7 @@ impl DebugView {
             DebugView::Metallic => 4,
             DebugView::Depth => 5,
             DebugView::Ao => 6,
+            DebugView::ContactShadow => 7,
         }
     }
 }

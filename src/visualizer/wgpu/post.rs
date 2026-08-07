@@ -1,5 +1,5 @@
-use crate::{AoMethod, AoSettings, PostProcessSettings};
-use glam::Mat4;
+use crate::{AoMethod, AoSettings, ContactShadowSettings, PostProcessSettings};
+use glam::{Mat4, Vec3};
 
 const SSAO_KERNEL: usize = 32;
 const BLOOM_LEVELS: usize = 4;
@@ -30,6 +30,19 @@ struct GtaoUniforms {
     params: [f32; 4],
     noise_scale: [f32; 2],
     _pad: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ContactUniforms {
+    proj: [[f32; 4]; 4],
+    inv_proj: [[f32; 4]; 4],
+    view: [[f32; 4]; 4],
+    light_dir_world: [f32; 4],
+    resolution: [f32; 2],
+    length: f32,
+    thickness: f32,
+    params: [f32; 4],
 }
 
 #[repr(C)]
@@ -67,7 +80,8 @@ struct CompositeUniforms {
     vignette_intensity: f32,
     vignette_smoothness: f32,
     grain_intensity: f32,
-    _pad: [f32; 3],
+    contact_intensity: f32,
+    _pad: [f32; 2],
 }
 
 #[repr(C)]
@@ -86,6 +100,7 @@ struct Rt {
 pub struct PostFx {
     ssao_pipe: wgpu::RenderPipeline,
     gtao_pipe: wgpu::RenderPipeline,
+    contact_pipe: wgpu::RenderPipeline,
     blur_pipe: wgpu::RenderPipeline,
     bloom_extract_pipe: wgpu::RenderPipeline,
     bloom_down_pipe: wgpu::RenderPipeline,
@@ -95,6 +110,7 @@ pub struct PostFx {
 
     ssao_bgl: wgpu::BindGroupLayout,
     gtao_bgl: wgpu::BindGroupLayout,
+    contact_bgl: wgpu::BindGroupLayout,
     blur_bgl: wgpu::BindGroupLayout,
     bloom_bgl: wgpu::BindGroupLayout,
     composite_bgl: wgpu::BindGroupLayout,
@@ -102,6 +118,7 @@ pub struct PostFx {
 
     ssao_ubo: wgpu::Buffer,
     gtao_ubo: wgpu::Buffer,
+    contact_ubo: wgpu::Buffer,
     blur_ubo: wgpu::Buffer,
     bloom_ubo: wgpu::Buffer,
     composite_ubo: wgpu::Buffer,
@@ -116,6 +133,7 @@ pub struct PostFx {
 
     ao: Rt,
     ao_temp: Rt,
+    contact: Rt,
     bloom: Vec<Rt>,
     composite_temp: Rt,
     white_view: wgpu::TextureView,
@@ -128,6 +146,7 @@ impl PostFx {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
         let ssao_shader = device.create_shader_module(wgpu::include_wgsl!("ssao.wgsl"));
         let gtao_shader = device.create_shader_module(wgpu::include_wgsl!("gtao.wgsl"));
+        let contact_shader = device.create_shader_module(wgpu::include_wgsl!("contact_shadow.wgsl"));
         let blur_shader = device.create_shader_module(wgpu::include_wgsl!("blur.wgsl"));
         let bloom_shader = device.create_shader_module(wgpu::include_wgsl!("bloom.wgsl"));
         let composite_shader = device.create_shader_module(wgpu::include_wgsl!("composite.wgsl"));
@@ -153,6 +172,16 @@ impl PostFx {
                 filter_samp_entry(4),
                 tex_entry(5, true),
                 nearest_samp_entry(6),
+            ],
+        });
+        let contact_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("contact_shadow"),
+            entries: &[
+                ubo_entry(0, wgpu::ShaderStages::FRAGMENT),
+                depth_entry(1),
+                nearest_samp_entry(2),
+                tex_entry(3, true),
+                filter_samp_entry(4),
             ],
         });
         let blur_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -183,6 +212,7 @@ impl PostFx {
                 depth_entry(4),
                 filter_samp_entry(5),
                 nearest_samp_entry(6),
+                tex_entry(7, true),
             ],
         });
         let fxaa_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -208,6 +238,15 @@ impl PostFx {
             "gtao",
             &gtao_bgl,
             &gtao_shader,
+            "fs",
+            wgpu::TextureFormat::R8Unorm,
+            None,
+        );
+        let contact_pipe = fullscreen_pipe(
+            device,
+            "contact_shadow",
+            &contact_bgl,
+            &contact_shader,
             "fs",
             wgpu::TextureFormat::R8Unorm,
             None,
@@ -286,6 +325,12 @@ impl PostFx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let contact_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("contact_ubo"),
+            size: std::mem::size_of::<ContactUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let blur_ubo = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("blur_ubo"),
             size: std::mem::size_of::<BlurUniforms>() as u64,
@@ -336,6 +381,7 @@ impl PostFx {
 
         let ao = make_rt(device, 1, 1, wgpu::TextureFormat::R8Unorm, "ao");
         let ao_temp = make_rt(device, 1, 1, wgpu::TextureFormat::R8Unorm, "ao_temp");
+        let contact = make_rt(device, 1, 1, wgpu::TextureFormat::R8Unorm, "contact");
         let bloom = (0..BLOOM_LEVELS)
             .map(|i| make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, &format!("bloom{i}")))
             .collect();
@@ -345,6 +391,7 @@ impl PostFx {
         Self {
             ssao_pipe,
             gtao_pipe,
+            contact_pipe,
             blur_pipe,
             bloom_extract_pipe,
             bloom_down_pipe,
@@ -353,12 +400,14 @@ impl PostFx {
             fxaa_pipe,
             ssao_bgl,
             gtao_bgl,
+            contact_bgl,
             blur_bgl,
             bloom_bgl,
             composite_bgl,
             fxaa_bgl,
             ssao_ubo,
             gtao_ubo,
+            contact_ubo,
             blur_ubo,
             bloom_ubo,
             composite_ubo,
@@ -371,6 +420,7 @@ impl PostFx {
             nearest_samp,
             ao,
             ao_temp,
+            contact,
             bloom,
             composite_temp,
             white_view,
@@ -386,6 +436,7 @@ impl PostFx {
         if self.ao.size != (w, h) {
             self.ao = make_rt(device, w, h, wgpu::TextureFormat::R8Unorm, "ao");
             self.ao_temp = make_rt(device, w, h, wgpu::TextureFormat::R8Unorm, "ao_temp");
+            self.contact = make_rt(device, w, h, wgpu::TextureFormat::R8Unorm, "contact");
             self.composite_temp =
                 make_rt(device, w, h, wgpu::TextureFormat::Rgba8UnormSrgb, "composite_temp");
         }
@@ -409,6 +460,108 @@ impl PostFx {
     /// Blurred AO result (`R8Unorm`). Valid after [`Self::generate_ao`] / [`Self::apply`].
     pub fn ao_view(&self) -> &wgpu::TextureView {
         &self.ao.view
+    }
+
+    /// Contact-shadow result (`R8Unorm`). Valid after [`Self::generate_contact_shadow`] / [`Self::apply`].
+    pub fn contact_view(&self) -> &wgpu::TextureView {
+        &self.contact.view
+    }
+
+    /// Screen-space contact shadows (+ light bilateral blur) into the contact target.
+    pub fn generate_contact_shadow(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        settings: &ContactShadowSettings,
+        depth: &wgpu::TextureView,
+        normals: &wgpu::TextureView,
+        light_dir_world: Vec3,
+        proj: Mat4,
+        view: Mat4,
+        size: (u32, u32),
+    ) {
+        let (w, h) = size;
+        let dir = light_dir_world.normalize_or_zero();
+        queue.write_buffer(
+            &self.contact_ubo,
+            0,
+            bytemuck::bytes_of(&ContactUniforms {
+                proj: proj.to_cols_array_2d(),
+                inv_proj: proj.inverse().to_cols_array_2d(),
+                view: view.to_cols_array_2d(),
+                light_dir_world: [dir.x, dir.y, dir.z, 0.0],
+                resolution: [w as f32, h as f32],
+                length: settings.length.max(0.01),
+                thickness: settings.thickness.max(0.001),
+                params: [
+                    settings.samples.clamp(4, 32) as f32,
+                    settings.bias.max(0.0),
+                    0.0,
+                    0.0,
+                ],
+            }),
+        );
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("contact_shadow"),
+            layout: &self.contact_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.contact_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(normals),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                },
+            ],
+        });
+        {
+            let mut pass = color_pass(
+                encoder,
+                "contact_shadow",
+                &self.contact.view,
+                wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+            );
+            pass.set_pipeline(&self.contact_pipe);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        self.blur_pass(
+            device,
+            queue,
+            encoder,
+            &self.contact.view,
+            &self.ao_temp.view,
+            depth,
+            [1.0 / w as f32, 0.0],
+            true,
+            40.0,
+        );
+        self.blur_pass(
+            device,
+            queue,
+            encoder,
+            &self.ao_temp.view,
+            &self.contact.view,
+            depth,
+            [0.0, 1.0 / h as f32],
+            true,
+            40.0,
+        );
     }
 
     /// Run SSAO or GTAO (+ bilateral blur) into the internal AO target.
@@ -592,6 +745,7 @@ impl PostFx {
         view: Mat4,
         view_proj: Mat4,
         camera_pos: [f32; 3],
+        light_dir_world: Option<Vec3>,
         size: (u32, u32),
     ) {
         let (w, h) = size;
@@ -607,6 +761,23 @@ impl PostFx {
                 view,
                 size,
             );
+        }
+
+        if settings.contact_shadow.enabled {
+            if let Some(dir) = light_dir_world {
+                self.generate_contact_shadow(
+                    device,
+                    queue,
+                    encoder,
+                    &settings.contact_shadow,
+                    depth,
+                    normals,
+                    dir,
+                    proj,
+                    view,
+                    size,
+                );
+            }
         }
 
         if settings.bloom.enabled {
@@ -652,6 +823,11 @@ impl PostFx {
 
         let ao_view = if settings.ao.enabled {
             &self.ao.view
+        } else {
+            &self.white_view
+        };
+        let contact_view = if settings.contact_shadow.enabled && light_dir_world.is_some() {
+            &self.contact.view
         } else {
             &self.white_view
         };
@@ -724,7 +900,13 @@ impl PostFx {
                 vignette_intensity: vig_i,
                 vignette_smoothness: vig_s,
                 grain_intensity: grain,
-                _pad: [0.0; 3],
+                contact_intensity: if settings.contact_shadow.enabled && light_dir_world.is_some()
+                {
+                    settings.contact_shadow.intensity
+                } else {
+                    0.0
+                },
+                _pad: [0.0; 2],
             }),
         );
 
@@ -764,6 +946,10 @@ impl PostFx {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(contact_view),
                 },
             ],
         });

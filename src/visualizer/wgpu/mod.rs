@@ -1024,6 +1024,10 @@ impl WgpuVisualizer {
                 scene.camera.target,
                 scene.camera.up,
             );
+            let light_dir = scene.lights.iter().find_map(|l| match l {
+                crate::Light::Directional(d) if d.enabled => Some(d.direction),
+                _ => None,
+            });
             self.post_fx.apply(
                 &self.device,
                 &self.queue,
@@ -1037,15 +1041,16 @@ impl WgpuVisualizer {
                 view,
                 view_proj,
                 [eye.x, eye.y, eye.z],
+                light_dir,
                 self.size,
             );
         } else {
+            let view = glam::camera::lh::view::look_at_mat4(
+                scene.camera.eye,
+                scene.camera.target,
+                scene.camera.up,
+            );
             let ao = if self.debug_view == DebugView::Ao {
-                let view = glam::camera::lh::view::look_at_mat4(
-                    scene.camera.eye,
-                    scene.camera.target,
-                    scene.camera.up,
-                );
                 self.post_fx.generate_ao(
                     &self.device,
                     &self.queue,
@@ -1058,8 +1063,34 @@ impl WgpuVisualizer {
                     self.size,
                 );
                 Some(self.post_fx.ao_view())
+            } else if self.debug_view == DebugView::ContactShadow {
+                if let Some(dir) = scene.lights.iter().find_map(|l| match l {
+                    crate::Light::Directional(d) if d.enabled => Some(d.direction),
+                    _ => None,
+                }) {
+                    self.post_fx.generate_contact_shadow(
+                        &self.device,
+                        &self.queue,
+                        &mut encoder,
+                        &self.post.contact_shadow,
+                        &self.frames.depth_view,
+                        &self.frames.normal_view,
+                        dir,
+                        proj,
+                        view,
+                        self.size,
+                    );
+                    Some(self.post_fx.contact_view())
+                } else {
+                    None
+                }
             } else {
                 None
+            };
+            let occlusion_intensity = match self.debug_view {
+                DebugView::Ao => self.post.ao.intensity,
+                DebugView::ContactShadow => self.post.contact_shadow.intensity,
+                _ => 1.0,
             };
             self.debug_blit.blit(
                 &self.device,
@@ -1075,7 +1106,7 @@ impl WgpuVisualizer {
                 exposure,
                 near,
                 far,
-                self.post.ao.intensity,
+                occlusion_intensity,
             );
         }
 

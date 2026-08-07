@@ -68,7 +68,7 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
         let t = clamp(z / far, 0.0, 1.0);
         return vec4(vec3(t), 1.0);
     }
-    // AO — apply intensity so the slider matches Final composite.
+    // AO (6) / Contact shadow (7) — intensity matches Final composite.
     let ao = textureSampleLevel(ao_tex, samp, i.uv, 0.0).r;
     let intensity = clamp(u.ao_params.x, 0.0, 2.0);
     let shown = mix(1.0, ao, intensity);

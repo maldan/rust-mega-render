@@ -1,6 +1,7 @@
 #[derive(Clone, Debug)]
 pub struct PostProcessSettings {
     pub ao: AoSettings,
+    pub contact_shadow: ContactShadowSettings,
     pub bloom: BloomSettings,
     pub tonemap: TonemapSettings,
     pub color_grade: ColorGradeSettings,
@@ -34,6 +35,21 @@ pub struct AoSettings {
     pub steps: u32,
     /// GTAO: thickness / falloff scale in view space.
     pub thickness: f32,
+}
+
+/// Screen-space contact shadows along the primary directional light.
+#[derive(Clone, Debug)]
+pub struct ContactShadowSettings {
+    pub enabled: bool,
+    /// Ray length in world units.
+    pub length: f32,
+    /// Depth thickness tolerance (world units) for hit acceptance.
+    pub thickness: f32,
+    pub intensity: f32,
+    /// March steps (4..=32).
+    pub samples: u32,
+    /// Start offset along the ray to reduce self-occlusion.
+    pub bias: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -108,6 +124,14 @@ impl Default for PostProcessSettings {
                 steps: 8,
                 thickness: 1.0,
             },
+            contact_shadow: ContactShadowSettings {
+                enabled: false,
+                length: 0.4,
+                thickness: 0.08,
+                intensity: 1.0,
+                samples: 12,
+                bias: 0.002,
+            },
             bloom: BloomSettings {
                 enabled: false,
                 threshold: 0.7,
@@ -148,6 +172,7 @@ impl Default for PostProcessSettings {
 impl PostProcessSettings {
     pub fn any_enabled(&self) -> bool {
         self.ao.enabled
+            || self.contact_shadow.enabled
             || self.bloom.enabled
             || self.tonemap.enabled
             || self.color_grade.enabled
