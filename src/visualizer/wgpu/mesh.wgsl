@@ -228,8 +228,14 @@ fn ibl_contrib(
     return (diffuse + specular) * frame.ibl.x;
 }
 
+struct GBufferOut {
+    @location(0) color: vec4<f32>,
+    @location(1) normal: vec4<f32>,
+    @location(2) orm: vec4<f32>,
+}
+
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOutput) -> GBufferOut {
     let base = textureSample(albedo_tex, samp, in.uv) * object.albedo;
     let albedo = base.rgb;
     let mr = textureSample(mr_tex, samp, in.uv);
@@ -255,9 +261,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     for (var i = 0u; i < count; i++) {
         lit += light_contrib(frame.lights[i], in.world_pos, n, v, albedo, metallic, roughness);
     }
-    // camera_pos.w > 0.5 → linear HDR for post tonemap; else Reinhard for direct output.
-    if frame.camera_pos.w < 0.5 {
-        lit = lit / (lit + vec3<f32>(1.0));
-    }
-    return vec4<f32>(lit, base.a);
+    // Always linear HDR into G-buffer color (present/tonemap happens later).
+    var out: GBufferOut;
+    out.color = vec4<f32>(lit, base.a);
+    out.normal = vec4<f32>(n, 0.0);
+    // R = occlusion placeholder, G = roughness, B = metallic
+    out.orm = vec4<f32>(1.0, roughness, metallic, 1.0);
+    return out;
 }

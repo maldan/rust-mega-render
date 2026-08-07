@@ -84,8 +84,8 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
 
     if u.ao_intensity > 0.0 {
         let ao = textureSample(ao_tex, samp, i.uv).r;
-        // Keep some ambient in occluded areas so HDR doesn't crush before tonemap.
-        color *= mix(1.0, ao, u.ao_intensity * 0.75);
+        // intensity 0 = off, 1 = full AO, >1 = stronger darkening.
+        color *= mix(1.0, ao, clamp(u.ao_intensity, 0.0, 2.0));
     }
     if u.bloom_intensity > 0.0 {
         color += textureSample(bloom_tex, samp, i.uv).rgb * u.bloom_intensity;

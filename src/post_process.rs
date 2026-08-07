@@ -1,6 +1,6 @@
 #[derive(Clone, Debug)]
 pub struct PostProcessSettings {
-    pub ssao: SsaoSettings,
+    pub ao: AoSettings,
     pub bloom: BloomSettings,
     pub tonemap: TonemapSettings,
     pub color_grade: ColorGradeSettings,
@@ -10,12 +10,30 @@ pub struct PostProcessSettings {
     pub fog: FogSettings,
 }
 
+/// Which screen-space AO algorithm to run when [`AoSettings::enabled`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AoMethod {
+    /// Classic hemisphere kernel SSAO (depth-only normals).
+    Ssao,
+    /// Ground-truth AO (horizon search) using G-buffer normals.
+    #[default]
+    Gtao,
+}
+
 #[derive(Clone, Debug)]
-pub struct SsaoSettings {
+pub struct AoSettings {
     pub enabled: bool,
+    pub method: AoMethod,
     pub radius: f32,
+    /// SSAO sample bias along the normal.
     pub bias: f32,
     pub intensity: f32,
+    /// GTAO: number of slice directions (2..=8).
+    pub directions: u32,
+    /// GTAO: steps per horizon ray (2..=16).
+    pub steps: u32,
+    /// GTAO: thickness / falloff scale in view space.
+    pub thickness: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -80,11 +98,15 @@ pub struct FogSettings {
 impl Default for PostProcessSettings {
     fn default() -> Self {
         Self {
-            ssao: SsaoSettings {
+            ao: AoSettings {
                 enabled: false,
-                radius: 1.0,
+                method: AoMethod::Gtao,
+                radius: 0.55,
                 bias: 0.05,
                 intensity: 1.0,
+                directions: 6,
+                steps: 8,
+                thickness: 1.0,
             },
             bloom: BloomSettings {
                 enabled: false,
@@ -125,7 +147,7 @@ impl Default for PostProcessSettings {
 
 impl PostProcessSettings {
     pub fn any_enabled(&self) -> bool {
-        self.ssao.enabled
+        self.ao.enabled
             || self.bloom.enabled
             || self.tonemap.enabled
             || self.color_grade.enabled

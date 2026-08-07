@@ -1,0 +1,115 @@
+//! Thin G-buffer / frame targets for the wgpu visualizer.
+//!
+//! Layout (foundation for GTAO / SSR / SSGI / …):
+//! - `color`  — HDR lighting (`Rgba16Float`)
+//! - `normal` — world-space normals (`Rgba16Float`, xyz)
+//! - `orm`    — occlusion / roughness / metallic (`Rgba8Unorm`)
+//! - `depth`  — `Depth32Float`
+//! - `present`— internal sRGB present target when no external view is given
+
+pub struct FrameTargets {
+    pub _color: wgpu::Texture,
+    pub color_view: wgpu::TextureView,
+    pub _normal: wgpu::Texture,
+    pub normal_view: wgpu::TextureView,
+    pub _orm: wgpu::Texture,
+    pub orm_view: wgpu::TextureView,
+    pub _depth: wgpu::Texture,
+    pub depth_view: wgpu::TextureView,
+    pub _present: wgpu::Texture,
+    pub present_view: wgpu::TextureView,
+    pub size: (u32, u32),
+}
+
+impl FrameTargets {
+    pub fn new(device: &wgpu::Device, w: u32, h: u32) -> Self {
+        let w = w.max(1);
+        let h = h.max(1);
+        let size = wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        };
+        let make_tex = |label, format, extra_usage| {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | extra_usage,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&Default::default());
+            (tex, view)
+        };
+
+        let (color, color_view) = make_tex(
+            "gbuffer_color",
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureUsages::empty(),
+        );
+        let (normal, normal_view) = make_tex(
+            "gbuffer_normal",
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureUsages::empty(),
+        );
+        let (orm, orm_view) = make_tex(
+            "gbuffer_orm",
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::empty(),
+        );
+        let (present, present_view) = make_tex(
+            "present",
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureUsages::empty(),
+        );
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gbuffer_depth"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let depth_view = depth.create_view(&Default::default());
+
+        Self {
+            _color: color,
+            color_view,
+            _normal: normal,
+            normal_view,
+            _orm: orm,
+            orm_view,
+            _depth: depth,
+            depth_view,
+            _present: present,
+            present_view,
+            size: (w, h),
+        }
+    }
+
+    pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32) -> bool {
+        let w = w.max(1);
+        let h = h.max(1);
+        if self.size == (w, h) {
+            return false;
+        }
+        *self = Self::new(device, w, h);
+        true
+    }
+
+    /// Color formats for the opaque G-buffer pass (mesh / sky / debug overlay).
+    pub fn color_formats() -> [wgpu::TextureFormat; 3] {
+        [
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ]
+    }
+}

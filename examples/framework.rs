@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glam::{Vec2, Vec3};
-use mega_render::{Camera, PostProcessSettings, Scene, Visualizer, WgpuVisualizer};
+use mega_render::{Camera, DebugView, PostProcessSettings, Scene, Visualizer, WgpuVisualizer};
 use mega_ui::wgpu::{DrawStats, UiRenderer};
 use mega_ui::{CursorIcon, DockState, Ui, UiInput};
 use winit::application::ApplicationHandler;
@@ -25,12 +25,15 @@ pub const SCENE_TEX: u32 = 0;
 pub struct UiCtx<'a> {
     pub scene: &'a mut Scene,
     pub post: &'a mut PostProcessSettings,
+    pub debug_view: &'a mut DebugView,
     pub dock: &'a mut DockState,
     /// Full window size in pixels (for dock layout).
     pub window_size: Vec2,
     /// Set this to the scene pane size in **pixels** (from `ui.available_size()`).
     pub viewport_size: &'a mut Vec2,
     pub dt: f32,
+    /// Frames-per-second averaged over the last ~1 second.
+    pub fps: f32,
     pub stats: DrawStats,
 }
 
@@ -326,6 +329,9 @@ pub struct Host<D: Demo> {
     dock: DockState,
     input: FrameInput,
     last_frame: Instant,
+    fps_accum_dt: f32,
+    fps_frames: u32,
+    fps: f32,
     animating: bool,
     cursor: CursorIcon,
     draw_stats: DrawStats,
@@ -351,6 +357,9 @@ impl<D: Demo> Host<D> {
             dock,
             input: FrameInput::default(),
             last_frame: Instant::now(),
+            fps_accum_dt: 0.0,
+            fps_frames: 0,
+            fps: 0.0,
             animating: true,
             cursor: CursorIcon::Default,
             draw_stats: DrawStats::default(),
@@ -512,10 +521,18 @@ impl<D: Demo> Host<D> {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
+        self.fps_accum_dt += dt;
+        self.fps_frames += 1;
+        if self.fps_accum_dt >= 1.0 {
+            self.fps = self.fps_frames as f32 / self.fps_accum_dt;
+            self.fps_accum_dt = 0.0;
+            self.fps_frames = 0;
+        }
 
         if !self.want_capture_keyboard || self.fly.looking {
             self.fly.update(dt);
         }
+        self.scene.poll_loads();
         self.scene.update_animations(dt);
         let demo_anim = D::update(&mut self.scene, dt);
         self.fly.apply(&mut self.scene);
@@ -544,18 +561,22 @@ impl<D: Demo> Host<D> {
             };
 
             let mut viewport_size = self.viewport_size;
+            let mut debug_view = gpu.visualizer.debug_view();
             let keep_ui = {
                 let mut ctx = UiCtx {
                     scene: &mut self.scene,
                     post: gpu.visualizer.post_process(),
+                    debug_view: &mut debug_view,
                     dock: &mut self.dock,
                     window_size: viewport,
                     viewport_size: &mut viewport_size,
                     dt,
+                    fps: self.fps,
                     stats: self.draw_stats,
                 };
                 D::build_ui(&mut self.ui, &mut ctx)
             };
+            gpu.visualizer.set_debug_view(debug_view);
             self.viewport_size = viewport_size;
 
             let out = self.ui.end_frame();

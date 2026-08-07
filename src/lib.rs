@@ -3,6 +3,7 @@
 mod animation;
 mod camera;
 mod debug_draw;
+mod debug_view;
 mod gltf_load;
 mod ibl;
 mod light;
@@ -20,14 +21,15 @@ mod visualizer;
 pub use animation::{AnimChannel, AnimPath, AnimValues, AnimationClip, Animator};
 pub use camera::Camera;
 pub use debug_draw::{DebugDraw, DebugLine, DebugPoint};
+pub use debug_view::DebugView;
 pub use gltf_load::load_gltf;
 pub use light::{DirectionalLight, Light, PointLight};
 pub use material::Material;
 pub use mesh::Mesh;
 pub use node::{Node, Transform};
 pub use post_process::{
-    BloomSettings, ColorGradeSettings, FogSettings, FxaaSettings, GrainSettings,
-    PostProcessSettings, SsaoSettings, TonemapSettings, VignetteSettings,
+    AoMethod, AoSettings, BloomSettings, ColorGradeSettings, FogSettings, FxaaSettings,
+    GrainSettings, PostProcessSettings, TonemapSettings, VignetteSettings,
 };
 pub use primitives::{cube, plane, sphere};
 pub use scene::Scene;

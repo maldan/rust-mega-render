@@ -29,12 +29,22 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     return o;
 }
 
+struct GBufferOut {
+    @location(0) color: vec4<f32>,
+    @location(1) normal: vec4<f32>,
+    @location(2) orm: vec4<f32>,
+}
+
 @fragment
-fn fs(i: VsOut) -> @location(0) vec4<f32> {
+fn fs(i: VsOut) -> GBufferOut {
     let d = normalize(i.dir);
     let phi = atan2(d.z, d.x);
     let theta = acos(clamp(d.y, -1.0, 1.0));
     let uv = vec2(phi / (2.0 * PI) + 0.5, theta / PI);
     let color = textureSampleLevel(env_equirect, env_samp, uv, 0.0).rgb;
-    return vec4(color * u.params.x, 1.0);
+    var out: GBufferOut;
+    out.color = vec4(color * u.params.x, 1.0);
+    out.normal = vec4(-d, 0.0);
+    out.orm = vec4(1.0, 1.0, 0.0, 1.0);
+    return out;
 }

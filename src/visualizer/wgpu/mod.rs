@@ -1,13 +1,17 @@
 use super::Visualizer;
-use crate::{Mesh, PostProcessSettings, Scene, Texture};
+use crate::{DebugView, Mesh, PostProcessSettings, Scene, Texture};
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 
 mod post;
 mod ibl_gpu;
+mod frame_targets;
+mod debug_blit;
 use ibl_gpu::GpuIbl;
 use post::PostFx;
+use frame_targets::FrameTargets;
+use debug_blit::DebugBlit;
 
 const SHADOW_SIZE: u32 = 2048;
 const MAX_LIGHTS: usize = 8;
@@ -108,17 +112,13 @@ struct GpuTexture {
 pub struct WgpuVisualizer {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// MRT HDR mesh pipeline — 3 color targets (color / normal / orm).
     pipeline: wgpu::RenderPipeline,
-    pipeline_hdr: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     line_overlay_pipeline: wgpu::RenderPipeline,
     point_pipeline: wgpu::RenderPipeline,
     point_overlay_pipeline: wgpu::RenderPipeline,
-    line_pipeline_hdr: wgpu::RenderPipeline,
-    line_overlay_pipeline_hdr: wgpu::RenderPipeline,
-    point_pipeline_hdr: wgpu::RenderPipeline,
-    point_overlay_pipeline_hdr: wgpu::RenderPipeline,
     frame_bind_group: wgpu::BindGroup,
     frame_bind_layout: wgpu::BindGroupLayout,
     debug_bind_group: wgpu::BindGroup,
@@ -131,7 +131,6 @@ pub struct WgpuVisualizer {
     shadow_object_layout: wgpu::BindGroupLayout,
     sky_bind_layout: wgpu::BindGroupLayout,
     sky_pipeline: wgpu::RenderPipeline,
-    sky_pipeline_hdr: wgpu::RenderPipeline,
     sky_bind_group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
     shadow_samp: wgpu::Sampler,
@@ -141,12 +140,9 @@ pub struct WgpuVisualizer {
     ibl: GpuIbl,
     meshes: HashMap<(u32, u32), GpuMesh>,
     textures: HashMap<(u32, u32), GpuTexture>,
-    target: wgpu::Texture,
-    target_view: wgpu::TextureView,
-    scene_color: wgpu::Texture,
-    scene_color_view: wgpu::TextureView,
-    depth: wgpu::Texture,
-    depth_view: wgpu::TextureView,
+    frames: FrameTargets,
+    debug_blit: DebugBlit,
+    debug_view: DebugView,
     post_fx: PostFx,
     post: PostProcessSettings,
     _shadow_tex: wgpu::Texture,
@@ -448,23 +444,14 @@ impl WgpuVisualizer {
             bias: wgpu::DepthBiasState::default(),
         };
 
+        // Single MRT HDR mesh pipeline (3 color targets).
         let pipeline = mesh_pipeline(
             device,
             &pipeline_layout,
             &shader,
             &mesh_buffers,
             &depth_stencil,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-            "mesh",
-        );
-        let pipeline_hdr = mesh_pipeline(
-            device,
-            &pipeline_layout,
-            &shader,
-            &mesh_buffers,
-            &depth_stencil,
-            wgpu::TextureFormat::Rgba16Float,
-            "mesh_hdr",
+            "mesh_mrt",
         );
 
         let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -509,22 +496,8 @@ impl WgpuVisualizer {
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         };
-        let sky_pipeline = make_sky_pipeline(
-            device,
-            &sky_layout,
-            &sky_shader,
-            &sky_depth,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-            "sky",
-        );
-        let sky_pipeline_hdr = make_sky_pipeline(
-            device,
-            &sky_layout,
-            &sky_shader,
-            &sky_depth,
-            wgpu::TextureFormat::Rgba16Float,
-            "sky_hdr",
-        );
+        // Single MRT HDR sky pipeline.
+        let sky_pipeline = make_sky_pipeline(device, &sky_layout, &sky_shader, &sky_depth, "sky_mrt");
 
         let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
         let line_buffers = [Some(wgpu::VertexBufferLayout {
@@ -538,6 +511,8 @@ impl WgpuVisualizer {
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &point_attrs,
         })];
+
+        // MRT HDR debug pipelines only.
         let line_pipeline = debug_pipeline(
             device,
             &debug_layout,
@@ -547,7 +522,6 @@ impl WgpuVisualizer {
             wgpu::PrimitiveTopology::LineList,
             wgpu::CompareFunction::Less,
             &depth_stencil,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
         );
         let line_overlay_pipeline = debug_pipeline(
             device,
@@ -558,7 +532,6 @@ impl WgpuVisualizer {
             wgpu::PrimitiveTopology::LineList,
             wgpu::CompareFunction::Always,
             &depth_stencil,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
         );
         let point_pipeline = debug_pipeline(
             device,
@@ -569,7 +542,6 @@ impl WgpuVisualizer {
             wgpu::PrimitiveTopology::TriangleList,
             wgpu::CompareFunction::Less,
             &depth_stencil,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
         );
         let point_overlay_pipeline = debug_pipeline(
             device,
@@ -580,74 +552,24 @@ impl WgpuVisualizer {
             wgpu::PrimitiveTopology::TriangleList,
             wgpu::CompareFunction::Always,
             &depth_stencil,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-        );
-        let line_pipeline_hdr = debug_pipeline(
-            device,
-            &debug_layout,
-            &debug_shader,
-            "vs_main",
-            &line_buffers,
-            wgpu::PrimitiveTopology::LineList,
-            wgpu::CompareFunction::Less,
-            &depth_stencil,
-            wgpu::TextureFormat::Rgba16Float,
-        );
-        let line_overlay_pipeline_hdr = debug_pipeline(
-            device,
-            &debug_layout,
-            &debug_shader,
-            "vs_main",
-            &line_buffers,
-            wgpu::PrimitiveTopology::LineList,
-            wgpu::CompareFunction::Always,
-            &depth_stencil,
-            wgpu::TextureFormat::Rgba16Float,
-        );
-        let point_pipeline_hdr = debug_pipeline(
-            device,
-            &debug_layout,
-            &debug_shader,
-            "vs_point",
-            &point_buffers,
-            wgpu::PrimitiveTopology::TriangleList,
-            wgpu::CompareFunction::Less,
-            &depth_stencil,
-            wgpu::TextureFormat::Rgba16Float,
-        );
-        let point_overlay_pipeline_hdr = debug_pipeline(
-            device,
-            &debug_layout,
-            &debug_shader,
-            "vs_point",
-            &point_buffers,
-            wgpu::PrimitiveTopology::TriangleList,
-            wgpu::CompareFunction::Always,
-            &depth_stencil,
-            wgpu::TextureFormat::Rgba16Float,
         );
 
-        let (target, target_view, scene_color, scene_color_view, depth, depth_view) =
-            create_targets(device, 1, 1);
+        let frames = FrameTargets::new(device, 1, 1);
         let white = upload_texture(device, queue, &Texture::solid(255, 255, 255, 255));
         let flat_normal = upload_texture(device, queue, &Texture::solid_linear(128, 128, 255, 255));
         let default_mr = upload_texture(device, queue, &Texture::solid_linear(255, 255, 255, 255));
         let post_fx = PostFx::new(device, queue);
+        let debug_blit = DebugBlit::new(device, queue);
 
         Self {
             device: device.clone(),
             queue: queue.clone(),
             pipeline,
-            pipeline_hdr,
             shadow_pipeline,
             line_pipeline,
             line_overlay_pipeline,
             point_pipeline,
             point_overlay_pipeline,
-            line_pipeline_hdr,
-            line_overlay_pipeline_hdr,
-            point_pipeline_hdr,
-            point_overlay_pipeline_hdr,
             frame_bind_group,
             frame_bind_layout,
             debug_bind_group,
@@ -660,7 +582,6 @@ impl WgpuVisualizer {
             shadow_object_layout,
             sky_bind_layout,
             sky_pipeline,
-            sky_pipeline_hdr,
             sky_bind_group,
             sampler,
             shadow_samp,
@@ -670,12 +591,9 @@ impl WgpuVisualizer {
             ibl,
             meshes: HashMap::new(),
             textures: HashMap::new(),
-            target,
-            target_view,
-            scene_color,
-            scene_color_view,
-            depth,
-            depth_view,
+            frames,
+            debug_blit,
+            debug_view: DebugView::Final,
             post_fx,
             post: PostProcessSettings::default(),
             _shadow_tex: shadow_tex,
@@ -715,7 +633,7 @@ impl WgpuVisualizer {
     }
 
     pub fn target_view(&self) -> &wgpu::TextureView {
-        &self.target_view
+        &self.frames.present_view
     }
 
     pub fn ensure_target(&mut self, w: u32, h: u32) -> bool {
@@ -725,21 +643,14 @@ impl WgpuVisualizer {
             return false;
         }
         self.size = (w, h);
-        let (t, tv, sc, scv, d, dv) = create_targets(&self.device, w, h);
-        self.target = t;
-        self.target_view = tv;
-        self.scene_color = sc;
-        self.scene_color_view = scv;
-        self.depth = d;
-        self.depth_view = dv;
+        self.frames.resize(&self.device, w, h);
         self.post_fx.resize(&self.device, w, h);
         true
     }
 
     /// Render into an external color target (e.g. swapchain).
     ///
-    /// `color` must be `Rgba8UnormSrgb` (same as the mesh pipeline).
-    /// Depth / post intermediates still use the internal targets from `ensure_target`.
+    /// `color` must be `Rgba8UnormSrgb`.
     pub fn render_to(&mut self, scene: &Scene, aspect: f32, color: &wgpu::TextureView) {
         self.render_inner(scene, aspect, Some(color));
     }
@@ -758,7 +669,8 @@ impl WgpuVisualizer {
 
         let eye = scene.camera.eye;
         let view_proj = scene.camera.view_proj(aspect);
-        let use_post = self.post.any_enabled();
+
+        // Always output linear HDR into the G-buffer.
         self.queue.write_buffer(
             &self.frame_uniform_buf,
             0,
@@ -771,8 +683,8 @@ impl WgpuVisualizer {
                     scene.ambient[2],
                     light_count as f32,
                 ],
-                // w > 0.5 → linear output for post tonemap
-                camera_pos: [eye.x, eye.y, eye.z, if use_post { 1.0 } else { 0.0 }],
+                // w = 1.0 → always output linear HDR
+                camera_pos: [eye.x, eye.y, eye.z, 1.0],
                 ibl: [
                     scene.ibl_intensity,
                     self.ibl.max_mip,
@@ -912,6 +824,7 @@ impl WgpuVisualizer {
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
 
+        // Shadow pass (unchanged).
         if scene.shadow_directional().is_some() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow_pass"),
@@ -941,32 +854,49 @@ impl WgpuVisualizer {
             }
         }
 
+        // Geometry pass: always render into the G-buffer MRT.
         {
-            let scene_color_view = if use_post {
-                &self.scene_color_view
-            } else if let Some(ext) = external {
-                ext
-            } else {
-                &self.target_view
-            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: scene_color_view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.08,
-                            g: 0.09,
-                            b: 0.12,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
+                color_attachments: &[
+                    // color0: HDR scene color (dark background)
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.frames.color_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.08,
+                                g: 0.09,
+                                b: 0.12,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    // color1: world-space normals (clear to black = no normal)
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.frames.normal_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    // color2: ORM (clear to white = full roughness / occlusion)
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.frames.orm_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
+                    view: &self.frames.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -977,11 +907,7 @@ impl WgpuVisualizer {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(if use_post {
-                &self.pipeline_hdr
-            } else {
-                &self.pipeline
-            });
+            pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.frame_bind_group, &[]);
 
             for (i, (mesh_key, albedo_key, normal_key, mr_key, _, _, _, _)) in draws.iter().enumerate()
@@ -1029,39 +955,24 @@ impl WgpuVisualizer {
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
             }
 
-            let (line_pipe, line_overlay_pipe, point_pipe, point_overlay_pipe) = if use_post {
-                (
-                    &self.line_pipeline_hdr,
-                    &self.line_overlay_pipeline_hdr,
-                    &self.point_pipeline_hdr,
-                    &self.point_overlay_pipeline_hdr,
-                )
-            } else {
-                (
-                    &self.line_pipeline,
-                    &self.line_overlay_pipeline,
-                    &self.point_pipeline,
-                    &self.point_overlay_pipeline,
-                )
-            };
-            draw_debug_lines(&mut pass, line_pipe, &self.debug_bind_group, &line_buf, debug.lines.len());
+            draw_debug_lines(&mut pass, &self.line_pipeline, &self.debug_bind_group, &line_buf, debug.lines.len());
             draw_debug_points(
                 &mut pass,
-                point_pipe,
+                &self.point_pipeline,
                 &self.debug_bind_group,
                 &point_buf,
                 debug.points.len(),
             );
             draw_debug_lines(
                 &mut pass,
-                line_overlay_pipe,
+                &self.line_overlay_pipeline,
                 &self.debug_bind_group,
                 &line_overlay_buf,
                 debug.lines_overlay.len(),
             );
             draw_debug_points(
                 &mut pass,
-                point_overlay_pipe,
+                &self.point_overlay_pipeline,
                 &self.debug_bind_group,
                 &point_overlay_buf,
                 debug.points_overlay.len(),
@@ -1089,37 +1000,82 @@ impl WgpuVisualizer {
                         params: [scene.ibl_intensity, 0.0, 0.0, 0.0],
                     }),
                 );
-                pass.set_pipeline(if use_post {
-                    &self.sky_pipeline_hdr
-                } else {
-                    &self.sky_pipeline
-                });
+                pass.set_pipeline(&self.sky_pipeline);
                 pass.set_bind_group(0, &self.sky_bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
         }
 
-        // Post: scene_color → SSAO / Bloom / composite / FXAA → output
-        if use_post {
-            let proj = glam::camera::lh::proj::directx::perspective(
-                scene.camera.fov_y,
-                aspect,
-                scene.camera.near,
-                scene.camera.far,
+        // Present: G-buffer → output.
+        let out = external.unwrap_or(&self.frames.present_view);
+        let exposure = self.post.tonemap.exposure;
+        let near = scene.camera.near;
+        let far = scene.camera.far;
+        let proj = glam::camera::lh::proj::directx::perspective(
+            scene.camera.fov_y,
+            aspect,
+            near,
+            far,
+        );
+
+        if self.debug_view == DebugView::Final && self.post.any_enabled() {
+            let view = glam::camera::lh::view::look_at_mat4(
+                scene.camera.eye,
+                scene.camera.target,
+                scene.camera.up,
             );
-            let post_dst = external.unwrap_or(&self.target_view);
             self.post_fx.apply(
                 &self.device,
                 &self.queue,
                 &mut encoder,
                 &self.post,
-                &self.scene_color_view,
-                &self.depth_view,
-                post_dst,
+                &self.frames.color_view,
+                &self.frames.depth_view,
+                &self.frames.normal_view,
+                out,
                 proj,
+                view,
                 view_proj,
                 [eye.x, eye.y, eye.z],
                 self.size,
+            );
+        } else {
+            let ao = if self.debug_view == DebugView::Ao {
+                let view = glam::camera::lh::view::look_at_mat4(
+                    scene.camera.eye,
+                    scene.camera.target,
+                    scene.camera.up,
+                );
+                self.post_fx.generate_ao(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    &self.post.ao,
+                    &self.frames.depth_view,
+                    &self.frames.normal_view,
+                    proj,
+                    view,
+                    self.size,
+                );
+                Some(self.post_fx.ao_view())
+            } else {
+                None
+            };
+            self.debug_blit.blit(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                self.debug_view,
+                &self.frames.color_view,
+                &self.frames.normal_view,
+                &self.frames.orm_view,
+                &self.frames.depth_view,
+                ao,
+                out,
+                exposure,
+                near,
+                far,
+                self.post.ao.intensity,
             );
         }
 
@@ -1158,6 +1114,14 @@ impl Visualizer for WgpuVisualizer {
     fn render(&mut self, scene: &Scene, aspect: f32) {
         self.render_inner(scene, aspect, None);
     }
+
+    fn debug_view(&self) -> DebugView {
+        self.debug_view
+    }
+
+    fn set_debug_view(&mut self, view: DebugView) {
+        self.debug_view = view;
+    }
 }
 
 fn pack_lights(scene: &Scene) -> ([GpuLight; MAX_LIGHTS], u32) {
@@ -1173,8 +1137,11 @@ fn pack_lights(scene: &Scene) -> ([GpuLight; MAX_LIGHTS], u32) {
         if count as usize >= MAX_LIGHTS {
             break;
         }
-        out[count as usize] = match light {
+        let gpu = match light {
             Light::Directional(d) => {
+                if !d.enabled {
+                    continue;
+                }
                 let dir = d.direction.normalize_or_zero();
                 let cast = if d.cast_shadows && !shadow_assigned {
                     shadow_assigned = true;
@@ -1188,12 +1155,18 @@ fn pack_lights(scene: &Scene) -> ([GpuLight; MAX_LIGHTS], u32) {
                     params: [0.0, cast, 0.0, 0.0],
                 }
             }
-            Light::Point(p) => GpuLight {
-                pos_or_dir: [p.position.x, p.position.y, p.position.z, 1.0],
-                color: [p.color[0], p.color[1], p.color[2], p.intensity],
-                params: [p.range, 0.0, 0.0, 0.0],
-            },
+            Light::Point(p) => {
+                if !p.enabled {
+                    continue;
+                }
+                GpuLight {
+                    pos_or_dir: [p.position.x, p.position.y, p.position.z, 1.0],
+                    color: [p.color[0], p.color[1], p.color[2], p.intensity],
+                    params: [p.range, 0.0, 0.0, 0.0],
+                }
+            }
         };
+        out[count as usize] = gpu;
         count += 1;
     }
     (out, count)
@@ -1380,14 +1353,15 @@ fn make_sky_bind_group(
     })
 }
 
+/// Sky pipeline targeting the G-buffer MRT (3 color targets).
 fn make_sky_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
     depth_stencil: &wgpu::DepthStencilState,
-    format: wgpu::TextureFormat,
     label: &str,
 ) -> wgpu::RenderPipeline {
+    let formats = FrameTargets::color_formats();
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
         layout: Some(layout),
@@ -1400,11 +1374,23 @@ fn make_sky_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some("fs"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
+            targets: &[
+                Some(wgpu::ColorTargetState {
+                    format: formats[0],
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: formats[1],
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: formats[2],
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
             compilation_options: Default::default(),
         }),
         primitive: wgpu::PrimitiveState {
@@ -1419,15 +1405,16 @@ fn make_sky_pipeline(
     })
 }
 
+/// Mesh pipeline targeting the G-buffer MRT (3 color targets).
 fn mesh_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
     buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
     depth_stencil: &wgpu::DepthStencilState,
-    format: wgpu::TextureFormat,
     label: &str,
 ) -> wgpu::RenderPipeline {
+    let formats = FrameTargets::color_formats();
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
         layout: Some(layout),
@@ -1440,11 +1427,23 @@ fn mesh_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some("fs_main"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
+            targets: &[
+                Some(wgpu::ColorTargetState {
+                    format: formats[0],
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: formats[1],
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: formats[2],
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
             compilation_options: Default::default(),
         }),
         primitive: wgpu::PrimitiveState {
@@ -1460,6 +1459,8 @@ fn mesh_pipeline(
     })
 }
 
+/// Debug line/point pipeline targeting the G-buffer MRT (3 color targets).
+/// Alpha blend on color0; no writes to normal/ORM targets.
 fn debug_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -1469,8 +1470,8 @@ fn debug_pipeline(
     topology: wgpu::PrimitiveTopology,
     depth_compare: wgpu::CompareFunction,
     depth_stencil: &wgpu::DepthStencilState,
-    format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
+    let formats = FrameTargets::color_formats();
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("debug"),
         layout: Some(layout),
@@ -1483,11 +1484,26 @@ fn debug_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some("fs_main"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
+            targets: &[
+                // color0: alpha-blended debug overlay
+                Some(wgpu::ColorTargetState {
+                    format: formats[0],
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                // color1: normals — no write (debug doesn't modify G-buffer)
+                Some(wgpu::ColorTargetState {
+                    format: formats[1],
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::empty(),
+                }),
+                // color2: ORM — no write
+                Some(wgpu::ColorTargetState {
+                    format: formats[2],
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::empty(),
+                }),
+            ],
             compilation_options: Default::default(),
         }),
         primitive: wgpu::PrimitiveState {
@@ -1647,66 +1663,4 @@ fn create_shadow_map(device: &wgpu::Device) -> (wgpu::Texture, wgpu::TextureView
     });
     let view = tex.create_view(&Default::default());
     (tex, view)
-}
-
-fn create_targets(
-    device: &wgpu::Device,
-    w: u32,
-    h: u32,
-) -> (
-    wgpu::Texture,
-    wgpu::TextureView,
-    wgpu::Texture,
-    wgpu::TextureView,
-    wgpu::Texture,
-    wgpu::TextureView,
-) {
-    let size = wgpu::Extent3d {
-        width: w,
-        height: h,
-        depth_or_array_layers: 1,
-    };
-    let color = |label, format, usage| {
-        let tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage,
-            view_formats: &[],
-        });
-        let view = tex.create_view(&Default::default());
-        (tex, view)
-    };
-    let (target, target_view) = color(
-        "scene_rt",
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-    );
-    let (scene_color, scene_color_view) = color(
-        "scene_color",
-        wgpu::TextureFormat::Rgba16Float,
-        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-    );
-    let depth = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("scene_depth"),
-        size,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let depth_view = depth.create_view(&Default::default());
-    (
-        target,
-        target_view,
-        scene_color,
-        scene_color_view,
-        depth,
-        depth_view,
-    )
 }

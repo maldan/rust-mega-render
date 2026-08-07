@@ -1,4 +1,4 @@
-use crate::PostProcessSettings;
+use crate::{AoMethod, AoSettings, PostProcessSettings};
 use glam::Mat4;
 
 const SSAO_KERNEL: usize = 32;
@@ -14,6 +14,20 @@ struct SsaoUniforms {
     resolution: [f32; 2],
     radius: f32,
     bias: f32,
+    noise_scale: [f32; 2],
+    _pad: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GtaoUniforms {
+    proj: [[f32; 4]; 4],
+    inv_proj: [[f32; 4]; 4],
+    view: [[f32; 4]; 4],
+    resolution: [f32; 2],
+    radius: f32,
+    thickness: f32,
+    params: [f32; 4],
     noise_scale: [f32; 2],
     _pad: [f32; 2],
 }
@@ -71,6 +85,7 @@ struct Rt {
 
 pub struct PostFx {
     ssao_pipe: wgpu::RenderPipeline,
+    gtao_pipe: wgpu::RenderPipeline,
     blur_pipe: wgpu::RenderPipeline,
     bloom_extract_pipe: wgpu::RenderPipeline,
     bloom_down_pipe: wgpu::RenderPipeline,
@@ -79,12 +94,14 @@ pub struct PostFx {
     fxaa_pipe: wgpu::RenderPipeline,
 
     ssao_bgl: wgpu::BindGroupLayout,
+    gtao_bgl: wgpu::BindGroupLayout,
     blur_bgl: wgpu::BindGroupLayout,
     bloom_bgl: wgpu::BindGroupLayout,
     composite_bgl: wgpu::BindGroupLayout,
     fxaa_bgl: wgpu::BindGroupLayout,
 
     ssao_ubo: wgpu::Buffer,
+    gtao_ubo: wgpu::Buffer,
     blur_ubo: wgpu::Buffer,
     bloom_ubo: wgpu::Buffer,
     composite_ubo: wgpu::Buffer,
@@ -110,6 +127,7 @@ pub struct PostFx {
 impl PostFx {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
         let ssao_shader = device.create_shader_module(wgpu::include_wgsl!("ssao.wgsl"));
+        let gtao_shader = device.create_shader_module(wgpu::include_wgsl!("gtao.wgsl"));
         let blur_shader = device.create_shader_module(wgpu::include_wgsl!("blur.wgsl"));
         let bloom_shader = device.create_shader_module(wgpu::include_wgsl!("bloom.wgsl"));
         let composite_shader = device.create_shader_module(wgpu::include_wgsl!("composite.wgsl"));
@@ -123,6 +141,18 @@ impl PostFx {
                 nearest_samp_entry(2),
                 tex_entry(3, true),
                 nearest_samp_entry(4),
+            ],
+        });
+        let gtao_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gtao"),
+            entries: &[
+                ubo_entry(0, wgpu::ShaderStages::FRAGMENT),
+                depth_entry(1),
+                nearest_samp_entry(2),
+                tex_entry(3, true),
+                filter_samp_entry(4),
+                tex_entry(5, true),
+                nearest_samp_entry(6),
             ],
         });
         let blur_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -169,6 +199,15 @@ impl PostFx {
             "ssao",
             &ssao_bgl,
             &ssao_shader,
+            "fs",
+            wgpu::TextureFormat::R8Unorm,
+            None,
+        );
+        let gtao_pipe = fullscreen_pipe(
+            device,
+            "gtao",
+            &gtao_bgl,
+            &gtao_shader,
             "fs",
             wgpu::TextureFormat::R8Unorm,
             None,
@@ -241,6 +280,12 @@ impl PostFx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let gtao_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gtao_ubo"),
+            size: std::mem::size_of::<GtaoUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let blur_ubo = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("blur_ubo"),
             size: std::mem::size_of::<BlurUniforms>() as u64,
@@ -299,6 +344,7 @@ impl PostFx {
 
         Self {
             ssao_pipe,
+            gtao_pipe,
             blur_pipe,
             bloom_extract_pipe,
             bloom_down_pipe,
@@ -306,11 +352,13 @@ impl PostFx {
             composite_pipe,
             fxaa_pipe,
             ssao_bgl,
+            gtao_bgl,
             blur_bgl,
             bloom_bgl,
             composite_bgl,
             fxaa_bgl,
             ssao_ubo,
+            gtao_ubo,
             blur_ubo,
             bloom_ubo,
             composite_ubo,
@@ -358,6 +406,178 @@ impl PostFx {
         }
     }
 
+    /// Blurred AO result (`R8Unorm`). Valid after [`Self::generate_ao`] / [`Self::apply`].
+    pub fn ao_view(&self) -> &wgpu::TextureView {
+        &self.ao.view
+    }
+
+    /// Run SSAO or GTAO (+ bilateral blur) into the internal AO target.
+    pub fn generate_ao(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        settings: &AoSettings,
+        depth: &wgpu::TextureView,
+        normals: &wgpu::TextureView,
+        proj: Mat4,
+        view: Mat4,
+        size: (u32, u32),
+    ) {
+        let (w, h) = size;
+        match settings.method {
+            AoMethod::Ssao => {
+                queue.write_buffer(
+                    &self.ssao_ubo,
+                    0,
+                    bytemuck::bytes_of(&SsaoUniforms {
+                        proj: proj.to_cols_array_2d(),
+                        inv_proj: proj.inverse().to_cols_array_2d(),
+                        kernel: self.kernel,
+                        resolution: [w as f32, h as f32],
+                        radius: settings.radius,
+                        bias: settings.bias,
+                        noise_scale: [w as f32 / NOISE_SIZE as f32, h as f32 / NOISE_SIZE as f32],
+                        _pad: [0.0; 2],
+                    }),
+                );
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("ssao"),
+                    layout: &self.ssao_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.ssao_ubo.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(depth),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&self.noise_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::Sampler(&self.noise_samp),
+                        },
+                    ],
+                });
+                {
+                    let mut pass = color_pass(
+                        encoder,
+                        "ssao",
+                        &self.ao.view,
+                        wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                    );
+                    pass.set_pipeline(&self.ssao_pipe);
+                    pass.set_bind_group(0, &bg, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+            }
+            AoMethod::Gtao => {
+                queue.write_buffer(
+                    &self.gtao_ubo,
+                    0,
+                    bytemuck::bytes_of(&GtaoUniforms {
+                        proj: proj.to_cols_array_2d(),
+                        inv_proj: proj.inverse().to_cols_array_2d(),
+                        view: view.to_cols_array_2d(),
+                        resolution: [w as f32, h as f32],
+                        radius: settings.radius,
+                        thickness: settings.thickness,
+                        params: [
+                            settings.directions.max(2) as f32,
+                            settings.steps.max(2) as f32,
+                            0.0,
+                            0.0,
+                        ],
+                        noise_scale: [w as f32 / NOISE_SIZE as f32, h as f32 / NOISE_SIZE as f32],
+                        _pad: [0.0; 2],
+                    }),
+                );
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("gtao"),
+                    layout: &self.gtao_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.gtao_ubo.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(depth),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(normals),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::TextureView(&self.noise_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::Sampler(&self.noise_samp),
+                        },
+                    ],
+                });
+                {
+                    let mut pass = color_pass(
+                        encoder,
+                        "gtao",
+                        &self.ao.view,
+                        wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                    );
+                    pass.set_pipeline(&self.gtao_pipe);
+                    pass.set_bind_group(0, &bg, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+            }
+        }
+
+        // GTAO is lower-frequency / slice-noisy → slightly wider bilateral blur.
+        let (blur_px, blur_sigma) = match settings.method {
+            AoMethod::Gtao => (1.6, 55.0),
+            AoMethod::Ssao => (1.0, 80.0),
+        };
+
+        self.blur_pass(
+            device,
+            queue,
+            encoder,
+            &self.ao.view,
+            &self.ao_temp.view,
+            depth,
+            [blur_px / w as f32, 0.0],
+            true,
+            blur_sigma,
+        );
+        self.blur_pass(
+            device,
+            queue,
+            encoder,
+            &self.ao_temp.view,
+            &self.ao.view,
+            depth,
+            [0.0, blur_px / h as f32],
+            true,
+            blur_sigma,
+        );
+    }
+
     pub fn apply(
         &self,
         device: &wgpu::Device,
@@ -366,81 +586,26 @@ impl PostFx {
         settings: &PostProcessSettings,
         scene_color: &wgpu::TextureView,
         depth: &wgpu::TextureView,
+        normals: &wgpu::TextureView,
         target: &wgpu::TextureView,
         proj: Mat4,
+        view: Mat4,
         view_proj: Mat4,
         camera_pos: [f32; 3],
         size: (u32, u32),
     ) {
         let (w, h) = size;
-        if settings.ssao.enabled {
-            queue.write_buffer(
-                &self.ssao_ubo,
-                0,
-                bytemuck::bytes_of(&SsaoUniforms {
-                    proj: proj.to_cols_array_2d(),
-                    inv_proj: proj.inverse().to_cols_array_2d(),
-                    kernel: self.kernel,
-                    resolution: [w as f32, h as f32],
-                    radius: settings.ssao.radius,
-                    bias: settings.ssao.bias,
-                    noise_scale: [w as f32 / NOISE_SIZE as f32, h as f32 / NOISE_SIZE as f32],
-                    _pad: [0.0; 2],
-                }),
-            );
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("ssao"),
-                layout: &self.ssao_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.ssao_ubo.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(depth),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&self.noise_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: wgpu::BindingResource::Sampler(&self.noise_samp),
-                    },
-                ],
-            });
-            {
-                let mut pass =
-                    color_pass(encoder, "ssao", &self.ao.view, wgpu::LoadOp::Clear(wgpu::Color::WHITE));
-                pass.set_pipeline(&self.ssao_pipe);
-                pass.set_bind_group(0, &bg, &[]);
-                pass.draw(0..3, 0..1);
-            }
-
-            self.blur_pass(
+        if settings.ao.enabled {
+            self.generate_ao(
                 device,
                 queue,
                 encoder,
-                &self.ao.view,
-                &self.ao_temp.view,
+                &settings.ao,
                 depth,
-                [1.0 / w as f32, 0.0],
-                true,
-            );
-            self.blur_pass(
-                device,
-                queue,
-                encoder,
-                &self.ao_temp.view,
-                &self.ao.view,
-                depth,
-                [0.0, 1.0 / h as f32],
-                true,
+                normals,
+                proj,
+                view,
+                size,
             );
         }
 
@@ -485,7 +650,7 @@ impl PostFx {
             }
         }
 
-        let ao_view = if settings.ssao.enabled {
+        let ao_view = if settings.ao.enabled {
             &self.ao.view
         } else {
             &self.white_view
@@ -537,8 +702,8 @@ impl PostFx {
                 fog_height: fog.height,
                 fog_height_falloff: fog.height_falloff,
                 fog_enabled: if fog.enabled { 1.0 } else { 0.0 },
-                ao_intensity: if settings.ssao.enabled {
-                    settings.ssao.intensity
+                ao_intensity: if settings.ao.enabled {
+                    settings.ao.intensity
                 } else {
                     0.0
                 },
@@ -655,13 +820,14 @@ impl PostFx {
         depth: &wgpu::TextureView,
         direction: [f32; 2],
         use_depth: bool,
+        depth_sigma: f32,
     ) {
         queue.write_buffer(
             &self.blur_ubo,
             0,
             bytemuck::bytes_of(&BlurUniforms {
                 direction,
-                depth_sigma: 80.0,
+                depth_sigma,
                 use_depth: if use_depth { 1.0 } else { 0.0 },
             }),
         );

@@ -95,10 +95,10 @@ impl Scene {
         m
     }
 
-    /// First directional light with `cast_shadows`.
+    /// First enabled directional light with `cast_shadows`.
     pub fn shadow_directional(&self) -> Option<&DirectionalLight> {
         self.lights.iter().find_map(|l| match l {
-            Light::Directional(d) if d.cast_shadows => Some(d),
+            Light::Directional(d) if d.enabled && d.cast_shadows => Some(d),
             _ => None,
         })
     }
