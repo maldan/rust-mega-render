@@ -15,8 +15,8 @@ mod framework;
 use framework::{Demo, Host, SCENE_TEX, UiCtx};
 use glam::{Vec2, Vec3};
 use mega_render::{
-    cube, plane, sphere, AoMethod, DebugView, Light, Material, Node, PointLight, Scene, Transform,
-    Visualizer, WgpuVisualizer,
+    cube, plane, sphere, AoMethod, DebugView, Light, Material, Node, PointLight, Scene,
+    ShadowFilter, Transform, Visualizer, WgpuVisualizer,
 };
 use mega_ui::{DockNode, DockState, ScrollAxes, TextStyle, Ui};
 
@@ -175,6 +175,13 @@ impl Demo for MaterialDemo {
     }
 
     fn configure(visualizer: &mut WgpuVisualizer) {
+        let shadow = visualizer.shadow_settings();
+        shadow.filter = ShadowFilter::Pcss;
+        shadow.map_size = 4096;
+        shadow.pcss_light_size = 0.35;
+        shadow.pcss_blocker_samples = 16;
+        shadow.pcss_filter_samples = 48;
+
         let post = visualizer.post_process();
         post.ao.enabled = true;
         post.ao.method = AoMethod::Gtao;
@@ -218,6 +225,7 @@ impl Demo for MaterialDemo {
         let UiCtx {
             scene,
             post,
+            shadow,
             debug_view,
             dock,
             viewport_size,
@@ -423,6 +431,61 @@ impl Demo for MaterialDemo {
                             ui.slider("Dir X", &mut d.direction.x, -1.0..=1.0);
                             ui.slider("Dir Y", &mut d.direction.y, -1.0..=1.0);
                             ui.slider("Dir Z", &mut d.direction.z, -1.0..=1.0);
+                            if d.cast_shadows {
+                                ui.separator();
+                                ui.label("Shadows (visualizer)");
+                                ui.label("Shadow map size");
+                                let mut map_idx = match shadow.map_size {
+                                    1024 => 0usize,
+                                    4096 => 2,
+                                    _ => 1,
+                                };
+                                if ui
+                                    .select("shadow_map_size", &mut map_idx, &["1024", "2048", "4096"])
+                                    .changed()
+                                {
+                                    shadow.map_size = match map_idx {
+                                        0 => 1024,
+                                        2 => 4096,
+                                        _ => 2048,
+                                    };
+                                }
+                                ui.label("Shadow filter");
+                                let mut filter = match shadow.filter {
+                                    ShadowFilter::Pcf => 0usize,
+                                    ShadowFilter::Pcss => 1,
+                                };
+                                if ui
+                                    .select("shadow_filter", &mut filter, &["PCF", "PCSS"])
+                                    .changed()
+                                {
+                                    shadow.filter = if filter == 0 {
+                                        ShadowFilter::Pcf
+                                    } else {
+                                        ShadowFilter::Pcss
+                                    };
+                                }
+                                ui.add_enabled(shadow.filter == ShadowFilter::Pcss, |ui| {
+                                    ui.label("Light size — мягкость (0 = острая, 1 = макс)");
+                                    ui.slider(
+                                        "Light size",
+                                        &mut shadow.pcss_light_size,
+                                        0.0..=1.0,
+                                    );
+                                    let mut blockers = shadow.pcss_blocker_samples as f32;
+                                    ui.label("Blocker samples — поиск окклюдеров");
+                                    if ui.slider("Blocker samples", &mut blockers, 4.0..=16.0).changed()
+                                    {
+                                        shadow.pcss_blocker_samples = blockers.round() as u32;
+                                    }
+                                    let mut filters = shadow.pcss_filter_samples as f32;
+                                    ui.label("Filter samples — сэмплы penumbra");
+                                    if ui.slider("Filter samples", &mut filters, 8.0..=48.0).changed()
+                                    {
+                                        shadow.pcss_filter_samples = filters.round() as u32;
+                                    }
+                                });
+                            }
                         });
                     });
                 }

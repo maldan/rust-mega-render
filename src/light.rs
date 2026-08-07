@@ -11,7 +11,7 @@ pub struct DirectionalLight {
     pub color: [f32; 3],
     pub intensity: f32,
     pub enabled: bool,
-    /// Only directional lights can cast shadows.
+    /// Whether this light may cast shadows (technique is up to the visualizer).
     pub cast_shadows: bool,
 }
 

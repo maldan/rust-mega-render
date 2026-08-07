@@ -3,8 +3,10 @@ struct FrameUniforms {
     light_view_proj: mat4x4<f32>,
     ambient: vec4<f32>, // xyz ambient, w = light count
     camera_pos: vec4<f32>,
-    // x = ibl intensity, y = prefilter max mip, z = ibl enabled, w unused
+    // x = ibl intensity, y = prefilter max mip, z = ibl enabled, w = pcss filter samples
     ibl: vec4<f32>,
+    // x = filter (0=pcf, 1=pcss), y = light_size, z = 1/shadow_map_size, w = blocker samples
+    shadow: vec4<f32>,
     lights: array<GpuLight, 8>,
 }
 
@@ -29,6 +31,7 @@ struct ObjectUniforms {
 @group(0) @binding(4) var brdf_lut: texture_2d<f32>;
 @group(0) @binding(5) var env_samp: sampler;
 @group(0) @binding(6) var clamp_samp: sampler;
+@group(0) @binding(7) var shadow_depth_samp: sampler;
 @group(1) @binding(0) var<uniform> object: ObjectUniforms;
 @group(1) @binding(1) var albedo_tex: texture_2d<f32>;
 @group(1) @binding(2) var normal_tex: texture_2d<f32>;
@@ -83,6 +86,44 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     return out;
 }
 
+fn ign(p: vec2<f32>) -> f32 {
+    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+/// Vogel disk sample in unit disk; `phi` rotates the pattern per-pixel to kill banding.
+fn vogel(i: u32, count: u32, phi: f32) -> vec2<f32> {
+    let r = sqrt((f32(i) + 0.5) / f32(count));
+    let theta = f32(i) * 2.39996323 + phi;
+    return vec2(cos(theta), sin(theta)) * r;
+}
+
+fn pcf_3x3(uv: vec2<f32>, z_recv: f32, texel: f32) -> f32 {
+    var shadow = 0.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let offset = vec2<f32>(f32(x), f32(y)) * texel;
+            shadow += textureSampleCompare(shadow_map, shadow_samp, uv + offset, z_recv);
+        }
+    }
+    return shadow / 9.0;
+}
+
+/// Soft disk PCF — hides shadow-map texel squares better than a 3×3 grid up close.
+fn pcf_vogel(uv: vec2<f32>, z_recv: f32, radius: f32, phi: f32) -> f32 {
+    const TAPS: u32 = 24u;
+    var shadow = 0.0;
+    var wsum = 0.0;
+    for (var i = 0u; i < TAPS; i++) {
+        let sample_uv = uv + vogel(i, TAPS, phi) * radius;
+        if sample_uv.x < 0.0 || sample_uv.x > 1.0 || sample_uv.y < 0.0 || sample_uv.y > 1.0 {
+            continue;
+        }
+        shadow += textureSampleCompare(shadow_map, shadow_samp, sample_uv, z_recv);
+        wsum += 1.0;
+    }
+    return select(1.0, shadow / wsum, wsum > 0.5);
+}
+
 fn shadow_factor(world_pos: vec3<f32>, n: vec3<f32>, l: vec3<f32>) -> f32 {
     let light_clip = frame.light_view_proj * vec4<f32>(world_pos, 1.0);
     let ndc = light_clip.xyz / light_clip.w;
@@ -90,16 +131,66 @@ fn shadow_factor(world_pos: vec3<f32>, n: vec3<f32>, l: vec3<f32>) -> f32 {
     if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z < 0.0 || ndc.z > 1.0 {
         return 1.0;
     }
-    let bias = max(0.0004 * (1.0 - dot(n, l)), 0.0001);
-    var shadow = 0.0;
-    let texel = 1.0 / 2048.0;
-    for (var y = -1; y <= 1; y++) {
-        for (var x = -1; x <= 1; x++) {
-            let offset = vec2<f32>(f32(x), f32(y)) * texel;
-            shadow += textureSampleCompare(shadow_map, shadow_samp, uv + offset, ndc.z - bias);
+    let bias = max(0.0005 * (1.0 - dot(n, l)), 0.00015);
+    let z_recv = ndc.z - bias;
+    let texel = frame.shadow.z;
+    let use_pcss = frame.shadow.x > 0.5;
+    // Continuous noise — NOT floored to shadow texels (that locks pattern into visible squares).
+    let map_res = 1.0 / max(texel, 1e-6);
+    let phi = ign(uv * map_res) * 6.2831853;
+
+    if !use_pcss {
+        return pcf_3x3(uv, z_recv, texel);
+    }
+
+    let softness = clamp(frame.shadow.y, 0.0, 1.0);
+    let blocker_taps = u32(clamp(frame.shadow.w, 4.0, 16.0));
+    let filter_taps = u32(clamp(frame.ibl.w, 8.0, 48.0));
+
+    if softness < 0.001 {
+        return pcf_vogel(uv, z_recv, texel * 2.5, phi);
+    }
+
+    let size_uv = softness * softness * 0.10;
+    let search_radius = max(size_uv * 0.7, texel * 4.0);
+    let blocker_bias = bias * 2.5 + texel * 1.5;
+
+    var blocker_sum = 0.0;
+    var blocker_count = 0.0;
+    for (var i = 0u; i < blocker_taps; i++) {
+        let sample_uv = uv + vogel(i, blocker_taps, phi) * search_radius;
+        if sample_uv.x < 0.0 || sample_uv.x > 1.0 || sample_uv.y < 0.0 || sample_uv.y > 1.0 {
+            continue;
+        }
+        let z = textureSample(shadow_map, shadow_depth_samp, sample_uv);
+        if z + blocker_bias < z_recv {
+            blocker_sum += z;
+            blocker_count += 1.0;
         }
     }
-    return shadow / 9.0;
+
+    let min_radius = texel * mix(2.5, 6.0, softness);
+    if blocker_count < 1.5 {
+        return pcf_vogel(uv, z_recv, min_radius, phi);
+    }
+
+    let avg_blocker = blocker_sum / blocker_count;
+    let gap = max(z_recv - avg_blocker, 0.0);
+    var penumbra = gap * size_uv * 8.0;
+    penumbra = clamp(penumbra, min_radius, max(size_uv, min_radius));
+
+    var shadow = 0.0;
+    var wsum = 0.0;
+    let phi_f = phi + 1.6180339;
+    for (var i = 0u; i < filter_taps; i++) {
+        let sample_uv = uv + vogel(i, filter_taps, phi_f) * penumbra;
+        if sample_uv.x < 0.0 || sample_uv.x > 1.0 || sample_uv.y < 0.0 || sample_uv.y > 1.0 {
+            continue;
+        }
+        shadow += textureSampleCompare(shadow_map, shadow_samp, sample_uv, z_recv);
+        wsum += 1.0;
+    }
+    return select(pcf_vogel(uv, z_recv, min_radius, phi), shadow / wsum, wsum > 0.5);
 }
 
 fn distribution_ggx(n: vec3<f32>, h: vec3<f32>, roughness: f32) -> f32 {

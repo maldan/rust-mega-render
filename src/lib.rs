@@ -13,6 +13,7 @@ mod node;
 mod post_process;
 mod primitives;
 mod scene;
+mod shadow;
 mod skin;
 mod store;
 mod texture;
@@ -33,6 +34,7 @@ pub use post_process::{
 };
 pub use primitives::{cube, plane, sphere};
 pub use scene::Scene;
+pub use shadow::{ShadowFilter, ShadowSettings};
 pub use skin::Skin;
 pub use store::{Handle, Store};
 pub use texture::Texture;

@@ -1,5 +1,5 @@
 use super::Visualizer;
-use crate::{DebugView, Mesh, PostProcessSettings, Scene, Texture};
+use crate::{DebugView, Mesh, PostProcessSettings, Scene, ShadowFilter, ShadowSettings, Texture};
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
 use wgpu::util::DeviceExt;
@@ -13,7 +13,7 @@ use post::PostFx;
 use frame_targets::FrameTargets;
 use debug_blit::DebugBlit;
 
-const SHADOW_SIZE: u32 = 2048;
+const DEFAULT_SHADOW_SIZE: u32 = 2048;
 const MAX_LIGHTS: usize = 8;
 const MAX_BONES: usize = 128;
 const OBJECT_UBO_SIZE: u64 = (std::mem::size_of::<ObjectUniforms>() as u64 + 255) & !255;
@@ -69,8 +69,10 @@ struct FrameUniforms {
     light_view_proj: [[f32; 4]; 4],
     ambient: [f32; 4],
     camera_pos: [f32; 4],
-    /// x = intensity, y = max mip, z = enabled, w unused
+    /// x = intensity, y = max mip, z = enabled, w = pcss filter samples
     ibl: [f32; 4],
+    /// x = filter (0=pcf, 1=pcss), y = light_size, z = 1/map_size, w = blocker samples
+    shadow: [f32; 4],
     lights: [GpuLight; MAX_LIGHTS],
 }
 
@@ -134,6 +136,7 @@ pub struct WgpuVisualizer {
     sky_bind_group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
     shadow_samp: wgpu::Sampler,
+    shadow_depth_samp: wgpu::Sampler,
     white: GpuTexture,
     flat_normal: GpuTexture,
     default_mr: GpuTexture,
@@ -145,8 +148,10 @@ pub struct WgpuVisualizer {
     debug_view: DebugView,
     post_fx: PostFx,
     post: PostProcessSettings,
+    shadow: ShadowSettings,
     _shadow_tex: wgpu::Texture,
     shadow_view: wgpu::TextureView,
+    shadow_map_size: u32,
     size: (u32, u32),
 }
 
@@ -192,8 +197,13 @@ impl WgpuVisualizer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let shadow_depth_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
 
-        let (shadow_tex, shadow_view) = create_shadow_map(device);
+        let (shadow_tex, shadow_view) = create_shadow_map(device, DEFAULT_SHADOW_SIZE);
         let ibl = GpuIbl::black(device, queue);
 
         let frame_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -255,6 +265,12 @@ impl WgpuVisualizer {
                     binding: 6,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                     count: None,
                 },
             ],
@@ -387,6 +403,7 @@ impl WgpuVisualizer {
             &frame_uniform_buf,
             &shadow_view,
             &shadow_samp,
+            &shadow_depth_samp,
             &ibl,
         );
         let sky_bind_group = make_sky_bind_group(device, &sky_bind_layout, &sky_uniform_buf, &ibl);
@@ -585,6 +602,7 @@ impl WgpuVisualizer {
             sky_bind_group,
             sampler,
             shadow_samp,
+            shadow_depth_samp,
             white,
             flat_normal,
             default_mr,
@@ -596,12 +614,28 @@ impl WgpuVisualizer {
             debug_view: DebugView::Final,
             post_fx,
             post: PostProcessSettings::default(),
+            shadow: ShadowSettings::default(),
             _shadow_tex: shadow_tex,
             shadow_view,
+            shadow_map_size: DEFAULT_SHADOW_SIZE,
             size: (1, 1),
         }
     }
 
+    fn ensure_shadow_map(&mut self, requested: u32) {
+        let size = match requested {
+            1024 | 2048 | 4096 => requested,
+            _ => DEFAULT_SHADOW_SIZE,
+        };
+        if self.shadow_map_size == size {
+            return;
+        }
+        let (tex, view) = create_shadow_map(&self.device, size);
+        self._shadow_tex = tex;
+        self.shadow_view = view;
+        self.shadow_map_size = size;
+        self.rebuild_ibl_bind_groups();
+    }
     /// Load an equirectangular HDR/EXR, bake IBL maps, and enable env lighting + skybox.
     pub fn set_env_map(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), String> {
         let ibl = ibl_gpu::load_and_upload(&self.device, &self.queue, path)?;
@@ -622,6 +656,7 @@ impl WgpuVisualizer {
             &self.frame_uniform_buf,
             &self.shadow_view,
             &self.shadow_samp,
+            &self.shadow_depth_samp,
             &self.ibl,
         );
         self.sky_bind_group = make_sky_bind_group(
@@ -661,11 +696,20 @@ impl WgpuVisualizer {
         aspect: f32,
         external: Option<&wgpu::TextureView>,
     ) {
-        let shadow_dir = scene
-            .shadow_directional()
-            .map(|d| d.direction.normalize_or_zero());
-        let light_vp = shadow_dir.map(sun_view_proj).unwrap_or(Mat4::IDENTITY);
+        let shadow_dir = scene.shadow_directional();
+        self.ensure_shadow_map(self.shadow.map_size);
+
+        let light_vp = shadow_dir
+            .map(|d| sun_view_proj(d.direction.normalize_or_zero()))
+            .unwrap_or(Mat4::IDENTITY);
         let (gpu_lights, light_count) = pack_lights(scene);
+        let shadow_filter = match self.shadow.filter {
+            ShadowFilter::Pcf => 0.0,
+            ShadowFilter::Pcss => 1.0,
+        };
+        let pcss_light_size = self.shadow.pcss_light_size.clamp(0.0, 1.0);
+        let blocker_samples = self.shadow.pcss_blocker_samples.clamp(4, 16) as f32;
+        let filter_samples = self.shadow.pcss_filter_samples.clamp(8, 48) as f32;
 
         let eye = scene.camera.eye;
         let view_proj = scene.camera.view_proj(aspect);
@@ -689,7 +733,13 @@ impl WgpuVisualizer {
                     scene.ibl_intensity,
                     self.ibl.max_mip,
                     if self.ibl.enabled { 1.0 } else { 0.0 },
-                    0.0,
+                    filter_samples,
+                ],
+                shadow: [
+                    shadow_filter,
+                    pcss_light_size,
+                    1.0 / self.shadow_map_size as f32,
+                    blocker_samples,
                 ],
                 lights: gpu_lights,
             }),
@@ -1142,6 +1192,14 @@ impl Visualizer for WgpuVisualizer {
         &mut self.post
     }
 
+    fn shadow_settings(&mut self) -> &mut ShadowSettings {
+        &mut self.shadow
+    }
+
+    fn effect_settings(&mut self) -> (&mut PostProcessSettings, &mut ShadowSettings) {
+        (&mut self.post, &mut self.shadow)
+    }
+
     fn render(&mut self, scene: &Scene, aspect: f32) {
         self.render_inner(scene, aspect, None);
     }
@@ -1320,6 +1378,7 @@ fn make_frame_bind_group(
     frame_ubo: &wgpu::Buffer,
     shadow_view: &wgpu::TextureView,
     shadow_samp: &wgpu::Sampler,
+    shadow_depth_samp: &wgpu::Sampler,
     ibl: &GpuIbl,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1353,6 +1412,10 @@ fn make_frame_bind_group(
             wgpu::BindGroupEntry {
                 binding: 6,
                 resource: wgpu::BindingResource::Sampler(&ibl.clamp_samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::Sampler(shadow_depth_samp),
             },
         ],
     })
@@ -1677,12 +1740,13 @@ fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture) -> 
     }
 }
 
-fn create_shadow_map(device: &wgpu::Device) -> (wgpu::Texture, wgpu::TextureView) {
+fn create_shadow_map(device: &wgpu::Device, size: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let size = size.max(256);
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("shadow_map"),
         size: wgpu::Extent3d {
-            width: SHADOW_SIZE,
-            height: SHADOW_SIZE,
+            width: size,
+            height: size,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
