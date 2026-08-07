@@ -7,6 +7,8 @@ struct FrameUniforms {
     ibl: vec4<f32>,
     // x = filter (0=pcf, 1=pcss), y = light_size, z = 1/shadow_map_size, w = blocker samples
     shadow: vec4<f32>,
+    // x = IBL diffuse / constant-ambient scale (1 = full; reduced when SSGI is on)
+    gi: vec4<f32>,
     lights: array<GpuLight, 8>,
 }
 
@@ -288,6 +290,7 @@ fn ibl_contrib(
     albedo: vec3<f32>,
     metallic: f32,
     roughness: f32,
+    ambient_gi: f32,
 ) -> vec3<f32> {
     let n = normalize(n_in);
     let v = normalize(v_in);
@@ -301,7 +304,7 @@ fn ibl_contrib(
     // Diffuse: heavily blurred equirect along the normal (no cubemap seams).
     // Not a perfect cosine irradiance integral, but stable and energy-sane after compress.
     let irradiance = sample_env(n, frame.ibl.y);
-    let diffuse = kd * albedo * irradiance;
+    let diffuse = kd * albedo * irradiance * ambient_gi;
 
     // Specular: reflect env. Dielectrics only reflect ~4% at face-on (F0),
     // more at grazing via the BRDF LUT. Metals reflect strongly tinted by albedo.
@@ -323,6 +326,7 @@ struct GBufferOut {
     @location(0) color: vec4<f32>,
     @location(1) normal: vec4<f32>,
     @location(2) orm: vec4<f32>,
+    @location(3) albedo: vec4<f32>,
 }
 
 @fragment
@@ -341,11 +345,14 @@ fn fs_main(in: VertexOutput) -> GBufferOut {
 
     let v = normalize(frame.camera_pos.xyz - in.world_pos);
 
+    // Scale down IBL/constant diffuse when SSGI is active (frame.gi.x).
+    let ambient_gi = clamp(frame.gi.x, 0.0, 1.0);
+
     var lit = vec3<f32>(0.0);
     if frame.ibl.z > 0.5 {
-        lit += ibl_contrib(n, v, albedo, metallic, roughness);
+        lit += ibl_contrib(n, v, albedo, metallic, roughness, ambient_gi);
     } else {
-        lit += frame.ambient.xyz * albedo;
+        lit += frame.ambient.xyz * albedo * ambient_gi;
     }
 
     let count = u32(frame.ambient.w);
@@ -358,5 +365,6 @@ fn fs_main(in: VertexOutput) -> GBufferOut {
     out.normal = vec4<f32>(n, 0.0);
     // R = occlusion placeholder, G = roughness, B = metallic
     out.orm = vec4<f32>(1.0, roughness, metallic, 1.0);
+    out.albedo = vec4<f32>(albedo, 1.0);
     return out;
 }

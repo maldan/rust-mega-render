@@ -73,6 +73,8 @@ struct FrameUniforms {
     ibl: [f32; 4],
     /// x = filter (0=pcf, 1=pcss), y = light_size, z = 1/map_size, w = blocker samples
     shadow: [f32; 4],
+    /// x = IBL diffuse / constant-ambient scale (1 = full)
+    gi: [f32; 4],
     lights: [GpuLight; MAX_LIGHTS],
 }
 
@@ -114,7 +116,7 @@ struct GpuTexture {
 pub struct WgpuVisualizer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    /// MRT HDR mesh pipeline — 3 color targets (color / normal / orm).
+    /// MRT HDR mesh pipeline — 4 color targets (color / normal / orm / albedo).
     pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
@@ -714,6 +716,12 @@ impl WgpuVisualizer {
         let eye = scene.camera.eye;
         let view_proj = scene.camera.view_proj(aspect);
 
+        let ambient_gi = if self.post.ssgi.enabled {
+            (1.0 - self.post.ssgi.ambient_dim.clamp(0.0, 1.0)).max(0.0)
+        } else {
+            1.0
+        };
+
         // Always output linear HDR into the G-buffer.
         self.queue.write_buffer(
             &self.frame_uniform_buf,
@@ -741,6 +749,7 @@ impl WgpuVisualizer {
                     1.0 / self.shadow_map_size as f32,
                     blocker_samples,
                 ],
+                gi: [ambient_gi, 0.0, 0.0, 0.0],
                 lights: gpu_lights,
             }),
         );
@@ -944,6 +953,16 @@ impl WgpuVisualizer {
                             store: wgpu::StoreOp::Store,
                         },
                     }),
+                    // color3: albedo (clear to black)
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.frames.albedo_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
                 ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.frames.depth_view,
@@ -1086,6 +1105,8 @@ impl WgpuVisualizer {
                 &self.frames.color_view,
                 &self.frames.depth_view,
                 &self.frames.normal_view,
+                &self.frames.albedo_view,
+                &self.frames.orm_view,
                 out,
                 proj,
                 view,
@@ -1134,12 +1155,32 @@ impl WgpuVisualizer {
                 } else {
                     None
                 }
+            } else if self.debug_view == DebugView::Ssgi {
+                self.post_fx.generate_ssgi(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    &self.post.ssgi,
+                    &self.frames.color_view,
+                    &self.frames.depth_view,
+                    &self.frames.normal_view,
+                    &self.frames.albedo_view,
+                    &self.frames.orm_view,
+                    proj,
+                    view,
+                    view_proj,
+                    self.size,
+                );
+                Some(self.post_fx.ssgi_view())
+            } else if self.debug_view == DebugView::Albedo {
+                Some(&self.frames.albedo_view)
             } else {
                 None
             };
             let occlusion_intensity = match self.debug_view {
                 DebugView::Ao => self.post.ao.intensity,
                 DebugView::ContactShadow => self.post.contact_shadow.intensity,
+                DebugView::Ssgi => self.post.ssgi.intensity,
                 _ => 1.0,
             };
             self.debug_blit.blit(
@@ -1447,7 +1488,7 @@ fn make_sky_bind_group(
     })
 }
 
-/// Sky pipeline targeting the G-buffer MRT (3 color targets).
+/// Sky pipeline targeting the G-buffer MRT (4 color targets).
 fn make_sky_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -1456,6 +1497,7 @@ fn make_sky_pipeline(
     label: &str,
 ) -> wgpu::RenderPipeline {
     let formats = FrameTargets::color_formats();
+    let targets = gbuffer_targets(&formats, false);
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
         layout: Some(layout),
@@ -1468,23 +1510,7 @@ fn make_sky_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some("fs"),
-            targets: &[
-                Some(wgpu::ColorTargetState {
-                    format: formats[0],
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-                Some(wgpu::ColorTargetState {
-                    format: formats[1],
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-                Some(wgpu::ColorTargetState {
-                    format: formats[2],
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-            ],
+            targets: &targets,
             compilation_options: Default::default(),
         }),
         primitive: wgpu::PrimitiveState {
@@ -1499,7 +1525,7 @@ fn make_sky_pipeline(
     })
 }
 
-/// Mesh pipeline targeting the G-buffer MRT (3 color targets).
+/// Mesh pipeline targeting the G-buffer MRT (4 color targets).
 fn mesh_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -1509,6 +1535,7 @@ fn mesh_pipeline(
     label: &str,
 ) -> wgpu::RenderPipeline {
     let formats = FrameTargets::color_formats();
+    let targets = gbuffer_targets(&formats, false);
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
         layout: Some(layout),
@@ -1521,23 +1548,7 @@ fn mesh_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some("fs_main"),
-            targets: &[
-                Some(wgpu::ColorTargetState {
-                    format: formats[0],
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-                Some(wgpu::ColorTargetState {
-                    format: formats[1],
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-                Some(wgpu::ColorTargetState {
-                    format: formats[2],
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-            ],
+            targets: &targets,
             compilation_options: Default::default(),
         }),
         primitive: wgpu::PrimitiveState {
@@ -1553,8 +1564,8 @@ fn mesh_pipeline(
     })
 }
 
-/// Debug line/point pipeline targeting the G-buffer MRT (3 color targets).
-/// Alpha blend on color0; no writes to normal/ORM targets.
+/// Debug line/point pipeline targeting the G-buffer MRT (4 color targets).
+/// Alpha blend on color0; no writes to normal/ORM/albedo targets.
 fn debug_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -1566,6 +1577,7 @@ fn debug_pipeline(
     depth_stencil: &wgpu::DepthStencilState,
 ) -> wgpu::RenderPipeline {
     let formats = FrameTargets::color_formats();
+    let targets = gbuffer_targets(&formats, true);
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("debug"),
         layout: Some(layout),
@@ -1578,26 +1590,7 @@ fn debug_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some("fs_main"),
-            targets: &[
-                // color0: alpha-blended debug overlay
-                Some(wgpu::ColorTargetState {
-                    format: formats[0],
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-                // color1: normals — no write (debug doesn't modify G-buffer)
-                Some(wgpu::ColorTargetState {
-                    format: formats[1],
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::empty(),
-                }),
-                // color2: ORM — no write
-                Some(wgpu::ColorTargetState {
-                    format: formats[2],
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::empty(),
-                }),
-            ],
+            targets: &targets,
             compilation_options: Default::default(),
         }),
         primitive: wgpu::PrimitiveState {
@@ -1613,6 +1606,44 @@ fn debug_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+fn gbuffer_targets(
+    formats: &[wgpu::TextureFormat; 4],
+    debug_overlay: bool,
+) -> [Option<wgpu::ColorTargetState>; 4] {
+    let side_mask = if debug_overlay {
+        wgpu::ColorWrites::empty()
+    } else {
+        wgpu::ColorWrites::ALL
+    };
+    let color0_blend = if debug_overlay {
+        Some(wgpu::BlendState::ALPHA_BLENDING)
+    } else {
+        None
+    };
+    [
+        Some(wgpu::ColorTargetState {
+            format: formats[0],
+            blend: color0_blend,
+            write_mask: wgpu::ColorWrites::ALL,
+        }),
+        Some(wgpu::ColorTargetState {
+            format: formats[1],
+            blend: None,
+            write_mask: side_mask,
+        }),
+        Some(wgpu::ColorTargetState {
+            format: formats[2],
+            blend: None,
+            write_mask: side_mask,
+        }),
+        Some(wgpu::ColorTargetState {
+            format: formats[3],
+            blend: None,
+            write_mask: side_mask,
+        }),
+    ]
 }
 
 fn object_bind_group(

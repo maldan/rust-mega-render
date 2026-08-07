@@ -30,7 +30,8 @@ pub use mesh::Mesh;
 pub use node::{Node, Transform};
 pub use post_process::{
     AoMethod, AoSettings, BloomSettings, ColorGradeSettings, ContactShadowSettings, FogSettings,
-    FxaaSettings, GrainSettings, PostProcessSettings, TonemapSettings, VignetteSettings,
+    FxaaSettings, GrainSettings, PostProcessSettings, SsgiSettings, TonemapSettings,
+    VignetteSettings,
 };
 pub use primitives::{cube, plane, sphere};
 pub use scene::Scene;

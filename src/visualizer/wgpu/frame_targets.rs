@@ -4,6 +4,7 @@
 //! - `color`  — HDR lighting (`Rgba16Float`)
 //! - `normal` — world-space normals (`Rgba16Float`, xyz)
 //! - `orm`    — occlusion / roughness / metallic (`Rgba8Unorm`)
+//! - `albedo` — base color (`Rgba8Unorm`, rgb) for diffuse SSGI
 //! - `depth`  — `Depth32Float`
 //! - `present`— internal sRGB present target when no external view is given
 
@@ -14,6 +15,8 @@ pub struct FrameTargets {
     pub normal_view: wgpu::TextureView,
     pub _orm: wgpu::Texture,
     pub orm_view: wgpu::TextureView,
+    pub _albedo: wgpu::Texture,
+    pub albedo_view: wgpu::TextureView,
     pub _depth: wgpu::Texture,
     pub depth_view: wgpu::TextureView,
     pub _present: wgpu::Texture,
@@ -62,6 +65,11 @@ impl FrameTargets {
             wgpu::TextureFormat::Rgba8Unorm,
             wgpu::TextureUsages::empty(),
         );
+        let (albedo, albedo_view) = make_tex(
+            "gbuffer_albedo",
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::empty(),
+        );
         let (present, present_view) = make_tex(
             "present",
             wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -86,6 +94,8 @@ impl FrameTargets {
             normal_view,
             _orm: orm,
             orm_view,
+            _albedo: albedo,
+            albedo_view,
             _depth: depth,
             depth_view,
             _present: present,
@@ -105,10 +115,11 @@ impl FrameTargets {
     }
 
     /// Color formats for the opaque G-buffer pass (mesh / sky / debug overlay).
-    pub fn color_formats() -> [wgpu::TextureFormat; 3] {
+    pub fn color_formats() -> [wgpu::TextureFormat; 4] {
         [
             wgpu::TextureFormat::Rgba16Float,
             wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureFormat::Rgba8Unorm,
             wgpu::TextureFormat::Rgba8Unorm,
         ]
     }

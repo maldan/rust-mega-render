@@ -68,6 +68,18 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
         let t = clamp(z / far, 0.0, 1.0);
         return vec4(vec3(t), 1.0);
     }
+    if mode == 8u {
+        // SSGI HDR preview — expose + Reinhard.
+        let intensity = max(u.ao_params.x, 0.0);
+        var c = textureSampleLevel(ao_tex, samp, i.uv, 0.0).rgb * exposure * intensity;
+        c = tonemap_reinhard(c);
+        return vec4(c, 1.0);
+    }
+    if mode == 9u {
+        // Albedo G-buffer (passed via ao_tex binding in Albedo debug mode).
+        let a = textureSampleLevel(ao_tex, samp, i.uv, 0.0).rgb;
+        return vec4(a, 1.0);
+    }
     // AO (6) / Contact shadow (7) — intensity matches Final composite.
     let ao = textureSampleLevel(ao_tex, samp, i.uv, 0.0).r;
     let intensity = clamp(u.ao_params.x, 0.0, 2.0);

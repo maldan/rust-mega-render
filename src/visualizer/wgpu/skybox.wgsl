@@ -33,6 +33,7 @@ struct GBufferOut {
     @location(0) color: vec4<f32>,
     @location(1) normal: vec4<f32>,
     @location(2) orm: vec4<f32>,
+    @location(3) albedo: vec4<f32>,
 }
 
 @fragment
@@ -46,5 +47,7 @@ fn fs(i: VsOut) -> GBufferOut {
     out.color = vec4(color * u.params.x, 1.0);
     out.normal = vec4(-d, 0.0);
     out.orm = vec4(1.0, 1.0, 0.0, 1.0);
+    // Sky is not a diffuse bounce surface for SSGI.
+    out.albedo = vec4(0.0);
     return out;
 }

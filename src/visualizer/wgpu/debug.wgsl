@@ -48,6 +48,7 @@ struct GBufferOut {
     @location(0) color: vec4<f32>,
     @location(1) normal: vec4<f32>,
     @location(2) orm: vec4<f32>,
+    @location(3) albedo: vec4<f32>,
 }
 
 @fragment
@@ -56,5 +57,6 @@ fn fs_main(in: VertexOutput) -> GBufferOut {
     out.color = in.color;
     out.normal = vec4(0.0);
     out.orm = vec4(0.0);
+    out.albedo = vec4(0.0);
     return out;
 }

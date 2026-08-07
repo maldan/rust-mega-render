@@ -1,4 +1,4 @@
-use crate::{AoMethod, AoSettings, ContactShadowSettings, PostProcessSettings};
+use crate::{AoMethod, AoSettings, ContactShadowSettings, PostProcessSettings, SsgiSettings};
 use glam::{Mat4, Vec3};
 
 const SSAO_KERNEL: usize = 32;
@@ -47,6 +47,36 @@ struct ContactUniforms {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SsgiUniforms {
+    proj: [[f32; 4]; 4],
+    inv_proj: [[f32; 4]; 4],
+    view: [[f32; 4]; 4],
+    resolution: [f32; 2],
+    radius: f32,
+    thickness: f32,
+    params: [f32; 4],
+    full_resolution: [f32; 2],
+    _pad: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SsgiTemporalUniforms {
+    inv_view_proj: [[f32; 4]; 4],
+    prev_view_proj: [[f32; 4]; 4],
+    params: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SsgiUpsampleUniforms {
+    half_texel: [f32; 2],
+    depth_sigma: f32,
+    _pad: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct BlurUniforms {
     direction: [f32; 2],
     depth_sigma: f32,
@@ -81,7 +111,8 @@ struct CompositeUniforms {
     vignette_smoothness: f32,
     grain_intensity: f32,
     contact_intensity: f32,
-    _pad: [f32; 2],
+    ssgi_intensity: f32,
+    _pad: f32,
 }
 
 #[repr(C)]
@@ -101,7 +132,12 @@ pub struct PostFx {
     ssao_pipe: wgpu::RenderPipeline,
     gtao_pipe: wgpu::RenderPipeline,
     contact_pipe: wgpu::RenderPipeline,
+    ssgi_pipe: wgpu::RenderPipeline,
+    ssgi_temporal_pipe: wgpu::RenderPipeline,
+    ssgi_upsample_pipe: wgpu::RenderPipeline,
+    copy_hdr_pipe: wgpu::RenderPipeline,
     blur_pipe: wgpu::RenderPipeline,
+    blur_hdr_pipe: wgpu::RenderPipeline,
     bloom_extract_pipe: wgpu::RenderPipeline,
     bloom_down_pipe: wgpu::RenderPipeline,
     bloom_up_pipe: wgpu::RenderPipeline,
@@ -111,6 +147,10 @@ pub struct PostFx {
     ssao_bgl: wgpu::BindGroupLayout,
     gtao_bgl: wgpu::BindGroupLayout,
     contact_bgl: wgpu::BindGroupLayout,
+    ssgi_bgl: wgpu::BindGroupLayout,
+    ssgi_temporal_bgl: wgpu::BindGroupLayout,
+    ssgi_upsample_bgl: wgpu::BindGroupLayout,
+    copy_bgl: wgpu::BindGroupLayout,
     blur_bgl: wgpu::BindGroupLayout,
     bloom_bgl: wgpu::BindGroupLayout,
     composite_bgl: wgpu::BindGroupLayout,
@@ -119,6 +159,9 @@ pub struct PostFx {
     ssao_ubo: wgpu::Buffer,
     gtao_ubo: wgpu::Buffer,
     contact_ubo: wgpu::Buffer,
+    ssgi_ubo: wgpu::Buffer,
+    ssgi_temporal_ubo: wgpu::Buffer,
+    ssgi_upsample_ubo: wgpu::Buffer,
     blur_ubo: wgpu::Buffer,
     bloom_ubo: wgpu::Buffer,
     composite_ubo: wgpu::Buffer,
@@ -134,12 +177,20 @@ pub struct PostFx {
     ao: Rt,
     ao_temp: Rt,
     contact: Rt,
+    ssgi: Rt,
+    ssgi_temp: Rt,
+    ssgi_hist: Rt,
+    ssgi_full: Rt,
     bloom: Vec<Rt>,
     composite_temp: Rt,
     white_view: wgpu::TextureView,
     _white: wgpu::Texture,
     black_view: wgpu::TextureView,
     _black: wgpu::Texture,
+
+    prev_view_proj: Mat4,
+    ssgi_has_history: bool,
+    ssgi_frame: u32,
 }
 
 impl PostFx {
@@ -147,6 +198,12 @@ impl PostFx {
         let ssao_shader = device.create_shader_module(wgpu::include_wgsl!("ssao.wgsl"));
         let gtao_shader = device.create_shader_module(wgpu::include_wgsl!("gtao.wgsl"));
         let contact_shader = device.create_shader_module(wgpu::include_wgsl!("contact_shadow.wgsl"));
+        let ssgi_shader = device.create_shader_module(wgpu::include_wgsl!("ssgi.wgsl"));
+        let ssgi_temporal_shader =
+            device.create_shader_module(wgpu::include_wgsl!("ssgi_temporal.wgsl"));
+        let ssgi_upsample_shader =
+            device.create_shader_module(wgpu::include_wgsl!("ssgi_upsample.wgsl"));
+        let copy_shader = device.create_shader_module(wgpu::include_wgsl!("copy.wgsl"));
         let blur_shader = device.create_shader_module(wgpu::include_wgsl!("blur.wgsl"));
         let bloom_shader = device.create_shader_module(wgpu::include_wgsl!("bloom.wgsl"));
         let composite_shader = device.create_shader_module(wgpu::include_wgsl!("composite.wgsl"));
@@ -184,6 +241,47 @@ impl PostFx {
                 filter_samp_entry(4),
             ],
         });
+        let ssgi_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ssgi"),
+            entries: &[
+                ubo_entry(0, wgpu::ShaderStages::FRAGMENT),
+                depth_entry(1),
+                nearest_samp_entry(2),
+                tex_entry(3, true),
+                filter_samp_entry(4),
+                tex_entry(5, true),
+                filter_samp_entry(6),
+                tex_entry(7, true),
+                filter_samp_entry(8),
+                tex_entry(9, true),
+                filter_samp_entry(10),
+            ],
+        });
+        let ssgi_temporal_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ssgi_temporal"),
+            entries: &[
+                ubo_entry(0, wgpu::ShaderStages::FRAGMENT),
+                tex_entry(1, true),
+                tex_entry(2, true),
+                nearest_samp_entry(3),
+                depth_entry(4),
+                nearest_samp_entry(5),
+            ],
+        });
+        let ssgi_upsample_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ssgi_upsample"),
+            entries: &[
+                ubo_entry(0, wgpu::ShaderStages::FRAGMENT),
+                tex_entry(1, true),
+                filter_samp_entry(2),
+                depth_entry(3),
+                nearest_samp_entry(4),
+            ],
+        });
+        let copy_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("copy_hdr"),
+            entries: &[tex_entry(0, true), nearest_samp_entry(1)],
+        });
         let blur_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("blur"),
             entries: &[
@@ -213,6 +311,7 @@ impl PostFx {
                 filter_samp_entry(5),
                 nearest_samp_entry(6),
                 tex_entry(7, true),
+                tex_entry(8, true),
             ],
         });
         let fxaa_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -251,6 +350,42 @@ impl PostFx {
             wgpu::TextureFormat::R8Unorm,
             None,
         );
+        let ssgi_pipe = fullscreen_pipe(
+            device,
+            "ssgi",
+            &ssgi_bgl,
+            &ssgi_shader,
+            "fs",
+            wgpu::TextureFormat::Rgba16Float,
+            None,
+        );
+        let ssgi_temporal_pipe = fullscreen_pipe(
+            device,
+            "ssgi_temporal",
+            &ssgi_temporal_bgl,
+            &ssgi_temporal_shader,
+            "fs",
+            wgpu::TextureFormat::Rgba16Float,
+            None,
+        );
+        let ssgi_upsample_pipe = fullscreen_pipe(
+            device,
+            "ssgi_upsample",
+            &ssgi_upsample_bgl,
+            &ssgi_upsample_shader,
+            "fs",
+            wgpu::TextureFormat::Rgba16Float,
+            None,
+        );
+        let copy_hdr_pipe = fullscreen_pipe(
+            device,
+            "copy_hdr",
+            &copy_bgl,
+            &copy_shader,
+            "fs",
+            wgpu::TextureFormat::Rgba16Float,
+            None,
+        );
         let blur_pipe = fullscreen_pipe(
             device,
             "blur",
@@ -258,6 +393,15 @@ impl PostFx {
             &blur_shader,
             "fs",
             wgpu::TextureFormat::R8Unorm,
+            None,
+        );
+        let blur_hdr_pipe = fullscreen_pipe(
+            device,
+            "blur_hdr",
+            &blur_bgl,
+            &blur_shader,
+            "fs",
+            wgpu::TextureFormat::Rgba16Float,
             None,
         );
         let bloom_extract_pipe = fullscreen_pipe(
@@ -331,6 +475,24 @@ impl PostFx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let ssgi_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ssgi_ubo"),
+            size: std::mem::size_of::<SsgiUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ssgi_temporal_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ssgi_temporal_ubo"),
+            size: std::mem::size_of::<SsgiTemporalUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ssgi_upsample_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ssgi_upsample_ubo"),
+            size: std::mem::size_of::<SsgiUpsampleUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let blur_ubo = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("blur_ubo"),
             size: std::mem::size_of::<BlurUniforms>() as u64,
@@ -382,6 +544,10 @@ impl PostFx {
         let ao = make_rt(device, 1, 1, wgpu::TextureFormat::R8Unorm, "ao");
         let ao_temp = make_rt(device, 1, 1, wgpu::TextureFormat::R8Unorm, "ao_temp");
         let contact = make_rt(device, 1, 1, wgpu::TextureFormat::R8Unorm, "contact");
+        let ssgi = make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "ssgi");
+        let ssgi_temp = make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "ssgi_temp");
+        let ssgi_hist = make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "ssgi_hist");
+        let ssgi_full = make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "ssgi_full");
         let bloom = (0..BLOOM_LEVELS)
             .map(|i| make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, &format!("bloom{i}")))
             .collect();
@@ -392,7 +558,12 @@ impl PostFx {
             ssao_pipe,
             gtao_pipe,
             contact_pipe,
+            ssgi_pipe,
+            ssgi_temporal_pipe,
+            ssgi_upsample_pipe,
+            copy_hdr_pipe,
             blur_pipe,
+            blur_hdr_pipe,
             bloom_extract_pipe,
             bloom_down_pipe,
             bloom_up_pipe,
@@ -401,6 +572,10 @@ impl PostFx {
             ssao_bgl,
             gtao_bgl,
             contact_bgl,
+            ssgi_bgl,
+            ssgi_temporal_bgl,
+            ssgi_upsample_bgl,
+            copy_bgl,
             blur_bgl,
             bloom_bgl,
             composite_bgl,
@@ -408,6 +583,9 @@ impl PostFx {
             ssao_ubo,
             gtao_ubo,
             contact_ubo,
+            ssgi_ubo,
+            ssgi_temporal_ubo,
+            ssgi_upsample_ubo,
             blur_ubo,
             bloom_ubo,
             composite_ubo,
@@ -421,12 +599,19 @@ impl PostFx {
             ao,
             ao_temp,
             contact,
+            ssgi,
+            ssgi_temp,
+            ssgi_hist,
+            ssgi_full,
             bloom,
             composite_temp,
             white_view,
             _white: white,
             black_view,
             _black: black,
+            prev_view_proj: Mat4::IDENTITY,
+            ssgi_has_history: false,
+            ssgi_frame: 0,
         }
     }
 
@@ -437,8 +622,18 @@ impl PostFx {
             self.ao = make_rt(device, w, h, wgpu::TextureFormat::R8Unorm, "ao");
             self.ao_temp = make_rt(device, w, h, wgpu::TextureFormat::R8Unorm, "ao_temp");
             self.contact = make_rt(device, w, h, wgpu::TextureFormat::R8Unorm, "contact");
+            self.ssgi_full = make_rt(device, w, h, wgpu::TextureFormat::Rgba16Float, "ssgi_full");
             self.composite_temp =
                 make_rt(device, w, h, wgpu::TextureFormat::Rgba8UnormSrgb, "composite_temp");
+        }
+        // SSGI gather at half-res; upsampled to ssgi_full for composite.
+        let sw = (w / 2).max(1);
+        let sh = (h / 2).max(1);
+        if self.ssgi.size != (sw, sh) {
+            self.ssgi = make_rt(device, sw, sh, wgpu::TextureFormat::Rgba16Float, "ssgi");
+            self.ssgi_temp = make_rt(device, sw, sh, wgpu::TextureFormat::Rgba16Float, "ssgi_temp");
+            self.ssgi_hist = make_rt(device, sw, sh, wgpu::TextureFormat::Rgba16Float, "ssgi_hist");
+            self.ssgi_has_history = false;
         }
         let mut bw = (w / 2).max(1);
         let mut bh = (h / 2).max(1);
@@ -465,6 +660,11 @@ impl PostFx {
     /// Contact-shadow result (`R8Unorm`). Valid after [`Self::generate_contact_shadow`] / [`Self::apply`].
     pub fn contact_view(&self) -> &wgpu::TextureView {
         &self.contact.view
+    }
+
+    /// SSGI result (`Rgba16Float`, full-res after upsample). Valid after [`Self::generate_ssgi`] / [`Self::apply`].
+    pub fn ssgi_view(&self) -> &wgpu::TextureView {
+        &self.ssgi_full.view
     }
 
     /// Screen-space contact shadows (+ light bilateral blur) into the contact target.
@@ -550,6 +750,7 @@ impl PostFx {
             [1.0 / w as f32, 0.0],
             true,
             40.0,
+            false,
         );
         self.blur_pass(
             device,
@@ -561,7 +762,286 @@ impl PostFx {
             [0.0, 1.0 / h as f32],
             true,
             40.0,
+            false,
         );
+    }
+
+    /// Spatial SSGI (+ optional temporal + HDR bilateral blur) into the SSGI target.
+    pub fn generate_ssgi(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        settings: &SsgiSettings,
+        scene_color: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        normals: &wgpu::TextureView,
+        albedo: &wgpu::TextureView,
+        orm: &wgpu::TextureView,
+        proj: Mat4,
+        view: Mat4,
+        view_proj: Mat4,
+        size: (u32, u32),
+    ) {
+        // Gather at half-res target size.
+        let (w, h) = self.ssgi.size;
+        let (fw, fh) = size;
+        let frame = (self.ssgi_frame % 1024) as f32;
+        self.ssgi_frame = self.ssgi_frame.wrapping_add(1);
+
+        queue.write_buffer(
+            &self.ssgi_ubo,
+            0,
+            bytemuck::bytes_of(&SsgiUniforms {
+                proj: proj.to_cols_array_2d(),
+                inv_proj: proj.inverse().to_cols_array_2d(),
+                view: view.to_cols_array_2d(),
+                resolution: [w as f32, h as f32],
+                radius: settings.radius.max(0.05),
+                thickness: settings.thickness.max(0.001),
+                params: [
+                    settings.samples.clamp(4, 32) as f32,
+                    settings.bias.max(0.0),
+                    settings.max_steps.clamp(4, 32) as f32,
+                    frame,
+                ],
+                full_resolution: [fw.max(1) as f32, fh.max(1) as f32],
+                _pad: [0.0; 2],
+            }),
+        );
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ssgi"),
+            layout: &self.ssgi_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.ssgi_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(normals),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(scene_color),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(albedo),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(orm),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+            ],
+        });
+
+        // Spatial always lands in ssgi_temp (scratch).
+        {
+            let mut pass = color_pass(
+                encoder,
+                "ssgi",
+                &self.ssgi_temp.view,
+                wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+            );
+            pass.set_pipeline(&self.ssgi_pipe);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        if settings.temporal {
+            let has_hist = self.ssgi_has_history;
+            queue.write_buffer(
+                &self.ssgi_temporal_ubo,
+                0,
+                bytemuck::bytes_of(&SsgiTemporalUniforms {
+                    inv_view_proj: view_proj.inverse().to_cols_array_2d(),
+                    prev_view_proj: self.prev_view_proj.to_cols_array_2d(),
+                    params: [
+                        settings.history.clamp(0.0, 0.98),
+                        settings.depth_reject.max(0.001),
+                        if has_hist { 1.0 } else { 0.0 },
+                        0.0,
+                    ],
+                }),
+            );
+            let tbg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ssgi_temporal"),
+                layout: &self.ssgi_temporal_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.ssgi_temporal_ubo.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.ssgi_temp.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.ssgi_hist.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(depth),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                    },
+                ],
+            });
+            {
+                let mut pass = color_pass(
+                    encoder,
+                    "ssgi_temporal",
+                    &self.ssgi.view,
+                    wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                );
+                pass.set_pipeline(&self.ssgi_temporal_pipe);
+                pass.set_bind_group(0, &tbg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        } else {
+            // No temporal: copy spatial into ssgi.
+            self.copy_hdr(device, encoder, &self.ssgi_temp.view, &self.ssgi.view);
+            self.ssgi_has_history = false;
+        }
+
+        // Mild bilateral denoise (preserves alpha / depth).
+        self.blur_pass(
+            device,
+            queue,
+            encoder,
+            &self.ssgi.view,
+            &self.ssgi_temp.view,
+            depth,
+            [2.0 / w as f32, 0.0],
+            true,
+            60.0,
+            true,
+        );
+        self.blur_pass(
+            device,
+            queue,
+            encoder,
+            &self.ssgi_temp.view,
+            &self.ssgi.view,
+            depth,
+            [0.0, 2.0 / h as f32],
+            true,
+            60.0,
+            true,
+        );
+
+        if settings.temporal {
+            self.copy_hdr(device, encoder, &self.ssgi.view, &self.ssgi_hist.view);
+            self.prev_view_proj = view_proj;
+            self.ssgi_has_history = true;
+        }
+
+        // Depth-aware upsample half → full (avoids bilinear stripe/block artifacts).
+        queue.write_buffer(
+            &self.ssgi_upsample_ubo,
+            0,
+            bytemuck::bytes_of(&SsgiUpsampleUniforms {
+                half_texel: [1.0 / w as f32, 1.0 / h as f32],
+                depth_sigma: 80.0,
+                _pad: 0.0,
+            }),
+        );
+        let ubg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ssgi_upsample"),
+            layout: &self.ssgi_upsample_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.ssgi_upsample_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.ssgi.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+            ],
+        });
+        {
+            let mut pass = color_pass(
+                encoder,
+                "ssgi_upsample",
+                &self.ssgi_full.view,
+                wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+            );
+            pass.set_pipeline(&self.ssgi_upsample_pipe);
+            pass.set_bind_group(0, &ubg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
+    fn copy_hdr(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+    ) {
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("copy_hdr"),
+            layout: &self.copy_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+            ],
+        });
+        let mut pass = color_pass(encoder, "copy_hdr", dst, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
+        pass.set_pipeline(&self.copy_hdr_pipe);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     /// Run SSAO or GTAO (+ bilateral blur) into the internal AO target.
@@ -717,6 +1197,7 @@ impl PostFx {
             [blur_px / w as f32, 0.0],
             true,
             blur_sigma,
+            false,
         );
         self.blur_pass(
             device,
@@ -728,11 +1209,12 @@ impl PostFx {
             [0.0, blur_px / h as f32],
             true,
             blur_sigma,
+            false,
         );
     }
 
     pub fn apply(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
@@ -740,6 +1222,8 @@ impl PostFx {
         scene_color: &wgpu::TextureView,
         depth: &wgpu::TextureView,
         normals: &wgpu::TextureView,
+        albedo: &wgpu::TextureView,
+        orm: &wgpu::TextureView,
         target: &wgpu::TextureView,
         proj: Mat4,
         view: Mat4,
@@ -778,6 +1262,26 @@ impl PostFx {
                     size,
                 );
             }
+        }
+
+        if settings.ssgi.enabled {
+            self.generate_ssgi(
+                device,
+                queue,
+                encoder,
+                &settings.ssgi,
+                scene_color,
+                depth,
+                normals,
+                albedo,
+                orm,
+                proj,
+                view,
+                view_proj,
+                size,
+            );
+        } else {
+            self.ssgi_has_history = false;
         }
 
         if settings.bloom.enabled {
@@ -830,6 +1334,11 @@ impl PostFx {
             &self.contact.view
         } else {
             &self.white_view
+        };
+        let ssgi_view = if settings.ssgi.enabled {
+            &self.ssgi_full.view
+        } else {
+            &self.black_view
         };
         let bloom_view = if settings.bloom.enabled {
             &self.bloom[0].view
@@ -906,7 +1415,12 @@ impl PostFx {
                 } else {
                     0.0
                 },
-                _pad: [0.0; 2],
+                ssgi_intensity: if settings.ssgi.enabled {
+                    settings.ssgi.intensity
+                } else {
+                    0.0
+                },
+                _pad: 0.0,
             }),
         );
 
@@ -950,6 +1464,10 @@ impl PostFx {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: wgpu::BindingResource::TextureView(contact_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(ssgi_view),
                 },
             ],
         });
@@ -1007,6 +1525,7 @@ impl PostFx {
         direction: [f32; 2],
         use_depth: bool,
         depth_sigma: f32,
+        hdr: bool,
     ) {
         queue.write_buffer(
             &self.blur_ubo,
@@ -1043,8 +1562,17 @@ impl PostFx {
                 },
             ],
         });
-        let mut pass = color_pass(encoder, "blur", dst, wgpu::LoadOp::Clear(wgpu::Color::WHITE));
-        pass.set_pipeline(&self.blur_pipe);
+        let clear = if hdr {
+            wgpu::Color::BLACK
+        } else {
+            wgpu::Color::WHITE
+        };
+        let mut pass = color_pass(encoder, "blur", dst, wgpu::LoadOp::Clear(clear));
+        pass.set_pipeline(if hdr {
+            &self.blur_hdr_pipe
+        } else {
+            &self.blur_pipe
+        });
         pass.set_bind_group(0, &bg, &[]);
         pass.draw(0..3, 0..1);
     }

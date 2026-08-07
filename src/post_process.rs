@@ -2,6 +2,7 @@
 pub struct PostProcessSettings {
     pub ao: AoSettings,
     pub contact_shadow: ContactShadowSettings,
+    pub ssgi: SsgiSettings,
     pub bloom: BloomSettings,
     pub tonemap: TonemapSettings,
     pub color_grade: ColorGradeSettings,
@@ -50,6 +51,32 @@ pub struct ContactShadowSettings {
     pub samples: u32,
     /// Start offset along the ray to reduce self-occlusion.
     pub bias: f32,
+}
+
+/// Spatial screen-space global illumination (optional temporal accumulation).
+#[derive(Clone, Debug)]
+pub struct SsgiSettings {
+    pub enabled: bool,
+    /// Max ray length in world units.
+    pub radius: f32,
+    /// Depth thickness tolerance (world units) for hit acceptance.
+    pub thickness: f32,
+    /// Additive strength in composite.
+    pub intensity: f32,
+    /// Hemisphere rays per pixel (4..=32).
+    pub samples: u32,
+    /// March steps along each ray (4..=32).
+    pub max_steps: u32,
+    /// Start offset along the ray to reduce self-hits.
+    pub bias: f32,
+    /// How much to reduce IBL diffuse / constant ambient (0..=1) to avoid double-counting.
+    pub ambient_dim: f32,
+    /// Camera-reprojection temporal accumulation.
+    pub temporal: bool,
+    /// Blend toward history (0 = current only, ~0.9 = stable).
+    pub history: f32,
+    /// Relative clip-depth rejection threshold for disocclusion.
+    pub depth_reject: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -132,6 +159,19 @@ impl Default for PostProcessSettings {
                 samples: 12,
                 bias: 0.002,
             },
+            ssgi: SsgiSettings {
+                enabled: false,
+                radius: 2.5,
+                thickness: 0.45,
+                intensity: 1.8,
+                samples: 6,
+                max_steps: 6,
+                bias: 0.02,
+                ambient_dim: 0.2,
+                temporal: true,
+                history: 0.88,
+                depth_reject: 0.025,
+            },
             bloom: BloomSettings {
                 enabled: false,
                 threshold: 0.7,
@@ -173,6 +213,7 @@ impl PostProcessSettings {
     pub fn any_enabled(&self) -> bool {
         self.ao.enabled
             || self.contact_shadow.enabled
+            || self.ssgi.enabled
             || self.bloom.enabled
             || self.tonemap.enabled
             || self.color_grade.enabled

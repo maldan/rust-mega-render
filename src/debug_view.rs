@@ -23,6 +23,10 @@ pub enum DebugView {
     Ao,
     /// Screen-space contact shadow buffer (white if unavailable).
     ContactShadow,
+    /// Screen-space GI buffer (black if unavailable).
+    Ssgi,
+    /// Base-color albedo G-buffer.
+    Albedo,
 }
 
 impl DebugView {
@@ -35,6 +39,8 @@ impl DebugView {
         DebugView::Depth,
         DebugView::Ao,
         DebugView::ContactShadow,
+        DebugView::Ssgi,
+        DebugView::Albedo,
     ];
 
     pub fn label(self) -> &'static str {
@@ -47,6 +53,8 @@ impl DebugView {
             DebugView::Depth => "Depth",
             DebugView::Ao => "AO",
             DebugView::ContactShadow => "Contact shadow",
+            DebugView::Ssgi => "SSGI",
+            DebugView::Albedo => "Albedo",
         }
     }
 
@@ -60,6 +68,8 @@ impl DebugView {
             DebugView::Depth => 5,
             DebugView::Ao => 6,
             DebugView::ContactShadow => 7,
+            DebugView::Ssgi => 8,
+            DebugView::Albedo => 9,
         }
     }
 }

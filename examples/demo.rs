@@ -195,6 +195,17 @@ impl Demo for MaterialDemo {
         post.contact_shadow.thickness = 0.08;
         post.contact_shadow.intensity = 0.85;
         post.contact_shadow.samples = 12;
+        post.ssgi.enabled = true;
+        post.ssgi.radius = 2.5;
+        post.ssgi.thickness = 0.45;
+        post.ssgi.intensity = 1.8;
+        post.ssgi.samples = 6;
+        post.ssgi.max_steps = 6;
+        post.ssgi.bias = 0.02;
+        post.ssgi.ambient_dim = 0.2;
+        post.ssgi.temporal = true;
+        post.ssgi.history = 0.88;
+        post.ssgi.depth_reject = 0.025;
         post.bloom.enabled = true;
         post.bloom.threshold = 1.2;
         post.bloom.intensity = 0.2;
@@ -333,6 +344,41 @@ impl Demo for MaterialDemo {
                         }
                         ui.label("Bias — отступ от поверхности");
                         ui.slider("Bias", &mut post.contact_shadow.bias, 0.0..=0.05);
+                    });
+                });
+                ui.collapsing_header("SSGI", |ui| {
+                    ui.checkbox("Enabled", &mut post.ssgi.enabled);
+                    ui.label("Spatial screen-space GI (без temporal).");
+                    ui.add_enabled(post.ssgi.enabled, |ui| {
+                        ui.label("Radius — длина луча (мир)");
+                        ui.slider("Radius", &mut post.ssgi.radius, 0.2..=4.0);
+                        ui.label("Thickness — допуск по глубине");
+                        ui.slider("Thickness", &mut post.ssgi.thickness, 0.02..=1.0);
+                        ui.label("Intensity — сила additive GI");
+                        ui.slider("Intensity", &mut post.ssgi.intensity, 0.0..=5.0);
+                        let mut samples = post.ssgi.samples as f32;
+                        let mut steps = post.ssgi.max_steps as f32;
+                        ui.label("Samples — лучей на пиксель");
+                        if ui.slider("Samples", &mut samples, 4.0..=32.0).changed() {
+                            post.ssgi.samples = samples.round() as u32;
+                        }
+                        ui.label("Steps — шагов марша");
+                        if ui.slider("Steps", &mut steps, 4.0..=32.0).changed() {
+                            post.ssgi.max_steps = steps.round() as u32;
+                        }
+                        ui.label("Bias — отступ от поверхности");
+                        ui.slider("Bias", &mut post.ssgi.bias, 0.0..=0.1);
+                        ui.label("Ambient dim — ослабление IBL diffuse");
+                        ui.slider("Ambient dim", &mut post.ssgi.ambient_dim, 0.0..=1.0);
+                        ui.separator();
+                        ui.checkbox("Temporal", &mut post.ssgi.temporal);
+                        ui.label("Camera reprojection + depth rejection.");
+                        ui.add_enabled(post.ssgi.temporal, |ui| {
+                            ui.label("History — вес прошлого кадра");
+                            ui.slider("History", &mut post.ssgi.history, 0.5..=0.98);
+                            ui.label("Depth reject — порог disocclusion");
+                            ui.slider("Depth reject", &mut post.ssgi.depth_reject, 0.005..=0.1);
+                        });
                     });
                 });
                 ui.collapsing_header("Bloom", |ui| {
