@@ -29,7 +29,10 @@ pub struct Scene {
     pub nodes: Store<Node>,
     pub camera: Camera,
     pub lights: Vec<Light>,
+    /// Flat ambient used when no IBL env map is loaded.
     pub ambient: [f32; 3],
+    /// Scales irradiance / specular / skybox when IBL is active.
+    pub ibl_intensity: f32,
     pub debug: DebugDraw,
     pub(crate) pending_loads: Vec<PendingLoad>,
 }
@@ -47,6 +50,7 @@ impl Scene {
             camera: Camera::orbit(0.8, 0.45, 8.0, Vec3::new(0.0, 0.5, 0.0)),
             lights: vec![Light::Directional(DirectionalLight::default())],
             ambient: [0.03, 0.03, 0.04],
+            ibl_intensity: 1.0,
             debug: DebugDraw::default(),
             pending_loads: Vec::new(),
         }

@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 
 mod post;
+mod ibl_gpu;
+use ibl_gpu::GpuIbl;
 use post::PostFx;
 
 const SHADOW_SIZE: u32 = 2048;
@@ -63,7 +65,16 @@ struct FrameUniforms {
     light_view_proj: [[f32; 4]; 4],
     ambient: [f32; 4],
     camera_pos: [f32; 4],
+    /// x = intensity, y = max mip, z = enabled, w unused
+    ibl: [f32; 4],
     lights: [GpuLight; MAX_LIGHTS],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SkyUniforms {
+    inv_view_proj: [[f32; 4]; 4],
+    params: [f32; 4],
 }
 
 #[repr(C)]
@@ -109,17 +120,25 @@ pub struct WgpuVisualizer {
     point_pipeline_hdr: wgpu::RenderPipeline,
     point_overlay_pipeline_hdr: wgpu::RenderPipeline,
     frame_bind_group: wgpu::BindGroup,
+    frame_bind_layout: wgpu::BindGroupLayout,
     debug_bind_group: wgpu::BindGroup,
     shadow_frame_bind_group: wgpu::BindGroup,
     frame_uniform_buf: wgpu::Buffer,
     debug_uniform_buf: wgpu::Buffer,
     shadow_frame_buf: wgpu::Buffer,
+    sky_uniform_buf: wgpu::Buffer,
     object_bind_layout: wgpu::BindGroupLayout,
     shadow_object_layout: wgpu::BindGroupLayout,
+    sky_bind_layout: wgpu::BindGroupLayout,
+    sky_pipeline: wgpu::RenderPipeline,
+    sky_pipeline_hdr: wgpu::RenderPipeline,
+    sky_bind_group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
+    shadow_samp: wgpu::Sampler,
     white: GpuTexture,
     flat_normal: GpuTexture,
     default_mr: GpuTexture,
+    ibl: GpuIbl,
     meshes: HashMap<(u32, u32), GpuMesh>,
     textures: HashMap<(u32, u32), GpuTexture>,
     target: wgpu::Texture,
@@ -159,6 +178,12 @@ impl WgpuVisualizer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let sky_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sky_uniform"),
+            size: std::mem::size_of::<SkyUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
@@ -173,6 +198,7 @@ impl WgpuVisualizer {
         });
 
         let (shadow_tex, shadow_view) = create_shadow_map(device);
+        let ibl = GpuIbl::black(device, queue);
 
         let frame_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
@@ -201,6 +227,69 @@ impl WgpuVisualizer {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let sky_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sky"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -296,24 +385,15 @@ impl WgpuVisualizer {
             }],
         });
 
-        let frame_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &frame_bind_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: frame_uniform_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&shadow_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&shadow_samp),
-                },
-            ],
-        });
+        let frame_bind_group = make_frame_bind_group(
+            device,
+            &frame_bind_layout,
+            &frame_uniform_buf,
+            &shadow_view,
+            &shadow_samp,
+            &ibl,
+        );
+        let sky_bind_group = make_sky_bind_group(device, &sky_bind_layout, &sky_uniform_buf, &ibl);
         let debug_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &debug_bind_layout,
@@ -415,6 +495,36 @@ impl WgpuVisualizer {
             multiview_mask: None,
             cache: None,
         });
+
+        let sky_shader = device.create_shader_module(wgpu::include_wgsl!("skybox.wgsl"));
+        let sky_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sky"),
+            bind_group_layouts: &[Some(&sky_bind_layout)],
+            immediate_size: 0,
+        });
+        let sky_depth = wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        };
+        let sky_pipeline = make_sky_pipeline(
+            device,
+            &sky_layout,
+            &sky_shader,
+            &sky_depth,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            "sky",
+        );
+        let sky_pipeline_hdr = make_sky_pipeline(
+            device,
+            &sky_layout,
+            &sky_shader,
+            &sky_depth,
+            wgpu::TextureFormat::Rgba16Float,
+            "sky_hdr",
+        );
 
         let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
         let line_buffers = [Some(wgpu::VertexBufferLayout {
@@ -539,17 +649,25 @@ impl WgpuVisualizer {
             point_pipeline_hdr,
             point_overlay_pipeline_hdr,
             frame_bind_group,
+            frame_bind_layout,
             debug_bind_group,
             shadow_frame_bind_group,
             frame_uniform_buf,
             debug_uniform_buf,
             shadow_frame_buf,
+            sky_uniform_buf,
             object_bind_layout,
             shadow_object_layout,
+            sky_bind_layout,
+            sky_pipeline,
+            sky_pipeline_hdr,
+            sky_bind_group,
             sampler,
+            shadow_samp,
             white,
             flat_normal,
             default_mr,
+            ibl,
             meshes: HashMap::new(),
             textures: HashMap::new(),
             target,
@@ -564,6 +682,36 @@ impl WgpuVisualizer {
             shadow_view,
             size: (1, 1),
         }
+    }
+
+    /// Load an equirectangular HDR/EXR, bake IBL maps, and enable env lighting + skybox.
+    pub fn set_env_map(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), String> {
+        let ibl = ibl_gpu::load_and_upload(&self.device, &self.queue, path)?;
+        self.ibl = ibl;
+        self.rebuild_ibl_bind_groups();
+        Ok(())
+    }
+
+    pub fn clear_env_map(&mut self) {
+        self.ibl = GpuIbl::black(&self.device, &self.queue);
+        self.rebuild_ibl_bind_groups();
+    }
+
+    fn rebuild_ibl_bind_groups(&mut self) {
+        self.frame_bind_group = make_frame_bind_group(
+            &self.device,
+            &self.frame_bind_layout,
+            &self.frame_uniform_buf,
+            &self.shadow_view,
+            &self.shadow_samp,
+            &self.ibl,
+        );
+        self.sky_bind_group = make_sky_bind_group(
+            &self.device,
+            &self.sky_bind_layout,
+            &self.sky_uniform_buf,
+            &self.ibl,
+        );
     }
 
     pub fn target_view(&self) -> &wgpu::TextureView {
@@ -625,6 +773,12 @@ impl WgpuVisualizer {
                 ],
                 // w > 0.5 → linear output for post tonemap
                 camera_pos: [eye.x, eye.y, eye.z, if use_post { 1.0 } else { 0.0 }],
+                ibl: [
+                    scene.ibl_intensity,
+                    self.ibl.max_mip,
+                    if self.ibl.enabled { 1.0 } else { 0.0 },
+                    0.0,
+                ],
                 lights: gpu_lights,
             }),
         );
@@ -912,6 +1066,37 @@ impl WgpuVisualizer {
                 &point_overlay_buf,
                 debug.points_overlay.len(),
             );
+
+            if self.ibl.enabled {
+                let view = glam::camera::lh::view::look_at_mat4(
+                    scene.camera.eye,
+                    scene.camera.target,
+                    scene.camera.up,
+                );
+                let view_rot = Mat4::from_cols(view.x_axis, view.y_axis, view.z_axis, glam::Vec4::W);
+                let proj = glam::camera::lh::proj::directx::perspective(
+                    scene.camera.fov_y,
+                    aspect,
+                    scene.camera.near,
+                    scene.camera.far,
+                );
+                let inv_view_proj = (proj * view_rot).inverse();
+                self.queue.write_buffer(
+                    &self.sky_uniform_buf,
+                    0,
+                    bytemuck::bytes_of(&SkyUniforms {
+                        inv_view_proj: inv_view_proj.to_cols_array_2d(),
+                        params: [scene.ibl_intensity, 0.0, 0.0, 0.0],
+                    }),
+                );
+                pass.set_pipeline(if use_post {
+                    &self.sky_pipeline_hdr
+                } else {
+                    &self.sky_pipeline
+                });
+                pass.set_bind_group(0, &self.sky_bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
         }
 
         // Post: scene_color → SSAO / Bloom / composite / FXAA → output
@@ -1123,6 +1308,115 @@ fn draw_debug_points(
     pass.set_bind_group(0, bind_group, &[]);
     pass.set_vertex_buffer(0, buf.slice(..));
     pass.draw(0..6, 0..count as u32);
+}
+
+fn make_frame_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    frame_ubo: &wgpu::Buffer,
+    shadow_view: &wgpu::TextureView,
+    shadow_samp: &wgpu::Sampler,
+    ibl: &GpuIbl,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("frame"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: frame_ubo.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(shadow_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(shadow_samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&ibl.equirect_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&ibl.brdf_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::Sampler(&ibl.equirect_samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::Sampler(&ibl.clamp_samp),
+            },
+        ],
+    })
+}
+
+fn make_sky_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sky_ubo: &wgpu::Buffer,
+    ibl: &GpuIbl,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("sky"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: sky_ubo.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&ibl.equirect_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&ibl.equirect_samp),
+            },
+        ],
+    })
+}
+
+fn make_sky_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    depth_stencil: &wgpu::DepthStencilState,
+    format: wgpu::TextureFormat,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_stencil.clone()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 fn mesh_pipeline(

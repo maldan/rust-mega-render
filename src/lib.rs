@@ -4,6 +4,7 @@ mod animation;
 mod camera;
 mod debug_draw;
 mod gltf_load;
+mod ibl;
 mod light;
 mod material;
 mod mesh;

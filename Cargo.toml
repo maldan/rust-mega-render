@@ -7,12 +7,17 @@ edition = "2024"
 wgpu = "30"
 glam = "0.33.2"
 bytemuck = { version = "1", features = ["derive"] }
-image = { version = "0.25.10", default-features = false, features = ["webp", "png", "jpeg"] }
+image = { version = "0.25.10", default-features = false, features = ["webp", "png", "jpeg", "exr", "hdr"] }
+half = "2"
 gltf = { version = "1.4", features = ["import", "utils"] }
 
 [dev-dependencies]
+arboard = "3"
 env_logger = "0.11"
 log = "0.4"
+# Demo-only UI. Path dep keeps mega-render ↔ mega-ui free of cycles
+# (mega-ui does not depend on mega-render).
+mega-ui = { path = "../ui", features = ["wgpu"] }
 pollster = "0.4"
 winit = "0.30"
 

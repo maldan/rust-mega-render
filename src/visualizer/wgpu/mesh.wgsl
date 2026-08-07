@@ -3,6 +3,8 @@ struct FrameUniforms {
     light_view_proj: mat4x4<f32>,
     ambient: vec4<f32>, // xyz ambient, w = light count
     camera_pos: vec4<f32>,
+    // x = ibl intensity, y = prefilter max mip, z = ibl enabled, w unused
+    ibl: vec4<f32>,
     lights: array<GpuLight, 8>,
 }
 
@@ -23,6 +25,10 @@ struct ObjectUniforms {
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
 @group(0) @binding(1) var shadow_map: texture_depth_2d;
 @group(0) @binding(2) var shadow_samp: sampler_comparison;
+@group(0) @binding(3) var env_equirect: texture_2d<f32>;
+@group(0) @binding(4) var brdf_lut: texture_2d<f32>;
+@group(0) @binding(5) var env_samp: sampler;
+@group(0) @binding(6) var clamp_samp: sampler;
 @group(1) @binding(0) var<uniform> object: ObjectUniforms;
 @group(1) @binding(1) var albedo_tex: texture_2d<f32>;
 @group(1) @binding(2) var normal_tex: texture_2d<f32>;
@@ -121,6 +127,10 @@ fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
+fn fresnel_schlick_roughness(cos_theta: f32, f0: vec3<f32>, roughness: f32) -> vec3<f32> {
+    return f0 + (max(vec3<f32>(1.0 - roughness), f0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
 fn light_contrib(
     light: GpuLight,
     world_pos: vec3<f32>,
@@ -168,6 +178,56 @@ fn light_contrib(
     return (diffuse + specular) * radiance * ndotl;
 }
 
+// Soft-compress HDR so studio lamps don't turn dielectrics into white sparkles.
+fn compress_env(c: vec3<f32>) -> vec3<f32> {
+    return c / (vec3(1.0) + c);
+}
+
+fn sample_env(dir: vec3<f32>, lod: f32) -> vec3<f32> {
+    let d = normalize(dir);
+    let phi = atan2(d.z, d.x);
+    let theta = acos(clamp(d.y, -1.0, 1.0));
+    let uv = vec2(phi / (2.0 * PI) + 0.5, theta / PI);
+    return compress_env(textureSampleLevel(env_equirect, env_samp, uv, lod).rgb);
+}
+
+fn ibl_contrib(
+    n_in: vec3<f32>,
+    v_in: vec3<f32>,
+    albedo: vec3<f32>,
+    metallic: f32,
+    roughness: f32,
+) -> vec3<f32> {
+    let n = normalize(n_in);
+    let v = normalize(v_in);
+
+    // Dielectric F0 ≈ 0.04; metals use albedo as F0.
+    let f0 = mix(vec3<f32>(0.04), albedo, metallic);
+    let n_dot_v = max(dot(n, v), 0.001);
+    let f = fresnel_schlick_roughness(n_dot_v, f0, roughness);
+    let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
+
+    // Diffuse: heavily blurred equirect along the normal (no cubemap seams).
+    // Not a perfect cosine irradiance integral, but stable and energy-sane after compress.
+    let irradiance = sample_env(n, frame.ibl.y);
+    let diffuse = kd * albedo * irradiance;
+
+    // Specular: reflect env. Dielectrics only reflect ~4% at face-on (F0),
+    // more at grazing via the BRDF LUT. Metals reflect strongly tinted by albedo.
+    var lod = roughness * roughness * frame.ibl.y;
+    // Dielectrics: never sample mip0 — HDR lamps become white pin-dots otherwise.
+    if metallic < 0.5 {
+        lod = max(lod, 1.25);
+    }
+    let r = reflect(-v, n);
+    let prefiltered = sample_env(r, lod);
+    let brdf = textureSample(brdf_lut, clamp_samp, vec2(n_dot_v, roughness)).rg;
+    // Split-sum: scale/bias. For plastic this stays small (F0*…).
+    let specular = prefiltered * (f0 * brdf.x + brdf.y);
+
+    return (diffuse + specular) * frame.ibl.x;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let base = textureSample(albedo_tex, samp, in.uv) * object.albedo;
@@ -184,7 +244,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let v = normalize(frame.camera_pos.xyz - in.world_pos);
 
-    var lit = frame.ambient.xyz * albedo;
+    var lit = vec3<f32>(0.0);
+    if frame.ibl.z > 0.5 {
+        lit += ibl_contrib(n, v, albedo, metallic, roughness);
+    } else {
+        lit += frame.ambient.xyz * albedo;
+    }
+
     let count = u32(frame.ambient.w);
     for (var i = 0u; i < count; i++) {
         lit += light_contrib(frame.lights[i], in.world_pos, n, v, albedo, metallic, roughness);
