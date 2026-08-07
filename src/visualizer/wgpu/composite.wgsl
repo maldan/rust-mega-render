@@ -36,7 +36,7 @@ struct CompositeUniforms {
     grain_intensity: f32,
     contact_intensity: f32,
     ssgi_intensity: f32,
-    _pad0: f32,
+    ssr_intensity: f32,
 }
 
 @group(0) @binding(0) var<uniform> u: CompositeUniforms;
@@ -48,6 +48,7 @@ struct CompositeUniforms {
 @group(0) @binding(6) var depth_samp: sampler;
 @group(0) @binding(7) var contact_tex: texture_2d<f32>;
 @group(0) @binding(8) var ssgi_tex: texture_2d<f32>;
+@group(0) @binding(9) var ssr_tex: texture_2d<f32>;
 
 fn world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
@@ -95,6 +96,9 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
     }
     if u.ssgi_intensity > 0.0 {
         color += textureSample(ssgi_tex, samp, i.uv).rgb * u.ssgi_intensity;
+    }
+    if u.ssr_intensity > 0.0 {
+        color += textureSample(ssr_tex, samp, i.uv).rgb * u.ssr_intensity;
     }
     if u.bloom_intensity > 0.0 {
         color += textureSample(bloom_tex, samp, i.uv).rgb * u.bloom_intensity;

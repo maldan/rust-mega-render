@@ -1,22 +1,24 @@
-//! CPU IBL bake: equirect mips (diffuse/specular blur proxy) + BRDF LUT.
+//! Equirect HDR/EXR: full-res sharp map + smaller pre-blurred copies for roughness.
 
-use glam::{Vec2, Vec3};
-use std::f32::consts::PI;
 use std::path::Path;
 
-pub const EQUIRECT_WIDTH: u32 = 1024;
-pub const BRDF_SIZE: u32 = 256;
+/// Max width of pre-blurred roughness maps (height follows aspect).
+pub const BLUR_MAX_WIDTH: u32 = 1024;
+/// Number of progressively blurred maps (all ≤ [`BLUR_MAX_WIDTH`]).
+pub const BLUR_LEVELS: u32 = 4;
 
+#[derive(Clone)]
 pub struct EquirectHdr {
     pub width: u32,
     pub height: u32,
     pub rgb: Vec<[f32; 3]>,
 }
 
-pub struct BakedIbl {
-    pub equirect_mips: Vec<EquirectHdr>,
-    pub brdf: Vec<[f32; 2]>,
-    pub brdf_size: u32,
+pub struct EnvMaps {
+    /// Full-resolution source (skybox + sharp reflections).
+    pub sharp: EquirectHdr,
+    /// Progressively blurred copies, same size, width ≤ [`BLUR_MAX_WIDTH`].
+    pub blurred: Vec<EquirectHdr>,
 }
 
 pub fn load_equirect_hdr(path: impl AsRef<Path>) -> Result<EquirectHdr, String> {
@@ -35,23 +37,26 @@ pub fn load_equirect_hdr(path: impl AsRef<Path>) -> Result<EquirectHdr, String> 
     Ok(EquirectHdr { width, height, rgb })
 }
 
-pub fn bake_ibl(src: &EquirectHdr) -> BakedIbl {
-    let base = if src.width > EQUIRECT_WIDTH {
-        resize_equirect(src, EQUIRECT_WIDTH)
+/// Keep original sharp; build [`BLUR_LEVELS`] blurred maps at ≤1024.
+pub fn prepare_env_maps(sharp: EquirectHdr) -> EnvMaps {
+    let base = if sharp.width > BLUR_MAX_WIDTH {
+        resize_equirect(&sharp, BLUR_MAX_WIDTH)
     } else {
         EquirectHdr {
-            width: src.width,
-            height: src.height,
-            rgb: src.rgb.clone(),
+            width: sharp.width,
+            height: sharp.height,
+            rgb: sharp.rgb.clone(),
         }
     };
-    let equirect_mips = build_equirect_mips(base);
-    let brdf = bake_brdf_lut(BRDF_SIZE);
-    BakedIbl {
-        equirect_mips,
-        brdf,
-        brdf_size: BRDF_SIZE,
+
+    // Pixel radii on the ≤1024 map — real blur, not mip shrink.
+    let radii: [u32; BLUR_LEVELS as usize] = [4, 14, 36, 80];
+    let mut blurred = Vec::with_capacity(BLUR_LEVELS as usize);
+    for &radius in &radii {
+        blurred.push(blur_equirect(&base, radius));
     }
+
+    EnvMaps { sharp, blurred }
 }
 
 fn resize_equirect(src: &EquirectHdr, new_w: u32) -> EquirectHdr {
@@ -73,38 +78,79 @@ fn resize_equirect(src: &EquirectHdr, new_w: u32) -> EquirectHdr {
     }
 }
 
-fn build_equirect_mips(base: EquirectHdr) -> Vec<EquirectHdr> {
-    let mut mips = vec![base];
-    while mips.last().unwrap().width > 4 {
-        let prev = mips.last().unwrap();
-        let w = (prev.width / 2).max(1);
-        let h = (prev.height / 2).max(1);
-        let mut rgb = vec![[0.0; 3]; (w * h) as usize];
-        for y in 0..h {
-            for x in 0..w {
-                let u = (x as f32 + 0.5) / w as f32;
-                let v = (y as f32 + 0.5) / h as f32;
-                // 4-tap box in source.
-                let du = 0.25 / w as f32;
-                let dv = 0.25 / h as f32;
-                let c0 = sample_equirect(prev, u - du, v - dv);
-                let c1 = sample_equirect(prev, u + du, v - dv);
-                let c2 = sample_equirect(prev, u - du, v + dv);
-                let c3 = sample_equirect(prev, u + du, v + dv);
-                rgb[(y * w + x) as usize] = [
-                    (c0[0] + c1[0] + c2[0] + c3[0]) * 0.25,
-                    (c0[1] + c1[1] + c2[1] + c3[1]) * 0.25,
-                    (c0[2] + c1[2] + c2[2] + c3[2]) * 0.25,
-                ];
-            }
-        }
-        mips.push(EquirectHdr {
-            width: w,
-            height: h,
-            rgb,
-        });
+/// Separable box blur ≈ soft gaussian (3 passes). U wraps, V clamps.
+fn blur_equirect(src: &EquirectHdr, radius: u32) -> EquirectHdr {
+    let r = radius.max(1);
+    let mut img = src.rgb.clone();
+    for _ in 0..3 {
+        img = box_blur_horizontal(&img, src.width, src.height, r);
+        img = box_blur_vertical(&img, src.width, src.height, r);
     }
-    mips
+    EquirectHdr {
+        width: src.width,
+        height: src.height,
+        rgb: img,
+    }
+}
+
+fn box_blur_horizontal(src: &[[f32; 3]], w: u32, h: u32, radius: u32) -> Vec<[f32; 3]> {
+    let w = w as usize;
+    let h = h as usize;
+    let r = radius as usize;
+    let inv = 1.0 / (2 * r + 1) as f32;
+    let mut out = vec![[0.0; 3]; w * h];
+    for y in 0..h {
+        let row = y * w;
+        // Running sum seed
+        let mut sum = [0.0f32; 3];
+        for k in 0..=(2 * r) {
+            let x = (k as isize - r as isize).rem_euclid(w as isize) as usize;
+            let c = src[row + x];
+            sum[0] += c[0];
+            sum[1] += c[1];
+            sum[2] += c[2];
+        }
+        for x in 0..w {
+            out[row + x] = [sum[0] * inv, sum[1] * inv, sum[2] * inv];
+            let x_out = (x as isize - r as isize).rem_euclid(w as isize) as usize;
+            let x_in = (x as isize + r as isize + 1).rem_euclid(w as isize) as usize;
+            let c_out = src[row + x_out];
+            let c_in = src[row + x_in];
+            sum[0] += c_in[0] - c_out[0];
+            sum[1] += c_in[1] - c_out[1];
+            sum[2] += c_in[2] - c_out[2];
+        }
+    }
+    out
+}
+
+fn box_blur_vertical(src: &[[f32; 3]], w: u32, h: u32, radius: u32) -> Vec<[f32; 3]> {
+    let w = w as usize;
+    let h = h as usize;
+    let r = radius as usize;
+    let inv = 1.0 / (2 * r + 1) as f32;
+    let mut out = vec![[0.0; 3]; w * h];
+    for x in 0..w {
+        let mut sum = [0.0f32; 3];
+        for k in 0..=(2 * r) {
+            let y = (k as isize - r as isize).clamp(0, h as isize - 1) as usize;
+            let c = src[y * w + x];
+            sum[0] += c[0];
+            sum[1] += c[1];
+            sum[2] += c[2];
+        }
+        for y in 0..h {
+            out[y * w + x] = [sum[0] * inv, sum[1] * inv, sum[2] * inv];
+            let y_out = (y as isize - r as isize).clamp(0, h as isize - 1) as usize;
+            let y_in = (y as isize + r as isize + 1).clamp(0, h as isize - 1) as usize;
+            let c_out = src[y_out * w + x];
+            let c_in = src[y_in * w + x];
+            sum[0] += c_in[0] - c_out[0];
+            sum[1] += c_in[1] - c_out[1];
+            sum[2] += c_in[2] - c_out[2];
+        }
+    }
+    out
 }
 
 pub fn sample_equirect(src: &EquirectHdr, u: f32, v: f32) -> [f32; 3] {
@@ -127,81 +173,4 @@ pub fn sample_equirect(src: &EquirectHdr, u: f32, v: f32) -> [f32; 3] {
         c00[1] + (c10[1] - c00[1]) * tx + (c01[1] - c00[1]) * ty + (c00[1] - c10[1] - c01[1] + c11[1]) * tx * ty,
         c00[2] + (c10[2] - c00[2]) * tx + (c01[2] - c00[2]) * ty + (c00[2] - c10[2] - c01[2] + c11[2]) * tx * ty,
     ]
-}
-
-fn radical_inverse_vdc(mut bits: u32) -> f32 {
-    bits = (bits << 16) | (bits >> 16);
-    bits = ((bits & 0x5555_5555) << 1) | ((bits & 0xAAAA_AAAA) >> 1);
-    bits = ((bits & 0x3333_3333) << 2) | ((bits & 0xCCCC_CCCC) >> 2);
-    bits = ((bits & 0x0F0F_0F0F) << 4) | ((bits & 0xF0F0_F0F0) >> 4);
-    bits = ((bits & 0x00FF_00FF) << 8) | ((bits & 0xFF00_FF00) >> 8);
-    bits as f32 * 2.328_3064e-10
-}
-
-fn hammersley(i: u32, n: u32) -> Vec2 {
-    Vec2::new(i as f32 / n as f32, radical_inverse_vdc(i))
-}
-
-fn importance_sample_ggx(xi: Vec2, n: Vec3, roughness: f32) -> Vec3 {
-    let a = roughness * roughness;
-    let phi = 2.0 * PI * xi.x;
-    let cos_theta = ((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y)).sqrt();
-    let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
-    let h = Vec3::new(phi.cos() * sin_theta, phi.sin() * sin_theta, cos_theta);
-    let up = if n.z.abs() < 0.999 {
-        Vec3::Z
-    } else {
-        Vec3::X
-    };
-    let tangent = up.cross(n).normalize_or_zero();
-    let bitangent = n.cross(tangent);
-    (tangent * h.x + bitangent * h.y + n * h.z).normalize_or_zero()
-}
-
-fn geometry_schlick_ggx(n_dot_v: f32, roughness: f32) -> f32 {
-    let a = roughness;
-    let k = (a * a) / 2.0;
-    n_dot_v / (n_dot_v * (1.0 - k) + k)
-}
-
-fn geometry_smith(n_dot_v: f32, n_dot_l: f32, roughness: f32) -> f32 {
-    geometry_schlick_ggx(n_dot_v, roughness) * geometry_schlick_ggx(n_dot_l, roughness)
-}
-
-fn integrate_brdf(n_dot_v: f32, roughness: f32) -> [f32; 2] {
-    const SAMPLE_COUNT: u32 = 64;
-    let v = Vec3::new((1.0 - n_dot_v * n_dot_v).sqrt(), 0.0, n_dot_v);
-    let n = Vec3::Z;
-    let mut a = 0.0_f32;
-    let mut b = 0.0_f32;
-    for i in 0..SAMPLE_COUNT {
-        let xi = hammersley(i, SAMPLE_COUNT);
-        let h = importance_sample_ggx(xi, n, roughness);
-        let l = (2.0 * v.dot(h) * h - v).normalize_or_zero();
-        let n_dot_l = l.z.max(0.0);
-        let n_dot_h = h.z.max(0.0);
-        let v_dot_h = v.dot(h).max(0.0);
-        if n_dot_l > 0.0 {
-            let g = geometry_smith(n_dot_v, n_dot_l, roughness);
-            let g_vis = (g * v_dot_h) / (n_dot_h * n_dot_v).max(1e-4);
-            let fc = (1.0 - v_dot_h).powi(5);
-            a += (1.0 - fc) * g_vis;
-            b += fc * g_vis;
-        }
-    }
-    let inv = 1.0 / SAMPLE_COUNT as f32;
-    [a * inv, b * inv]
-}
-
-fn bake_brdf_lut(size: u32) -> Vec<[f32; 2]> {
-    let mut out = vec![[0.0; 2]; (size * size) as usize];
-    for y in 0..size {
-        for x in 0..size {
-            let n_dot_v = (x as f32 + 0.5) / size as f32;
-            let roughness = (y as f32 + 0.5) / size as f32;
-            out[(y * size + x) as usize] =
-                integrate_brdf(n_dot_v.max(0.001), roughness.clamp(0.001, 1.0));
-        }
-    }
-    out
 }

@@ -1,8 +1,10 @@
 #[derive(Clone, Debug)]
 pub struct PostProcessSettings {
+    pub env: EnvMapSettings,
     pub ao: AoSettings,
     pub contact_shadow: ContactShadowSettings,
     pub ssgi: SsgiSettings,
+    pub ssr: SsrSettings,
     pub bloom: BloomSettings,
     pub tonemap: TonemapSettings,
     pub color_grade: ColorGradeSettings,
@@ -10,6 +12,26 @@ pub struct PostProcessSettings {
     pub grain: GrainSettings,
     pub fxaa: FxaaSettings,
     pub fog: FogSettings,
+}
+
+/// Equirect env reflections + skybox (no heavy IBL bake).
+#[derive(Clone, Debug)]
+pub struct EnvMapSettings {
+    pub enabled: bool,
+    /// Scales reflections and skybox.
+    pub intensity: f32,
+    /// Yaw of the env map in degrees (0..=360).
+    pub rotation_y: f32,
+}
+
+impl Default for EnvMapSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            intensity: 1.0,
+            rotation_y: 0.0,
+        }
+    }
 }
 
 /// Which screen-space AO algorithm to run when [`AoSettings::enabled`].
@@ -53,6 +75,30 @@ pub struct ContactShadowSettings {
     pub bias: f32,
 }
 
+/// Screen-space reflections with env-map fallback (confidence blend).
+#[derive(Clone, Debug)]
+pub struct SsrSettings {
+    pub enabled: bool,
+    /// Max ray length in world / view units.
+    pub max_distance: f32,
+    /// Depth thickness tolerance (view units) for hit acceptance.
+    pub thickness: f32,
+    /// Additive strength in composite.
+    pub intensity: f32,
+    /// March steps (8..=64).
+    pub max_steps: u32,
+    /// Start offset along the ray to reduce self-hits.
+    pub bias: f32,
+    /// Skip screen-space march above this roughness (env-only specular).
+    pub roughness_cutoff: f32,
+    /// Camera-reprojection temporal accumulation.
+    pub temporal: bool,
+    /// Blend toward history (0 = current only, ~0.9 = stable).
+    pub history: f32,
+    /// Relative clip-depth rejection threshold for disocclusion.
+    pub depth_reject: f32,
+}
+
 /// Spatial screen-space global illumination (optional temporal accumulation).
 #[derive(Clone, Debug)]
 pub struct SsgiSettings {
@@ -69,7 +115,7 @@ pub struct SsgiSettings {
     pub max_steps: u32,
     /// Start offset along the ray to reduce self-hits.
     pub bias: f32,
-    /// How much to reduce IBL diffuse / constant ambient (0..=1) to avoid double-counting.
+    /// How much to reduce constant ambient (0..=1) to avoid double-counting with SSGI.
     pub ambient_dim: f32,
     /// Camera-reprojection temporal accumulation.
     pub temporal: bool,
@@ -141,6 +187,7 @@ pub struct FogSettings {
 impl Default for PostProcessSettings {
     fn default() -> Self {
         Self {
+            env: EnvMapSettings::default(),
             ao: AoSettings {
                 enabled: false,
                 method: AoMethod::Gtao,
@@ -171,6 +218,18 @@ impl Default for PostProcessSettings {
                 temporal: true,
                 history: 0.88,
                 depth_reject: 0.025,
+            },
+            ssr: SsrSettings {
+                enabled: false,
+                max_distance: 12.0,
+                thickness: 0.22,
+                intensity: 1.0,
+                max_steps: 48,
+                bias: 0.05,
+                roughness_cutoff: 0.55,
+                temporal: true,
+                history: 0.85,
+                depth_reject: 0.03,
             },
             bloom: BloomSettings {
                 enabled: false,
@@ -214,6 +273,7 @@ impl PostProcessSettings {
         self.ao.enabled
             || self.contact_shadow.enabled
             || self.ssgi.enabled
+            || self.ssr.enabled
             || self.bloom.enabled
             || self.tonemap.enabled
             || self.color_grade.enabled

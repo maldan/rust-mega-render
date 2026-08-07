@@ -2,6 +2,9 @@ use super::Visualizer;
 use crate::{DebugView, Mesh, PostProcessSettings, Scene, ShadowFilter, ShadowSettings, Texture};
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::mpsc;
+use std::thread;
 use wgpu::util::DeviceExt;
 
 mod post;
@@ -9,7 +12,7 @@ mod ibl_gpu;
 mod frame_targets;
 mod debug_blit;
 use ibl_gpu::GpuIbl;
-use post::PostFx;
+use post::{PostFx, SsrEnvInput};
 use frame_targets::FrameTargets;
 use debug_blit::DebugBlit;
 
@@ -69,11 +72,11 @@ struct FrameUniforms {
     light_view_proj: [[f32; 4]; 4],
     ambient: [f32; 4],
     camera_pos: [f32; 4],
-    /// x = intensity, y = max mip, z = enabled, w = pcss filter samples
+    /// x = env intensity, y = blur layer count, z = active, w = pcss filter samples
     ibl: [f32; 4],
     /// x = filter (0=pcf, 1=pcss), y = light_size, z = 1/map_size, w = blocker samples
     shadow: [f32; 4],
-    /// x = IBL diffuse / constant-ambient scale (1 = full)
+    /// x = constant-ambient scale, y = env yaw (radians)
     gi: [f32; 4],
     lights: [GpuLight; MAX_LIGHTS],
 }
@@ -143,6 +146,8 @@ pub struct WgpuVisualizer {
     flat_normal: GpuTexture,
     default_mr: GpuTexture,
     ibl: GpuIbl,
+    /// Background CPU env prepare; uploaded on [`Self::poll_env_map`].
+    pending_env: Option<mpsc::Receiver<Result<crate::ibl::EnvMaps, String>>>,
     meshes: HashMap<(u32, u32), GpuMesh>,
     textures: HashMap<(u32, u32), GpuTexture>,
     frames: FrameTargets,
@@ -252,7 +257,7 @@ impl WgpuVisualizer {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
                         multisampled: false,
                     },
                     count: None,
@@ -265,12 +270,6 @@ impl WgpuVisualizer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 6,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                     count: None,
@@ -609,6 +608,7 @@ impl WgpuVisualizer {
             flat_normal,
             default_mr,
             ibl,
+            pending_env: None,
             meshes: HashMap::new(),
             textures: HashMap::new(),
             frames,
@@ -638,15 +638,56 @@ impl WgpuVisualizer {
         self.shadow_map_size = size;
         self.rebuild_ibl_bind_groups();
     }
-    /// Load an equirectangular HDR/EXR, bake IBL maps, and enable env lighting + skybox.
-    pub fn set_env_map(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), String> {
+    /// Load an equirectangular HDR/EXR on the calling thread (blocks on decode + blur).
+    pub fn set_env_map(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
+        self.pending_env = None;
         let ibl = ibl_gpu::load_and_upload(&self.device, &self.queue, path)?;
         self.ibl = ibl;
         self.rebuild_ibl_bind_groups();
         Ok(())
     }
 
+    /// Decode + blur EXR/HDR on a background thread; GPU upload happens in [`Self::poll_env_map`].
+    /// App keeps running with the previous / black env until ready.
+    pub fn set_env_map_async(&mut self, path: impl AsRef<Path>) {
+        let path = path.as_ref().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(ibl_gpu::load_cpu(&path));
+        });
+        self.pending_env = Some(rx);
+    }
+
+    /// Whether a background env prepare is still in flight.
+    pub fn env_map_loading(&self) -> bool {
+        self.pending_env.is_some()
+    }
+
+    /// Apply finished background env maps (call once per frame, e.g. from render).
+    pub fn poll_env_map(&mut self) {
+        let Some(rx) = &self.pending_env else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(maps)) => {
+                self.ibl = GpuIbl::from_maps(&self.device, &self.queue, &maps, true);
+                self.rebuild_ibl_bind_groups();
+                self.pending_env = None;
+                eprintln!("Env map: uploaded to GPU");
+            }
+            Ok(Err(e)) => {
+                eprintln!("env map: {e}");
+                self.pending_env = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.pending_env = None;
+            }
+        }
+    }
+
     pub fn clear_env_map(&mut self) {
+        self.pending_env = None;
         self.ibl = GpuIbl::black(&self.device, &self.queue);
         self.rebuild_ibl_bind_groups();
     }
@@ -698,6 +739,8 @@ impl WgpuVisualizer {
         aspect: f32,
         external: Option<&wgpu::TextureView>,
     ) {
+        self.poll_env_map();
+
         let shadow_dir = scene.shadow_directional();
         self.ensure_shadow_map(self.shadow.map_size);
 
@@ -721,6 +764,11 @@ impl WgpuVisualizer {
         } else {
             1.0
         };
+        let env_on = self.ibl.loaded && self.post.env.enabled;
+        // When SSR is on it owns specular env (confidence blend with screen hits).
+        let mesh_env_on = env_on && !self.post.ssr.enabled;
+        let env_rot = self.post.env.rotation_y.to_radians();
+        let env_intensity = self.post.env.intensity;
 
         // Always output linear HDR into the G-buffer.
         self.queue.write_buffer(
@@ -738,9 +786,9 @@ impl WgpuVisualizer {
                 // w = 1.0 → always output linear HDR
                 camera_pos: [eye.x, eye.y, eye.z, 1.0],
                 ibl: [
-                    scene.ibl_intensity,
-                    self.ibl.max_mip,
-                    if self.ibl.enabled { 1.0 } else { 0.0 },
+                    env_intensity,
+                    self.ibl.blur_levels,
+                    if mesh_env_on { 1.0 } else { 0.0 },
                     filter_samples,
                 ],
                 shadow: [
@@ -749,7 +797,7 @@ impl WgpuVisualizer {
                     1.0 / self.shadow_map_size as f32,
                     blocker_samples,
                 ],
-                gi: [ambient_gi, 0.0, 0.0, 0.0],
+                gi: [ambient_gi, env_rot, 0.0, 0.0],
                 lights: gpu_lights,
             }),
         );
@@ -1047,7 +1095,7 @@ impl WgpuVisualizer {
                 debug.points_overlay.len(),
             );
 
-            if self.ibl.enabled {
+            if env_on {
                 let view = glam::camera::lh::view::look_at_mat4(
                     scene.camera.eye,
                     scene.camera.target,
@@ -1066,7 +1114,7 @@ impl WgpuVisualizer {
                     0,
                     bytemuck::bytes_of(&SkyUniforms {
                         inv_view_proj: inv_view_proj.to_cols_array_2d(),
-                        params: [scene.ibl_intensity, 0.0, 0.0, 0.0],
+                        params: [env_intensity, env_rot, 0.0, 0.0],
                     }),
                 );
                 pass.set_pipeline(&self.sky_pipeline);
@@ -1097,6 +1145,15 @@ impl WgpuVisualizer {
                 crate::Light::Directional(d) if d.enabled => Some(d.direction),
                 _ => None,
             });
+            let env = SsrEnvInput {
+                sharp: &self.ibl.sharp_view,
+                blur: &self.ibl.blur_view,
+                samp: &self.ibl.samp,
+                blur_levels: self.ibl.blur_levels,
+                intensity: env_intensity,
+                rotation_y_rad: env_rot,
+                enabled: env_on,
+            };
             self.post_fx.apply(
                 &self.device,
                 &self.queue,
@@ -1113,6 +1170,7 @@ impl WgpuVisualizer {
                 view_proj,
                 [eye.x, eye.y, eye.z],
                 light_dir,
+                &env,
                 self.size,
             );
         } else {
@@ -1172,6 +1230,34 @@ impl WgpuVisualizer {
                     self.size,
                 );
                 Some(self.post_fx.ssgi_view())
+            } else if self.debug_view == DebugView::Ssr {
+                let env = SsrEnvInput {
+                    sharp: &self.ibl.sharp_view,
+                    blur: &self.ibl.blur_view,
+                    samp: &self.ibl.samp,
+                    blur_levels: self.ibl.blur_levels,
+                    intensity: env_intensity,
+                    rotation_y_rad: env_rot,
+                    enabled: env_on,
+                };
+                self.post_fx.generate_ssr(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    &self.post.ssr,
+                    &self.frames.color_view,
+                    &self.frames.depth_view,
+                    &self.frames.normal_view,
+                    &self.frames.albedo_view,
+                    &self.frames.orm_view,
+                    &env,
+                    proj,
+                    view,
+                    view_proj,
+                    [eye.x, eye.y, eye.z],
+                    self.size,
+                );
+                Some(self.post_fx.ssr_view())
             } else if self.debug_view == DebugView::Albedo {
                 Some(&self.frames.albedo_view)
             } else {
@@ -1181,6 +1267,7 @@ impl WgpuVisualizer {
                 DebugView::Ao => self.post.ao.intensity,
                 DebugView::ContactShadow => self.post.contact_shadow.intensity,
                 DebugView::Ssgi => self.post.ssgi.intensity,
+                DebugView::Ssr => self.post.ssr.intensity,
                 _ => 1.0,
             };
             self.debug_blit.blit(
@@ -1440,22 +1527,18 @@ fn make_frame_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: wgpu::BindingResource::TextureView(&ibl.equirect_view),
+                resource: wgpu::BindingResource::TextureView(&ibl.sharp_view),
             },
             wgpu::BindGroupEntry {
                 binding: 4,
-                resource: wgpu::BindingResource::TextureView(&ibl.brdf_view),
+                resource: wgpu::BindingResource::TextureView(&ibl.blur_view),
             },
             wgpu::BindGroupEntry {
                 binding: 5,
-                resource: wgpu::BindingResource::Sampler(&ibl.equirect_samp),
+                resource: wgpu::BindingResource::Sampler(&ibl.samp),
             },
             wgpu::BindGroupEntry {
                 binding: 6,
-                resource: wgpu::BindingResource::Sampler(&ibl.clamp_samp),
-            },
-            wgpu::BindGroupEntry {
-                binding: 7,
                 resource: wgpu::BindingResource::Sampler(shadow_depth_samp),
             },
         ],
@@ -1478,11 +1561,11 @@ fn make_sky_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(&ibl.equirect_view),
+                resource: wgpu::BindingResource::TextureView(&ibl.sharp_view),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: wgpu::BindingResource::Sampler(&ibl.equirect_samp),
+                resource: wgpu::BindingResource::Sampler(&ibl.samp),
             },
         ],
     })

@@ -1,9 +1,10 @@
-use crate::{AoMethod, AoSettings, ContactShadowSettings, PostProcessSettings, SsgiSettings};
+use crate::{AoMethod, AoSettings, ContactShadowSettings, PostProcessSettings, SsgiSettings, SsrSettings};
 use glam::{Mat4, Vec3};
 
 const SSAO_KERNEL: usize = 32;
 const BLOOM_LEVELS: usize = 4;
 const NOISE_SIZE: u32 = 4;
+const HIZ_MAX_LEVELS: u32 = 7;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -61,6 +62,22 @@ struct SsgiUniforms {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SsrUniforms {
+    proj: [[f32; 4]; 4],
+    inv_proj: [[f32; 4]; 4],
+    view: [[f32; 4]; 4],
+    inv_view: [[f32; 4]; 4],
+    camera_pos: [f32; 4],
+    resolution: [f32; 2],
+    max_distance: f32,
+    thickness: f32,
+    params: [f32; 4],
+    env: [f32; 4],
+    hiz: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SsgiTemporalUniforms {
     inv_view_proj: [[f32; 4]; 4],
     prev_view_proj: [[f32; 4]; 4],
@@ -112,7 +129,7 @@ struct CompositeUniforms {
     grain_intensity: f32,
     contact_intensity: f32,
     ssgi_intensity: f32,
-    _pad: f32,
+    ssr_intensity: f32,
 }
 
 #[repr(C)]
@@ -128,11 +145,37 @@ struct Rt {
     size: (u32, u32),
 }
 
+/// Min-depth pyramid for hierarchical SSR march.
+struct HizRt {
+    _tex: wgpu::Texture,
+    /// All mips — sampled in SSR.
+    srv: wgpu::TextureView,
+    /// Per-mip RT views for building.
+    mips: Vec<wgpu::TextureView>,
+    _size: (u32, u32),
+    levels: u32,
+}
+
+/// Env map bindings for SSR / deferred specular resolve.
+pub struct SsrEnvInput<'a> {
+    pub sharp: &'a wgpu::TextureView,
+    pub blur: &'a wgpu::TextureView,
+    pub samp: &'a wgpu::Sampler,
+    pub blur_levels: f32,
+    pub intensity: f32,
+    pub rotation_y_rad: f32,
+    pub enabled: bool,
+}
+
 pub struct PostFx {
     ssao_pipe: wgpu::RenderPipeline,
     gtao_pipe: wgpu::RenderPipeline,
     contact_pipe: wgpu::RenderPipeline,
     ssgi_pipe: wgpu::RenderPipeline,
+    ssr_pipe: wgpu::RenderPipeline,
+    ssr_temporal_pipe: wgpu::RenderPipeline,
+    hiz_copy_pipe: wgpu::RenderPipeline,
+    hiz_down_pipe: wgpu::RenderPipeline,
     ssgi_temporal_pipe: wgpu::RenderPipeline,
     ssgi_upsample_pipe: wgpu::RenderPipeline,
     copy_hdr_pipe: wgpu::RenderPipeline,
@@ -148,6 +191,10 @@ pub struct PostFx {
     gtao_bgl: wgpu::BindGroupLayout,
     contact_bgl: wgpu::BindGroupLayout,
     ssgi_bgl: wgpu::BindGroupLayout,
+    ssr_bgl: wgpu::BindGroupLayout,
+    ssr_temporal_bgl: wgpu::BindGroupLayout,
+    hiz_copy_bgl: wgpu::BindGroupLayout,
+    hiz_down_bgl: wgpu::BindGroupLayout,
     ssgi_temporal_bgl: wgpu::BindGroupLayout,
     ssgi_upsample_bgl: wgpu::BindGroupLayout,
     copy_bgl: wgpu::BindGroupLayout,
@@ -160,6 +207,7 @@ pub struct PostFx {
     gtao_ubo: wgpu::Buffer,
     contact_ubo: wgpu::Buffer,
     ssgi_ubo: wgpu::Buffer,
+    ssr_ubo: wgpu::Buffer,
     ssgi_temporal_ubo: wgpu::Buffer,
     ssgi_upsample_ubo: wgpu::Buffer,
     blur_ubo: wgpu::Buffer,
@@ -181,6 +229,10 @@ pub struct PostFx {
     ssgi_temp: Rt,
     ssgi_hist: Rt,
     ssgi_full: Rt,
+    ssr: Rt,
+    ssr_temp: Rt,
+    ssr_hist: Rt,
+    hiz: HizRt,
     bloom: Vec<Rt>,
     composite_temp: Rt,
     white_view: wgpu::TextureView,
@@ -191,6 +243,9 @@ pub struct PostFx {
     prev_view_proj: Mat4,
     ssgi_has_history: bool,
     ssgi_frame: u32,
+    ssr_prev_view_proj: Mat4,
+    ssr_has_history: bool,
+    ssr_frame: u32,
 }
 
 impl PostFx {
@@ -199,6 +254,12 @@ impl PostFx {
         let gtao_shader = device.create_shader_module(wgpu::include_wgsl!("gtao.wgsl"));
         let contact_shader = device.create_shader_module(wgpu::include_wgsl!("contact_shadow.wgsl"));
         let ssgi_shader = device.create_shader_module(wgpu::include_wgsl!("ssgi.wgsl"));
+        let ssr_shader = device.create_shader_module(wgpu::include_wgsl!("ssr.wgsl"));
+        let ssr_temporal_shader =
+            device.create_shader_module(wgpu::include_wgsl!("ssr_temporal.wgsl"));
+        let hiz_copy_shader = device.create_shader_module(wgpu::include_wgsl!("hiz_copy.wgsl"));
+        let hiz_down_shader =
+            device.create_shader_module(wgpu::include_wgsl!("hiz_downsample.wgsl"));
         let ssgi_temporal_shader =
             device.create_shader_module(wgpu::include_wgsl!("ssgi_temporal.wgsl"));
         let ssgi_upsample_shader =
@@ -257,6 +318,46 @@ impl PostFx {
                 filter_samp_entry(10),
             ],
         });
+        let ssr_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ssr"),
+            entries: &[
+                ubo_entry(0, wgpu::ShaderStages::FRAGMENT),
+                depth_entry(1),
+                nearest_samp_entry(2),
+                tex_entry(3, true),
+                filter_samp_entry(4),
+                tex_entry(5, true),
+                filter_samp_entry(6),
+                tex_entry(7, true),
+                filter_samp_entry(8),
+                tex_entry(9, true),
+                filter_samp_entry(10),
+                tex_entry(11, true),
+                tex_array_entry(12, true),
+                filter_samp_entry(13),
+                tex_entry(14, false),
+                nearest_samp_entry(15),
+            ],
+        });
+        let ssr_temporal_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ssr_temporal"),
+            entries: &[
+                ubo_entry(0, wgpu::ShaderStages::FRAGMENT),
+                tex_entry(1, true),
+                tex_entry(2, true),
+                nearest_samp_entry(3),
+                depth_entry(4),
+                nearest_samp_entry(5),
+            ],
+        });
+        let hiz_copy_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("hiz_copy"),
+            entries: &[depth_entry(0), nearest_samp_entry(1)],
+        });
+        let hiz_down_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("hiz_down"),
+            entries: &[tex_entry(0, false), nearest_samp_entry(1)],
+        });
         let ssgi_temporal_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ssgi_temporal"),
             entries: &[
@@ -312,6 +413,7 @@ impl PostFx {
                 nearest_samp_entry(6),
                 tex_entry(7, true),
                 tex_entry(8, true),
+                tex_entry(9, true),
             ],
         });
         let fxaa_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -357,6 +459,42 @@ impl PostFx {
             &ssgi_shader,
             "fs",
             wgpu::TextureFormat::Rgba16Float,
+            None,
+        );
+        let ssr_pipe = fullscreen_pipe(
+            device,
+            "ssr",
+            &ssr_bgl,
+            &ssr_shader,
+            "fs",
+            wgpu::TextureFormat::Rgba16Float,
+            None,
+        );
+        let ssr_temporal_pipe = fullscreen_pipe(
+            device,
+            "ssr_temporal",
+            &ssr_temporal_bgl,
+            &ssr_temporal_shader,
+            "fs",
+            wgpu::TextureFormat::Rgba16Float,
+            None,
+        );
+        let hiz_copy_pipe = fullscreen_pipe(
+            device,
+            "hiz_copy",
+            &hiz_copy_bgl,
+            &hiz_copy_shader,
+            "fs",
+            wgpu::TextureFormat::R32Float,
+            None,
+        );
+        let hiz_down_pipe = fullscreen_pipe(
+            device,
+            "hiz_down",
+            &hiz_down_bgl,
+            &hiz_down_shader,
+            "fs",
+            wgpu::TextureFormat::R32Float,
             None,
         );
         let ssgi_temporal_pipe = fullscreen_pipe(
@@ -481,6 +619,12 @@ impl PostFx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let ssr_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ssr_ubo"),
+            size: std::mem::size_of::<SsrUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let ssgi_temporal_ubo = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ssgi_temporal_ubo"),
             size: std::mem::size_of::<SsgiTemporalUniforms>() as u64,
@@ -548,6 +692,10 @@ impl PostFx {
         let ssgi_temp = make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "ssgi_temp");
         let ssgi_hist = make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "ssgi_hist");
         let ssgi_full = make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "ssgi_full");
+        let ssr = make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "ssr");
+        let ssr_temp = make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "ssr_temp");
+        let ssr_hist = make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "ssr_hist");
+        let hiz = make_hiz(device, 1, 1);
         let bloom = (0..BLOOM_LEVELS)
             .map(|i| make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, &format!("bloom{i}")))
             .collect();
@@ -559,6 +707,10 @@ impl PostFx {
             gtao_pipe,
             contact_pipe,
             ssgi_pipe,
+            ssr_pipe,
+            ssr_temporal_pipe,
+            hiz_copy_pipe,
+            hiz_down_pipe,
             ssgi_temporal_pipe,
             ssgi_upsample_pipe,
             copy_hdr_pipe,
@@ -573,6 +725,10 @@ impl PostFx {
             gtao_bgl,
             contact_bgl,
             ssgi_bgl,
+            ssr_bgl,
+            ssr_temporal_bgl,
+            hiz_copy_bgl,
+            hiz_down_bgl,
             ssgi_temporal_bgl,
             ssgi_upsample_bgl,
             copy_bgl,
@@ -584,6 +740,7 @@ impl PostFx {
             gtao_ubo,
             contact_ubo,
             ssgi_ubo,
+            ssr_ubo,
             ssgi_temporal_ubo,
             ssgi_upsample_ubo,
             blur_ubo,
@@ -603,6 +760,10 @@ impl PostFx {
             ssgi_temp,
             ssgi_hist,
             ssgi_full,
+            ssr,
+            ssr_temp,
+            ssr_hist,
+            hiz,
             bloom,
             composite_temp,
             white_view,
@@ -612,6 +773,9 @@ impl PostFx {
             prev_view_proj: Mat4::IDENTITY,
             ssgi_has_history: false,
             ssgi_frame: 0,
+            ssr_prev_view_proj: Mat4::IDENTITY,
+            ssr_has_history: false,
+            ssr_frame: 0,
         }
     }
 
@@ -623,6 +787,11 @@ impl PostFx {
             self.ao_temp = make_rt(device, w, h, wgpu::TextureFormat::R8Unorm, "ao_temp");
             self.contact = make_rt(device, w, h, wgpu::TextureFormat::R8Unorm, "contact");
             self.ssgi_full = make_rt(device, w, h, wgpu::TextureFormat::Rgba16Float, "ssgi_full");
+            self.ssr = make_rt(device, w, h, wgpu::TextureFormat::Rgba16Float, "ssr");
+            self.ssr_temp = make_rt(device, w, h, wgpu::TextureFormat::Rgba16Float, "ssr_temp");
+            self.ssr_hist = make_rt(device, w, h, wgpu::TextureFormat::Rgba16Float, "ssr_hist");
+            self.hiz = make_hiz(device, w, h);
+            self.ssr_has_history = false;
             self.composite_temp =
                 make_rt(device, w, h, wgpu::TextureFormat::Rgba8UnormSrgb, "composite_temp");
         }
@@ -665,6 +834,11 @@ impl PostFx {
     /// SSGI result (`Rgba16Float`, full-res after upsample). Valid after [`Self::generate_ssgi`] / [`Self::apply`].
     pub fn ssgi_view(&self) -> &wgpu::TextureView {
         &self.ssgi_full.view
+    }
+
+    /// SSR specular result (`Rgba16Float`). Valid after [`Self::generate_ssr`] / [`Self::apply`].
+    pub fn ssr_view(&self) -> &wgpu::TextureView {
+        &self.ssr.view
     }
 
     /// Screen-space contact shadows (+ light bilateral blur) into the contact target.
@@ -1017,6 +1191,296 @@ impl PostFx {
         }
     }
 
+    /// SSR + env specular resolve into the SSR target (full-res HDR).
+    /// Builds Hi-Z, hierarchical march, optional temporal + bilateral denoise.
+    pub fn generate_ssr(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        settings: &SsrSettings,
+        scene_color: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        normals: &wgpu::TextureView,
+        albedo: &wgpu::TextureView,
+        orm: &wgpu::TextureView,
+        env: &SsrEnvInput<'_>,
+        proj: Mat4,
+        view: Mat4,
+        view_proj: Mat4,
+        camera_pos: [f32; 3],
+        size: (u32, u32),
+    ) {
+        let (w, h) = size;
+        let frame = (self.ssr_frame % 1024) as f32;
+        self.ssr_frame = self.ssr_frame.wrapping_add(1);
+
+        self.build_hiz(device, encoder, depth);
+
+        let max_mip = (self.hiz.levels.saturating_sub(1)) as f32;
+        queue.write_buffer(
+            &self.ssr_ubo,
+            0,
+            bytemuck::bytes_of(&SsrUniforms {
+                proj: proj.to_cols_array_2d(),
+                inv_proj: proj.inverse().to_cols_array_2d(),
+                view: view.to_cols_array_2d(),
+                inv_view: view.inverse().to_cols_array_2d(),
+                camera_pos: [camera_pos[0], camera_pos[1], camera_pos[2], 0.0],
+                resolution: [w as f32, h as f32],
+                max_distance: settings.max_distance,
+                thickness: settings.thickness,
+                params: [
+                    settings.max_steps.max(8) as f32,
+                    settings.bias,
+                    settings.roughness_cutoff,
+                    frame,
+                ],
+                env: [
+                    env.intensity,
+                    env.blur_levels,
+                    if env.enabled { 1.0 } else { 0.0 },
+                    env.rotation_y_rad,
+                ],
+                hiz: [max_mip, 0.0, 0.0, 0.0],
+            }),
+        );
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ssr"),
+            layout: &self.ssr_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.ssr_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(normals),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(scene_color),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(orm),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(albedo),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(env.sharp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(env.blur),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::Sampler(env.samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: wgpu::BindingResource::TextureView(&self.hiz.srv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+            ],
+        });
+        {
+            let mut pass = color_pass(
+                encoder,
+                "ssr",
+                &self.ssr_temp.view,
+                wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+            );
+            pass.set_pipeline(&self.ssr_pipe);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        if settings.temporal {
+            let has_hist = self.ssr_has_history;
+            queue.write_buffer(
+                &self.ssgi_temporal_ubo,
+                0,
+                bytemuck::bytes_of(&SsgiTemporalUniforms {
+                    inv_view_proj: view_proj.inverse().to_cols_array_2d(),
+                    prev_view_proj: self.ssr_prev_view_proj.to_cols_array_2d(),
+                    params: [
+                        settings.history.clamp(0.0, 0.98),
+                        settings.depth_reject.max(0.001),
+                        if has_hist { 1.0 } else { 0.0 },
+                        0.0,
+                    ],
+                }),
+            );
+            let tbg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ssr_temporal"),
+                layout: &self.ssr_temporal_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.ssgi_temporal_ubo.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.ssr_temp.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.ssr_hist.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(depth),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                    },
+                ],
+            });
+            {
+                let mut pass = color_pass(
+                    encoder,
+                    "ssr_temporal",
+                    &self.ssr.view,
+                    wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                );
+                pass.set_pipeline(&self.ssr_temporal_pipe);
+                pass.set_bind_group(0, &tbg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        } else {
+            self.copy_hdr(device, encoder, &self.ssr_temp.view, &self.ssr.view);
+            self.ssr_has_history = false;
+        }
+
+        self.blur_pass(
+            device,
+            queue,
+            encoder,
+            &self.ssr.view,
+            &self.ssr_temp.view,
+            depth,
+            [1.25 / w as f32, 0.0],
+            true,
+            70.0,
+            true,
+        );
+        self.blur_pass(
+            device,
+            queue,
+            encoder,
+            &self.ssr_temp.view,
+            &self.ssr.view,
+            depth,
+            [0.0, 1.25 / h as f32],
+            true,
+            70.0,
+            true,
+        );
+
+        if settings.temporal {
+            self.copy_hdr(device, encoder, &self.ssr.view, &self.ssr_hist.view);
+            self.ssr_prev_view_proj = view_proj;
+            self.ssr_has_history = true;
+        }
+    }
+
+    fn build_hiz(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        depth: &wgpu::TextureView,
+    ) {
+        // Mip 0: copy hardware depth → R32Float.
+        let copy_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("hiz_copy"),
+            layout: &self.hiz_copy_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+            ],
+        });
+        {
+            let mut pass = color_pass(
+                encoder,
+                "hiz_copy",
+                &self.hiz.mips[0],
+                wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+            );
+            pass.set_pipeline(&self.hiz_copy_pipe);
+            pass.set_bind_group(0, &copy_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        for level in 1..self.hiz.levels as usize {
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("hiz_down"),
+                layout: &self.hiz_down_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.hiz.mips[level - 1]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                    },
+                ],
+            });
+            let mut pass = color_pass(
+                encoder,
+                "hiz_down",
+                &self.hiz.mips[level],
+                wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+            );
+            pass.set_pipeline(&self.hiz_down_pipe);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
     fn copy_hdr(
         &self,
         device: &wgpu::Device,
@@ -1230,6 +1694,7 @@ impl PostFx {
         view_proj: Mat4,
         camera_pos: [f32; 3],
         light_dir_world: Option<Vec3>,
+        env: &SsrEnvInput<'_>,
         size: (u32, u32),
     ) {
         let (w, h) = size;
@@ -1282,6 +1747,28 @@ impl PostFx {
             );
         } else {
             self.ssgi_has_history = false;
+        }
+
+        if settings.ssr.enabled {
+            self.generate_ssr(
+                device,
+                queue,
+                encoder,
+                &settings.ssr,
+                scene_color,
+                depth,
+                normals,
+                albedo,
+                orm,
+                env,
+                proj,
+                view,
+                view_proj,
+                camera_pos,
+                size,
+            );
+        } else {
+            self.ssr_has_history = false;
         }
 
         if settings.bloom.enabled {
@@ -1337,6 +1824,11 @@ impl PostFx {
         };
         let ssgi_view = if settings.ssgi.enabled {
             &self.ssgi_full.view
+        } else {
+            &self.black_view
+        };
+        let ssr_view = if settings.ssr.enabled {
+            &self.ssr.view
         } else {
             &self.black_view
         };
@@ -1420,7 +1912,11 @@ impl PostFx {
                 } else {
                     0.0
                 },
-                _pad: 0.0,
+                ssr_intensity: if settings.ssr.enabled {
+                    settings.ssr.intensity
+                } else {
+                    0.0
+                },
             }),
         );
 
@@ -1468,6 +1964,10 @@ impl PostFx {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: wgpu::BindingResource::TextureView(ssgi_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(ssr_view),
                 },
             ],
         });
@@ -1716,6 +2216,48 @@ fn make_rt(device: &wgpu::Device, w: u32, h: u32, format: wgpu::TextureFormat, l
     }
 }
 
+fn make_hiz(device: &wgpu::Device, w: u32, h: u32) -> HizRt {
+    let w = w.max(1);
+    let h = h.max(1);
+    let levels = ((w.max(h) as f32).log2().floor() as u32 + 1)
+        .clamp(1, HIZ_MAX_LEVELS);
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("hiz"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: levels,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let srv = tex.create_view(&Default::default());
+    let mips = (0..levels)
+        .map(|m| {
+            tex.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("hiz_mip"),
+                format: Some(wgpu::TextureFormat::R32Float),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                aspect: wgpu::TextureAspect::All,
+                base_mip_level: m,
+                mip_level_count: Some(1),
+                ..Default::default()
+            })
+        })
+        .collect();
+    HizRt {
+        _tex: tex,
+        srv,
+        mips,
+        _size: (w, h),
+        levels,
+    }
+}
+
 fn make_kernel() -> [[f32; 4]; SSAO_KERNEL] {
     let mut kernel = [[0.0; 4]; SSAO_KERNEL];
     for i in 0..SSAO_KERNEL {
@@ -1836,6 +2378,19 @@ fn tex_entry(binding: u32, filterable: bool) -> wgpu::BindGroupLayoutEntry {
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable },
             view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn tex_array_entry(binding: u32, filterable: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
             multisampled: false,
         },
         count: None,

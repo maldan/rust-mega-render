@@ -3,11 +3,11 @@ struct FrameUniforms {
     light_view_proj: mat4x4<f32>,
     ambient: vec4<f32>, // xyz ambient, w = light count
     camera_pos: vec4<f32>,
-    // x = ibl intensity, y = prefilter max mip, z = ibl enabled, w = pcss filter samples
+    // x = env intensity, y = blur layer count, z = env active, w = pcss filter samples
     ibl: vec4<f32>,
     // x = filter (0=pcf, 1=pcss), y = light_size, z = 1/shadow_map_size, w = blocker samples
     shadow: vec4<f32>,
-    // x = IBL diffuse / constant-ambient scale (1 = full; reduced when SSGI is on)
+    // x = constant-ambient scale, y = env yaw rotation (radians)
     gi: vec4<f32>,
     lights: array<GpuLight, 8>,
 }
@@ -29,11 +29,10 @@ struct ObjectUniforms {
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
 @group(0) @binding(1) var shadow_map: texture_depth_2d;
 @group(0) @binding(2) var shadow_samp: sampler_comparison;
-@group(0) @binding(3) var env_equirect: texture_2d<f32>;
-@group(0) @binding(4) var brdf_lut: texture_2d<f32>;
+@group(0) @binding(3) var env_sharp: texture_2d<f32>;
+@group(0) @binding(4) var env_blur: texture_2d_array<f32>;
 @group(0) @binding(5) var env_samp: sampler;
-@group(0) @binding(6) var clamp_samp: sampler;
-@group(0) @binding(7) var shadow_depth_samp: sampler;
+@group(0) @binding(6) var shadow_depth_samp: sampler;
 @group(1) @binding(0) var<uniform> object: ObjectUniforms;
 @group(1) @binding(1) var albedo_tex: texture_2d<f32>;
 @group(1) @binding(2) var normal_tex: texture_2d<f32>;
@@ -220,10 +219,6 @@ fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
-fn fresnel_schlick_roughness(cos_theta: f32, f0: vec3<f32>, roughness: f32) -> vec3<f32> {
-    return f0 + (max(vec3<f32>(1.0 - roughness), f0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
-}
-
 fn light_contrib(
     light: GpuLight,
     world_pos: vec3<f32>,
@@ -271,55 +266,64 @@ fn light_contrib(
     return (diffuse + specular) * radiance * ndotl;
 }
 
-// Soft-compress HDR so studio lamps don't turn dielectrics into white sparkles.
-fn compress_env(c: vec3<f32>) -> vec3<f32> {
-    return c / (vec3(1.0) + c);
+// Sharp full-res + discrete blurred ≤1024 maps (no mip pyramid).
+fn rotate_y(d: vec3<f32>, angle: f32) -> vec3<f32> {
+    let c = cos(angle);
+    let s = sin(angle);
+    return vec3(d.x * c + d.z * s, d.y, -d.x * s + d.z * c);
 }
 
-fn sample_env(dir: vec3<f32>, lod: f32) -> vec3<f32> {
-    let d = normalize(dir);
+fn dir_to_uv(dir: vec3<f32>) -> vec2<f32> {
+    let d = rotate_y(normalize(dir), frame.gi.y);
     let phi = atan2(d.z, d.x);
     let theta = acos(clamp(d.y, -1.0, 1.0));
-    let uv = vec2(phi / (2.0 * PI) + 0.5, theta / PI);
-    return compress_env(textureSampleLevel(env_equirect, env_samp, uv, lod).rgb);
+    return vec2(phi / (2.0 * PI) + 0.5, theta / PI);
 }
 
-fn ibl_contrib(
+fn sample_env_level(uv: vec2<f32>, idx: i32) -> vec3<f32> {
+    // idx 0 = sharp full-res; 1..N = blur array layers (still ~1024 wide).
+    if idx <= 0 {
+        return textureSampleLevel(env_sharp, env_samp, uv, 0.0).rgb;
+    }
+    let layers = max(i32(frame.ibl.y), 1);
+    let layer = u32(clamp(idx - 1, 0, layers - 1));
+    return textureSampleLevel(env_blur, env_samp, uv, layer, 0.0).rgb;
+}
+
+fn sample_env(dir: vec3<f32>, roughness: f32) -> vec3<f32> {
+    let uv = dir_to_uv(dir);
+    let levels = max(frame.ibl.y, 1.0);
+    // 0 = sharp, levels = last blur layer.
+    let t = clamp(roughness, 0.0, 1.0) * levels;
+    let i0 = i32(floor(t));
+    let i1 = min(i0 + 1, i32(levels));
+    let f = fract(t);
+    return mix(sample_env_level(uv, i0), sample_env_level(uv, i1), f);
+}
+
+fn env_reflect(
     n_in: vec3<f32>,
     v_in: vec3<f32>,
     albedo: vec3<f32>,
     metallic: f32,
     roughness: f32,
-    ambient_gi: f32,
 ) -> vec3<f32> {
     let n = normalize(n_in);
     let v = normalize(v_in);
+    let rgh = clamp(roughness, 0.04, 1.0);
 
-    // Dielectric F0 ≈ 0.04; metals use albedo as F0.
+    // Matte: almost no mirror; glossy keeps most of the env.
+    let gloss = 1.0 - rgh;
+    let energy = gloss * gloss;
+    if energy < 0.002 {
+        return vec3(0.0);
+    }
+
     let f0 = mix(vec3<f32>(0.04), albedo, metallic);
     let n_dot_v = max(dot(n, v), 0.001);
-    let f = fresnel_schlick_roughness(n_dot_v, f0, roughness);
-    let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
-
-    // Diffuse: heavily blurred equirect along the normal (no cubemap seams).
-    // Not a perfect cosine irradiance integral, but stable and energy-sane after compress.
-    let irradiance = sample_env(n, frame.ibl.y);
-    let diffuse = kd * albedo * irradiance * ambient_gi;
-
-    // Specular: reflect env. Dielectrics only reflect ~4% at face-on (F0),
-    // more at grazing via the BRDF LUT. Metals reflect strongly tinted by albedo.
-    var lod = roughness * roughness * frame.ibl.y;
-    // Dielectrics: never sample mip0 — HDR lamps become white pin-dots otherwise.
-    if metallic < 0.5 {
-        lod = max(lod, 1.25);
-    }
+    let f = fresnel_schlick(n_dot_v, f0);
     let r = reflect(-v, n);
-    let prefiltered = sample_env(r, lod);
-    let brdf = textureSample(brdf_lut, clamp_samp, vec2(n_dot_v, roughness)).rg;
-    // Split-sum: scale/bias. For plastic this stays small (F0*…).
-    let specular = prefiltered * (f0 * brdf.x + brdf.y);
-
-    return (diffuse + specular) * frame.ibl.x;
+    return sample_env(r, rgh) * f * energy * frame.ibl.x;
 }
 
 struct GBufferOut {
@@ -345,14 +349,12 @@ fn fs_main(in: VertexOutput) -> GBufferOut {
 
     let v = normalize(frame.camera_pos.xyz - in.world_pos);
 
-    // Scale down IBL/constant diffuse when SSGI is active (frame.gi.x).
+    // Scale down constant ambient when SSGI is active (frame.gi.x).
     let ambient_gi = clamp(frame.gi.x, 0.0, 1.0);
 
-    var lit = vec3<f32>(0.0);
+    var lit = frame.ambient.xyz * albedo * ambient_gi;
     if frame.ibl.z > 0.5 {
-        lit += ibl_contrib(n, v, albedo, metallic, roughness, ambient_gi);
-    } else {
-        lit += frame.ambient.xyz * albedo * ambient_gi;
+        lit += env_reflect(n, v, albedo, metallic, roughness);
     }
 
     let count = u32(frame.ambient.w);

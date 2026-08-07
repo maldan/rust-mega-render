@@ -1,72 +1,63 @@
-//! GPU upload / bind helpers for baked IBL.
+//! GPU upload for sharp equirect + blurred texture2d_array (roughness).
 
-use crate::ibl::{self, BakedIbl};
+use crate::ibl::{self, EquirectHdr, EnvMaps, BLUR_LEVELS};
 use half::f16;
 
 pub struct GpuIbl {
-    pub equirect_view: wgpu::TextureView,
-    pub brdf_view: wgpu::TextureView,
-    pub equirect_samp: wgpu::Sampler,
-    pub clamp_samp: wgpu::Sampler,
-    pub max_mip: f32,
-    pub enabled: bool,
-    _equirect: wgpu::Texture,
-    _brdf: wgpu::Texture,
+    pub sharp_view: wgpu::TextureView,
+    pub blur_view: wgpu::TextureView,
+    pub samp: wgpu::Sampler,
+    /// Number of blur array layers (for shader blend).
+    pub blur_levels: f32,
+    pub loaded: bool,
+    _sharp: wgpu::Texture,
+    _blur: wgpu::Texture,
 }
 
 impl GpuIbl {
     pub fn black(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        let equirect = solid_equirect(device, queue, [0.05; 3]);
-        let brdf = solid_brdf(device, queue, [1.0, 0.0]);
-        Self {
-            equirect_view: equirect.create_view(&Default::default()),
-            brdf_view: brdf.create_view(&Default::default()),
-            equirect_samp: equirect_sampler(device),
-            clamp_samp: clamp_sampler(device),
-            max_mip: 0.0,
-            enabled: false,
-            _equirect: equirect,
-            _brdf: brdf,
-        }
+        let pixel = EquirectHdr {
+            width: 1,
+            height: 1,
+            rgb: vec![[0.05; 3]],
+        };
+        let maps = EnvMaps {
+            sharp: pixel.clone(),
+            blurred: vec![pixel; BLUR_LEVELS as usize],
+        };
+        Self::from_maps(device, queue, &maps, false)
     }
 
-    pub fn from_baked(device: &wgpu::Device, queue: &wgpu::Queue, baked: &BakedIbl) -> Self {
-        let equirect = upload_equirect_mips(device, queue, &baked.equirect_mips);
-        let brdf = upload_brdf(device, queue, baked.brdf_size, &baked.brdf);
-        let max_mip = (baked.equirect_mips.len().saturating_sub(1)) as f32;
+    pub fn from_maps(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        maps: &EnvMaps,
+        loaded: bool,
+    ) -> Self {
+        let sharp = upload_equirect_2d(device, queue, &maps.sharp, "env_sharp");
+        let blur = upload_equirect_array(device, queue, &maps.blurred, "env_blur");
         Self {
-            equirect_view: equirect.create_view(&Default::default()),
-            brdf_view: brdf.create_view(&Default::default()),
-            equirect_samp: equirect_sampler(device),
-            clamp_samp: clamp_sampler(device),
-            max_mip,
-            enabled: true,
-            _equirect: equirect,
-            _brdf: brdf,
+            sharp_view: sharp.create_view(&Default::default()),
+            blur_view: blur.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            }),
+            samp: equirect_sampler(device),
+            blur_levels: maps.blurred.len() as f32,
+            loaded,
+            _sharp: sharp,
+            _blur: blur,
         }
     }
 }
 
 fn equirect_sampler(device: &wgpu::Device) -> wgpu::Sampler {
     device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("ibl_equirect_samp"),
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::MipmapFilterMode::Linear,
-        address_mode_u: wgpu::AddressMode::Repeat,
-        address_mode_v: wgpu::AddressMode::ClampToEdge,
-        address_mode_w: wgpu::AddressMode::ClampToEdge,
-        ..Default::default()
-    })
-}
-
-fn clamp_sampler(device: &wgpu::Device) -> wgpu::Sampler {
-    device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("ibl_clamp_samp"),
+        label: Some("env_samp"),
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
         mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_u: wgpu::AddressMode::Repeat,
         address_mode_v: wgpu::AddressMode::ClampToEdge,
         address_mode_w: wgpu::AddressMode::ClampToEdge,
         ..Default::default()
@@ -101,59 +92,18 @@ fn padded_rgba16_rows(width: u32, height: u32, rgb: &[[f32; 3]]) -> (Vec<u8>, u3
     (bytes, bpr)
 }
 
-fn upload_equirect_mips(
+fn upload_equirect_2d(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    mips: &[ibl::EquirectHdr],
+    img: &EquirectHdr,
+    label: &str,
 ) -> wgpu::Texture {
-    let base = &mips[0];
+    let (bytes, bpr) = padded_rgba16_rows(img.width, img.height, &img.rgb);
     let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("ibl_equirect"),
+        label: Some(label),
         size: wgpu::Extent3d {
-            width: base.width,
-            height: base.height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: mips.len() as u32,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba16Float,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    for (level, mip) in mips.iter().enumerate() {
-        let (bytes, bpr) = padded_rgba16_rows(mip.width, mip.height, &mip.rgb);
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &tex,
-                mip_level: level as u32,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(bpr),
-                rows_per_image: Some(mip.height),
-            },
-            wgpu::Extent3d {
-                width: mip.width,
-                height: mip.height,
-                depth_or_array_layers: 1,
-            },
-        );
-    }
-    tex
-}
-
-fn upload_brdf(device: &wgpu::Device, queue: &wgpu::Queue, size: u32, data: &[[f32; 2]]) -> wgpu::Texture {
-    let rgb: Vec<[f32; 3]> = data.iter().map(|c| [c[0], c[1], 0.0]).collect();
-    let (bytes, bpr) = padded_rgba16_rows(size, size, &rgb);
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("ibl_brdf"),
-        size: wgpu::Extent3d {
-            width: size,
-            height: size,
+            width: img.width,
+            height: img.height,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -174,28 +124,91 @@ fn upload_brdf(device: &wgpu::Device, queue: &wgpu::Queue, size: u32, data: &[[f
         wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(bpr),
-            rows_per_image: Some(size),
+            rows_per_image: Some(img.height),
         },
         wgpu::Extent3d {
-            width: size,
-            height: size,
+            width: img.width,
+            height: img.height,
             depth_or_array_layers: 1,
         },
     );
     tex
 }
 
-fn solid_equirect(device: &wgpu::Device, queue: &wgpu::Queue, rgb: [f32; 3]) -> wgpu::Texture {
-    let img = ibl::EquirectHdr {
-        width: 1,
-        height: 1,
-        rgb: vec![rgb],
-    };
-    upload_equirect_mips(device, queue, &[img])
+fn upload_equirect_array(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layers: &[EquirectHdr],
+    label: &str,
+) -> wgpu::Texture {
+    assert!(!layers.is_empty());
+    let w = layers[0].width;
+    let h = layers[0].height;
+    for layer in layers {
+        assert_eq!(layer.width, w);
+        assert_eq!(layer.height, h);
+    }
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: layers.len() as u32,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (i, layer) in layers.iter().enumerate() {
+        let (bytes, bpr) = padded_rgba16_rows(layer.width, layer.height, &layer.rgb);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: i as u32,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bpr),
+                rows_per_image: Some(layer.height),
+            },
+            wgpu::Extent3d {
+                width: layer.width,
+                height: layer.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    tex
 }
 
-fn solid_brdf(device: &wgpu::Device, queue: &wgpu::Queue, rg: [f32; 2]) -> wgpu::Texture {
-    upload_brdf(device, queue, 1, &[rg])
+pub fn load_cpu(path: impl AsRef<std::path::Path>) -> Result<EnvMaps, String> {
+    let path = path.as_ref();
+    let sharp = ibl::load_equirect_hdr(path)?;
+    eprintln!(
+        "Env map: {}x{} sharp — building {} blurred ≤{}px maps...",
+        sharp.width,
+        sharp.height,
+        BLUR_LEVELS,
+        ibl::BLUR_MAX_WIDTH
+    );
+    let maps = ibl::prepare_env_maps(sharp);
+    eprintln!(
+        "Env map: blur layers {}x{} x{}",
+        maps.blurred[0].width,
+        maps.blurred[0].height,
+        maps.blurred.len()
+    );
+    Ok(maps)
 }
 
 pub fn load_and_upload(
@@ -203,13 +216,5 @@ pub fn load_and_upload(
     queue: &wgpu::Queue,
     path: impl AsRef<std::path::Path>,
 ) -> Result<GpuIbl, String> {
-    let equirect = ibl::load_equirect_hdr(path)?;
-    eprintln!(
-        "IBL: preparing {}x{} → equirect {}px + mips + BRDF LUT...",
-        equirect.width,
-        equirect.height,
-        ibl::EQUIRECT_WIDTH
-    );
-    let baked = ibl::bake_ibl(&equirect);
-    Ok(GpuIbl::from_baked(device, queue, &baked))
+    Ok(GpuIbl::from_maps(device, queue, &load_cpu(path)?, true))
 }

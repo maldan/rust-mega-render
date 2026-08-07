@@ -28,7 +28,6 @@ fn build_demo_scene() -> Scene {
         d.direction = Vec3::new(0.28, -0.30, 0.93);
     }
     scene.ambient = [0.03, 0.03, 0.04];
-    scene.ibl_intensity = 1.0;
     scene.lights.push(Light::Point(PointLight {
         position: Vec3::new(-2.0, 3.0, 1.5),
         color: [0.5, 0.7, 1.0],
@@ -57,7 +56,7 @@ fn build_demo_scene() -> Scene {
 
     let mat_ground = scene
         .materials
-        .insert(Material::new([0.35, 0.38, 0.32, 1.0], 0.0, 0.85));
+        .insert(Material::new([0.72, 0.72, 0.75, 1.0], 1.0, 0.35));
 
     let root = scene.nodes.insert(Node {
         name: "root".into(),
@@ -175,6 +174,8 @@ impl Demo for MaterialDemo {
     }
 
     fn configure(visualizer: &mut WgpuVisualizer) {
+        visualizer.set_env_map_async(r"F:\3d\garbage\hdri\cowboy_town_saloon_4k.exr");
+
         let shadow = visualizer.shadow_settings();
         shadow.filter = ShadowFilter::Pcss;
         shadow.map_size = 4096;
@@ -183,6 +184,9 @@ impl Demo for MaterialDemo {
         shadow.pcss_filter_samples = 48;
 
         let post = visualizer.post_process();
+        post.env.enabled = true;
+        post.env.intensity = 1.0;
+        post.env.rotation_y = 0.0;
         post.ao.enabled = true;
         post.ao.method = AoMethod::Gtao;
         post.ao.radius = 1.96;
@@ -206,6 +210,16 @@ impl Demo for MaterialDemo {
         post.ssgi.temporal = true;
         post.ssgi.history = 0.88;
         post.ssgi.depth_reject = 0.025;
+        post.ssr.enabled = true;
+        post.ssr.max_distance = 12.0;
+        post.ssr.thickness = 0.22;
+        post.ssr.intensity = 1.0;
+        post.ssr.max_steps = 48;
+        post.ssr.bias = 0.05;
+        post.ssr.roughness_cutoff = 0.55;
+        post.ssr.temporal = true;
+        post.ssr.history = 0.85;
+        post.ssr.depth_reject = 0.03;
         post.bloom.enabled = true;
         post.bloom.threshold = 1.2;
         post.bloom.intensity = 0.2;
@@ -274,6 +288,16 @@ impl Demo for MaterialDemo {
                 ui.label("Others blit thin G-buffer / AO.");
             }),
             "Effects" => effect_panel(ui, "Effects", |ui| {
+                ui.collapsing_header("Env Map", |ui| {
+                    ui.checkbox("Enabled", &mut post.env.enabled);
+                    ui.label("Equirect HDR/EXR reflections + skybox.");
+                    ui.add_enabled(post.env.enabled, |ui| {
+                        ui.label("Intensity — сила отражений / sky");
+                        ui.slider("Intensity", &mut post.env.intensity, 0.0..=3.0);
+                        ui.label("Rotation Y — поворот карты (°)");
+                        ui.slider("Rotation Y", &mut post.env.rotation_y, 0.0..=360.0);
+                    });
+                });
                 ui.collapsing_header("AO", |ui| {
                     ui.checkbox("Enabled", &mut post.ao.enabled);
                     ui.add_enabled(post.ao.enabled, |ui| {
@@ -368,7 +392,7 @@ impl Demo for MaterialDemo {
                         }
                         ui.label("Bias — отступ от поверхности");
                         ui.slider("Bias", &mut post.ssgi.bias, 0.0..=0.1);
-                        ui.label("Ambient dim — ослабление IBL diffuse");
+                        ui.label("Ambient dim — ослабление constant ambient при SSGI");
                         ui.slider("Ambient dim", &mut post.ssgi.ambient_dim, 0.0..=1.0);
                         ui.separator();
                         ui.checkbox("Temporal", &mut post.ssgi.temporal);
@@ -378,6 +402,40 @@ impl Demo for MaterialDemo {
                             ui.slider("History", &mut post.ssgi.history, 0.5..=0.98);
                             ui.label("Depth reject — порог disocclusion");
                             ui.slider("Depth reject", &mut post.ssgi.depth_reject, 0.005..=0.1);
+                        });
+                    });
+                });
+                ui.collapsing_header("SSR", |ui| {
+                    ui.checkbox("Enabled", &mut post.ssr.enabled);
+                    ui.label("Screen reflections; misses fall back to env map.");
+                    ui.add_enabled(post.ssr.enabled, |ui| {
+                        ui.label("Max distance — длина луча");
+                        ui.slider("Max distance", &mut post.ssr.max_distance, 0.5..=20.0);
+                        ui.label("Thickness — допуск по глубине");
+                        ui.slider("Thickness", &mut post.ssr.thickness, 0.02..=1.0);
+                        ui.label("Intensity — сила specular");
+                        ui.slider("Intensity", &mut post.ssr.intensity, 0.0..=2.0);
+                        ui.label("Steps — шагов марша");
+                        let mut steps = post.ssr.max_steps as f32;
+                        if ui.slider("Steps", &mut steps, 8.0..=64.0).changed() {
+                            post.ssr.max_steps = steps.round() as u32;
+                        }
+                        ui.label("Bias — отступ от поверхности");
+                        ui.slider("Bias", &mut post.ssr.bias, 0.0..=0.2);
+                        ui.label("Roughness cutoff — выше только env");
+                        ui.slider(
+                            "Roughness cutoff",
+                            &mut post.ssr.roughness_cutoff,
+                            0.1..=1.0,
+                        );
+                        ui.separator();
+                        ui.checkbox("Temporal", &mut post.ssr.temporal);
+                        ui.label("Camera reprojection + depth rejection.");
+                        ui.add_enabled(post.ssr.temporal, |ui| {
+                            ui.label("History — вес прошлого кадра");
+                            ui.slider("History", &mut post.ssr.history, 0.5..=0.98);
+                            ui.label("Depth reject — порог disocclusion");
+                            ui.slider("Depth reject", &mut post.ssr.depth_reject, 0.005..=0.1);
                         });
                     });
                 });
@@ -452,8 +510,6 @@ impl Demo for MaterialDemo {
                 });
             }),
             "Lights" => effect_panel(ui, "Lights", |ui| {
-                ui.label("IBL intensity — сила IBL / sky");
-                ui.slider("IBL intensity", &mut scene.ibl_intensity, 0.0..=3.0);
                 ui.label("Ambient — плоский ambient");
                 let mut amb = [scene.ambient[0], scene.ambient[1], scene.ambient[2], 1.0];
                 if ui.color_edit("ambient", &mut amb).changed() {

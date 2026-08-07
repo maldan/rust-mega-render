@@ -29,9 +29,9 @@ pub use material::Material;
 pub use mesh::Mesh;
 pub use node::{Node, Transform};
 pub use post_process::{
-    AoMethod, AoSettings, BloomSettings, ColorGradeSettings, ContactShadowSettings, FogSettings,
-    FxaaSettings, GrainSettings, PostProcessSettings, SsgiSettings, TonemapSettings,
-    VignetteSettings,
+    AoMethod, AoSettings, BloomSettings, ColorGradeSettings, ContactShadowSettings, EnvMapSettings,
+    FogSettings, FxaaSettings, GrainSettings, PostProcessSettings, SsgiSettings, SsrSettings,
+    TonemapSettings, VignetteSettings,
 };
 pub use primitives::{cube, plane, sphere};
 pub use scene::Scene;

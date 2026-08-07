@@ -25,6 +25,8 @@ pub enum DebugView {
     ContactShadow,
     /// Screen-space GI buffer (black if unavailable).
     Ssgi,
+    /// Screen-space reflections / deferred specular (black if unavailable).
+    Ssr,
     /// Base-color albedo G-buffer.
     Albedo,
 }
@@ -40,6 +42,7 @@ impl DebugView {
         DebugView::Ao,
         DebugView::ContactShadow,
         DebugView::Ssgi,
+        DebugView::Ssr,
         DebugView::Albedo,
     ];
 
@@ -54,6 +57,7 @@ impl DebugView {
             DebugView::Ao => "AO",
             DebugView::ContactShadow => "Contact shadow",
             DebugView::Ssgi => "SSGI",
+            DebugView::Ssr => "SSR",
             DebugView::Albedo => "Albedo",
         }
     }
@@ -69,7 +73,8 @@ impl DebugView {
             DebugView::Ao => 6,
             DebugView::ContactShadow => 7,
             DebugView::Ssgi => 8,
-            DebugView::Albedo => 9,
+            DebugView::Ssr => 9,
+            DebugView::Albedo => 10,
         }
     }
 }

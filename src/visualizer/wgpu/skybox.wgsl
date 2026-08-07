@@ -5,14 +5,21 @@ struct VsOut {
 
 struct SkyUniforms {
     inv_view_proj: mat4x4<f32>,
-    params: vec4<f32>, // x = intensity
+    // x = intensity, y = yaw rotation (radians)
+    params: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> u: SkyUniforms;
-@group(0) @binding(1) var env_equirect: texture_2d<f32>;
+@group(0) @binding(1) var env_sharp: texture_2d<f32>;
 @group(0) @binding(2) var env_samp: sampler;
 
 const PI: f32 = 3.14159265;
+
+fn rotate_y(d: vec3<f32>, angle: f32) -> vec3<f32> {
+    let c = cos(angle);
+    let s = sin(angle);
+    return vec3(d.x * c + d.z * s, d.y, -d.x * s + d.z * c);
+}
 
 @vertex
 fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
@@ -38,14 +45,14 @@ struct GBufferOut {
 
 @fragment
 fn fs(i: VsOut) -> GBufferOut {
-    let d = normalize(i.dir);
+    let d = rotate_y(normalize(i.dir), u.params.y);
     let phi = atan2(d.z, d.x);
     let theta = acos(clamp(d.y, -1.0, 1.0));
     let uv = vec2(phi / (2.0 * PI) + 0.5, theta / PI);
-    let color = textureSampleLevel(env_equirect, env_samp, uv, 0.0).rgb;
+    let color = textureSampleLevel(env_sharp, env_samp, uv, 0.0).rgb;
     var out: GBufferOut;
     out.color = vec4(color * u.params.x, 1.0);
-    out.normal = vec4(-d, 0.0);
+    out.normal = vec4(-normalize(i.dir), 0.0);
     out.orm = vec4(1.0, 1.0, 0.0, 1.0);
     // Sky is not a diffuse bounce surface for SSGI.
     out.albedo = vec4(0.0);

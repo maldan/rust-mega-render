@@ -66,10 +66,6 @@ fn project_uv(view_p: vec3<f32>) -> vec3<f32> {
     return vec3(uv, ndc.z);
 }
 
-fn ign(pixel: vec2<f32>) -> f32 {
-    return fract(52.9829189 * fract(dot(pixel, vec2(0.06711056, 0.00583715))));
-}
-
 fn hash21(p: vec2<f32>) -> f32 {
     var p3 = fract(vec3(p.xyx) * 0.1031);
     p3 += dot(p3, p3.yzx + 33.33);
@@ -78,6 +74,11 @@ fn hash21(p: vec2<f32>) -> f32 {
 
 fn hash22(p: vec2<f32>) -> vec2<f32> {
     return vec2(hash21(p), hash21(p + vec2(13.1, 7.7)));
+}
+
+/// Stable per-pixel isotropic noise (quantized to texel).
+fn noise2(pixel: vec2<f32>) -> vec2<f32> {
+    return hash22(floor(pixel));
 }
 
 fn basis(n: vec3<f32>) -> mat3x3<f32> {
@@ -140,24 +141,26 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
     let radius = max(u.radius, 0.05);
     let thickness = max(u.thickness, 0.001);
 
-    // Slow pattern cycle (8 slots) — fast golden-phase made bright hits "fly" upward.
+    // Temporal only rotates the hemisphere — do NOT scroll noise in screen space.
+    // Scrolling (especially more in Y) made fireflies look like sparks rising on Y.
     let slot = u32(u.params.w) % 8u;
-    let phase = f32(slot) / 8.0;
+    let angle_rot = f32(slot) * (PI * 0.25);
 
     let pixel = i.uv * u.full_resolution;
-    let n0 = ign(pixel + vec2(phase * 37.1, phase * 73.7));
-    let n1 = hash21(pixel + vec2(19.19 + phase * 11.0, 7.7));
+    let n = noise2(pixel);
+    let n0 = n.x;
+    let n1 = n.y;
     let tbn = basis(n_view);
 
     // Local luminance reference — clamp hits relative to what's already on screen.
     let local_luma = max(luma(textureSampleLevel(color_tex, color_samp, i.uv, 0.0).rgb), 0.05);
-    let hit_max_luma = max(local_luma * 2.5, 1.0);
+    let hit_max_luma = max(local_luma * 2.0, 0.85);
 
     var irradiance = vec3(0.0);
 
     for (var s = 0u; s < samples; s++) {
-        let xi = hash22(pixel + vec2(f32(s) * 17.3 + phase * 64.0, n0 * 64.0));
-        let phi = 2.0 * PI * fract(xi.x + n1);
+        let xi = hash22(floor(pixel) + vec2(f32(s) * 19.0, f32(s) * 7.0));
+        let phi = 2.0 * PI * fract(xi.x + n1) + angle_rot;
         let cos_t = sqrt(xi.y);
         let sin_t = sqrt(max(1.0 - cos_t * cos_t, 0.0));
         let local = vec3(cos(phi) * sin_t, sin(phi) * sin_t, cos_t);
@@ -165,7 +168,7 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
 
         let ray_len = radius * (0.35 + 0.65 * fract(xi.y + n0));
         let step_len = ray_len / f32(max_steps);
-        let jitter = ign(pixel + vec2(f32(s) + phase * 9.0, 3.1)) * step_len;
+        let jitter = fract(n0 * 5.1 + f32(s) * 0.37) * step_len;
 
         var hit = false;
         var hit_uv = i.uv;
