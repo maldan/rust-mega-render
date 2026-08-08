@@ -24,6 +24,9 @@ const MAX_LIGHTS: usize = 8;
 const MAX_BONES: usize = 128;
 const OBJECT_UBO_SIZE: u64 = (std::mem::size_of::<ObjectUniforms>() as u64 + 255) & !255;
 const OBJECT_STRIDE: u64 = OBJECT_UBO_SIZE;
+const OBJECT_BONES_OFFSET: u64 = std::mem::offset_of!(ObjectUniforms, bones) as u64;
+const OBJECT_PREV_MODEL_OFFSET: u64 = std::mem::offset_of!(ObjectUniforms, prev_model) as u64;
+const OBJECT_PREV_BONES_OFFSET: u64 = std::mem::offset_of!(ObjectUniforms, prev_bones) as u64;
 const SHADOW_EXTENT: f32 = 14.0;
 
 #[repr(C)]
@@ -118,7 +121,17 @@ struct ObjectUniforms {
 
 struct PrevPose {
     model: Mat4,
-    bones: [[[f32; 4]; 4]; MAX_BONES],
+    /// Only for skinned draws (avoids 8KB×N CPU traffic on static meshes).
+    bones: Option<Box<[[[f32; 4]; 4]; MAX_BONES]>>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ObjectHeader {
+    model: [[f32; 4]; 4],
+    albedo: [f32; 4],
+    params: [f32; 4],
+    sss: [f32; 4],
 }
 
 struct GpuMesh {
@@ -179,6 +192,13 @@ pub struct WgpuVisualizer {
     shadow_view: wgpu::TextureView,
     shadow_map_size: u32,
     size: (u32, u32),
+    /// Persistent dynamic object UBO (grown as needed; not recreated every frame).
+    object_buf: wgpu::Buffer,
+    object_slots: u64,
+    shadow_object_bg: wgpu::BindGroup,
+    default_object_bg: wgpu::BindGroup,
+    /// Material bind groups keyed by albedo/normal/MR texture keys.
+    object_material_bgs: HashMap<[(u32, u32); 3], wgpu::BindGroup>,
     prev_poses: HashMap<(u32, u32), PrevPose>,
     prev_view_proj: Mat4,
     motion_has_history: bool,
@@ -620,6 +640,34 @@ impl WgpuVisualizer {
         let post_fx = PostFx::new(device, queue);
         let debug_blit = DebugBlit::new(device, queue);
 
+        let object_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("object_uniforms"),
+            size: OBJECT_STRIDE,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let shadow_object_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow_object"),
+            layout: &shadow_object_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &object_buf,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(OBJECT_UBO_SIZE),
+                }),
+            }],
+        });
+        let default_object_bg = object_bind_group(
+            device,
+            &object_bind_layout,
+            &object_buf,
+            &white.view,
+            &flat_normal.view,
+            &default_mr.view,
+            &sampler,
+        );
+
         Self {
             device: device.clone(),
             queue: queue.clone(),
@@ -663,11 +711,57 @@ impl WgpuVisualizer {
             shadow_view,
             shadow_map_size: DEFAULT_SHADOW_SIZE,
             size: (1, 1),
+            object_buf,
+            object_slots: 1,
+            shadow_object_bg,
+            default_object_bg,
+            object_material_bgs: HashMap::new(),
             prev_poses: HashMap::new(),
             prev_view_proj: Mat4::IDENTITY,
             motion_has_history: false,
             last_frame: Instant::now(),
         }
+    }
+
+    fn invalidate_object_bind_groups(&mut self) {
+        self.object_material_bgs.clear();
+        self.default_object_bg = object_bind_group(
+            &self.device,
+            &self.object_bind_layout,
+            &self.object_buf,
+            &self.white.view,
+            &self.flat_normal.view,
+            &self.default_mr.view,
+            &self.sampler,
+        );
+        self.shadow_object_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow_object"),
+            layout: &self.shadow_object_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &self.object_buf,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(OBJECT_UBO_SIZE),
+                }),
+            }],
+        });
+    }
+
+    fn ensure_object_slots(&mut self, slots: u64) {
+        let slots = slots.max(1);
+        if slots <= self.object_slots {
+            return;
+        }
+        let new_slots = slots.next_power_of_two().max(slots);
+        self.object_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("object_uniforms"),
+            size: OBJECT_STRIDE * new_slots,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.object_slots = new_slots;
+        self.invalidate_object_bind_groups();
     }
 
     fn ensure_shadow_map(&mut self, requested: u32) {
@@ -886,7 +980,7 @@ impl WgpuVisualizer {
             [f32; 4],
             [f32; 4],
             [f32; 4],
-            [[[f32; 4]; 4]; MAX_BONES],
+            Option<Box<[[[f32; 4]; 4]; MAX_BONES]>>,
         )> = Vec::new();
         for (h, node) in scene.nodes.iter() {
             if !node.visible {
@@ -921,15 +1015,17 @@ impl WgpuVisualizer {
                         None,
                     ),
                 };
-            let mut bones = [[[0.0; 4]; 4]; MAX_BONES];
-            bones[0] = Mat4::IDENTITY.to_cols_array_2d();
+            let mut bones = None;
             if let Some(skin_h) = node.skin {
                 if scene.meshes.get(mesh_h).is_some_and(|m| m.joints.is_some()) {
                     let mats = scene.joint_matrices(skin_h, h);
                     params[2] = 1.0;
+                    let mut bone_mats = Box::new([[[0.0; 4]; 4]; MAX_BONES]);
+                    bone_mats[0] = Mat4::IDENTITY.to_cols_array_2d();
                     for (i, m) in mats.iter().take(MAX_BONES).enumerate() {
-                        bones[i] = m.to_cols_array_2d();
+                        bone_mats[i] = m.to_cols_array_2d();
                     }
+                    bones = Some(bone_mats);
                 }
             }
             draws.push((
@@ -946,36 +1042,51 @@ impl WgpuVisualizer {
             ));
         }
 
-        let object_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("object_uniforms"),
-            size: OBJECT_STRIDE * draws.len().max(1) as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        self.ensure_object_slots(draws.len() as u64);
         let mut next_poses: HashMap<(u32, u32), PrevPose> = HashMap::with_capacity(draws.len());
         for (i, (node_key, _, _, _, _, model, albedo, params, sss, bones)) in
             draws.iter().enumerate()
         {
+            let skinned = params[2] > 0.5;
             let (prev_model, prev_bones) = match self.prev_poses.get(node_key) {
-                Some(p) if self.motion_has_history => (p.model, p.bones),
-                _ => (*model, *bones),
+                Some(p) if self.motion_has_history => (p.model, p.bones.as_deref()),
+                _ => (*model, bones.as_deref()),
             };
-            let data = ObjectUniforms {
+            let base = i as u64 * OBJECT_STRIDE;
+            let header = ObjectHeader {
                 model: model.to_cols_array_2d(),
                 albedo: *albedo,
                 params: *params,
                 sss: *sss,
-                bones: *bones,
-                prev_model: prev_model.to_cols_array_2d(),
-                prev_bones,
             };
             self.queue
-                .write_buffer(&object_buf, i as u64 * OBJECT_STRIDE, bytemuck::bytes_of(&data));
+                .write_buffer(&self.object_buf, base, bytemuck::bytes_of(&header));
+            self.queue.write_buffer(
+                &self.object_buf,
+                base + OBJECT_PREV_MODEL_OFFSET,
+                bytemuck::bytes_of(&prev_model.to_cols_array_2d()),
+            );
+            if skinned {
+                if let Some(b) = bones.as_deref() {
+                    self.queue.write_buffer(
+                        &self.object_buf,
+                        base + OBJECT_BONES_OFFSET,
+                        bytemuck::bytes_of(b),
+                    );
+                }
+                if let Some(p) = prev_bones.or(bones.as_deref()) {
+                    self.queue.write_buffer(
+                        &self.object_buf,
+                        base + OBJECT_PREV_BONES_OFFSET,
+                        bytemuck::bytes_of(p),
+                    );
+                }
+            }
             next_poses.insert(
                 *node_key,
                 PrevPose {
                     model: *model,
-                    bones: *bones,
+                    bones: bones.clone(),
                 },
             );
         }
@@ -983,40 +1094,48 @@ impl WgpuVisualizer {
         self.prev_view_proj = view_proj;
         self.motion_has_history = true;
 
-        let shadow_object_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.shadow_object_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &object_buf,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(OBJECT_UBO_SIZE),
-                }),
-            }],
-        });
-
         let debug = build_debug_batches(scene);
         let line_buf = upload_debug_verts(&self.device, &debug.lines);
         let line_overlay_buf = upload_debug_verts(&self.device, &debug.lines_overlay);
         let point_buf = upload_debug_points(&self.device, &debug.points);
         let point_overlay_buf = upload_debug_points(&self.device, &debug.points_overlay);
 
-        let mut bg_cache: HashMap<[(u32, u32); 3], wgpu::BindGroup> = HashMap::new();
-        let default_maps = (
-            (u32::MAX, 0),
-            (u32::MAX, 1),
-            (u32::MAX, 2),
-        );
-        let default_bg = object_bind_group(
-            &self.device,
-            &self.object_bind_layout,
-            &object_buf,
-            &self.white.view,
-            &self.flat_normal.view,
-            &self.default_mr.view,
-            &self.sampler,
-        );
+        let default_maps = ((u32::MAX, 0), (u32::MAX, 1), (u32::MAX, 2));
+        for (_, _, albedo_key, normal_key, mr_key, _, _, _, _, _) in &draws {
+            let cache_key = [
+                albedo_key.unwrap_or(default_maps.0),
+                normal_key.unwrap_or(default_maps.1),
+                mr_key.unwrap_or(default_maps.2),
+            ];
+            if cache_key == [default_maps.0, default_maps.1, default_maps.2] {
+                continue;
+            }
+            if self.object_material_bgs.contains_key(&cache_key) {
+                continue;
+            }
+            let albedo_view = albedo_key
+                .and_then(|k| self.textures.get(&k))
+                .map(|t| &t.view)
+                .unwrap_or(&self.white.view);
+            let normal_view = normal_key
+                .and_then(|k| self.textures.get(&k))
+                .map(|t| &t.view)
+                .unwrap_or(&self.flat_normal.view);
+            let mr_view = mr_key
+                .and_then(|k| self.textures.get(&k))
+                .map(|t| &t.view)
+                .unwrap_or(&self.default_mr.view);
+            let bg = object_bind_group(
+                &self.device,
+                &self.object_bind_layout,
+                &self.object_buf,
+                albedo_view,
+                normal_view,
+                mr_view,
+                &self.sampler,
+            );
+            self.object_material_bgs.insert(cache_key, bg);
+        }
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
 
@@ -1043,7 +1162,7 @@ impl WgpuVisualizer {
                 let Some(mesh) = self.meshes.get(mesh_key) else {
                     continue;
                 };
-                pass.set_bind_group(1, &shadow_object_bg, &[(i as u32) * OBJECT_STRIDE as u32]);
+                pass.set_bind_group(1, &self.shadow_object_bg, &[(i as u32) * OBJECT_STRIDE as u32]);
                 pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                 pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -1137,34 +1256,10 @@ impl WgpuVisualizer {
                     normal_key.unwrap_or(default_maps.1),
                     mr_key.unwrap_or(default_maps.2),
                 ];
-                if !bg_cache.contains_key(&cache_key) {
-                    let albedo_view = albedo_key
-                        .and_then(|k| self.textures.get(&k))
-                        .map(|t| &t.view)
-                        .unwrap_or(&self.white.view);
-                    let normal_view = normal_key
-                        .and_then(|k| self.textures.get(&k))
-                        .map(|t| &t.view)
-                        .unwrap_or(&self.flat_normal.view);
-                    let mr_view = mr_key
-                        .and_then(|k| self.textures.get(&k))
-                        .map(|t| &t.view)
-                        .unwrap_or(&self.default_mr.view);
-                    let bg = object_bind_group(
-                        &self.device,
-                        &self.object_bind_layout,
-                        &object_buf,
-                        albedo_view,
-                        normal_view,
-                        mr_view,
-                        &self.sampler,
-                    );
-                    bg_cache.insert(cache_key, bg);
-                }
                 let bg = if cache_key == [default_maps.0, default_maps.1, default_maps.2] {
-                    &default_bg
+                    &self.default_object_bg
                 } else {
-                    &bg_cache[&cache_key]
+                    &self.object_material_bgs[&cache_key]
                 };
                 pass.set_bind_group(1, bg, &[(i as u32) * OBJECT_STRIDE as u32]);
                 pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
@@ -1447,15 +1542,21 @@ impl Visualizer for WgpuVisualizer {
         self.meshes.retain(|k, _| live.contains_key(k));
 
         live.clear();
+        let mut textures_changed = false;
         for (h, tex) in scene.textures.iter() {
             let key = h.key();
             live.insert(key, ());
             if self.textures.get(&key).map(|g| g.synced) != Some(tex.version) {
                 self.textures
                     .insert(key, upload_texture(&self.device, &self.queue, tex));
+                textures_changed = true;
             }
         }
+        let tex_count_before = self.textures.len();
         self.textures.retain(|k, _| live.contains_key(k));
+        if textures_changed || self.textures.len() != tex_count_before {
+            self.invalidate_object_bind_groups();
+        }
     }
 
     fn post_process(&mut self) -> &mut PostProcessSettings {
