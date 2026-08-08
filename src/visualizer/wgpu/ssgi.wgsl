@@ -2,8 +2,8 @@
 //! LH view (+Z forward), DirectX clip depth.
 //!
 //! Cosine-weighted hemisphere with R2 low-discrepancy directions,
-//! short screen-space march, gather lit HDR as irradiance,
-//! then `albedo * (1 - metallic) * boost`.
+//! Hi-Z hierarchical march (empty-space skip + binary refine),
+//! gather lit HDR as irradiance → `albedo * (1 - metallic) * boost`.
 //! Alpha stores clip depth for temporal reprojection.
 
 struct VsOut {
@@ -37,7 +37,9 @@ struct SsgiUniforms {
     params: vec4<f32>,
     /// Full framebuffer size — used for noise so half-res doesn't stripe.
     full_resolution: vec2<f32>,
-    _pad: vec2<f32>,
+    /// Max Hi-Z mip level.
+    hiz_max_mip: f32,
+    _pad: f32,
 }
 
 @group(0) @binding(0) var<uniform> u: SsgiUniforms;
@@ -51,9 +53,10 @@ struct SsgiUniforms {
 @group(0) @binding(8) var albedo_samp: sampler;
 @group(0) @binding(9) var orm_tex: texture_2d<f32>;
 @group(0) @binding(10) var orm_samp: sampler;
+@group(0) @binding(11) var hiz_tex: texture_2d<f32>;
+@group(0) @binding(12) var hiz_samp: sampler;
 
 const PI: f32 = 3.14159265;
-/// R2 irrational bases (Roberts 2018) — low discrepancy in 2D.
 const R2_A: f32 = 0.7548776662466927;
 const R2_B: f32 = 0.5698402909980532;
 
@@ -80,12 +83,10 @@ fn hash22(p: vec2<f32>) -> vec2<f32> {
     return vec2(hash21(p), hash21(p + vec2(13.1, 7.7)));
 }
 
-/// Stable per-pixel isotropic noise (quantized to texel).
 fn noise2(pixel: vec2<f32>) -> vec2<f32> {
     return hash22(floor(pixel));
 }
 
-/// R2 sequence sample `i` (0-based), Cranley–Patterson rotated by `offset`.
 fn r2_cp(i: f32, offset: vec2<f32>) -> vec2<f32> {
     return fract(vec2(0.5) + vec2(i * R2_A, i * R2_B) + offset);
 }
@@ -110,19 +111,16 @@ fn luma(c: vec3<f32>) -> f32 {
     return dot(c, vec3(0.2126, 0.7152, 0.0722));
 }
 
-/// Soft-knee HDR clamp — less harsh than hard scale, still kills sparkles.
 fn suppress_firefly(c: vec3<f32>, max_luma: f32) -> vec3<f32> {
     let y = luma(c);
     if y <= max_luma {
         return c;
     }
-    // Soft knee: asymptote toward max_luma instead of hard cut.
     let soft = max_luma * (1.0 + log2(1.0 + (y - max_luma) / max(max_luma, 1e-3)));
     let capped = min(soft, max_luma * 1.75);
     return c * (capped / y);
 }
 
-/// 5-tap local luminance — stabler firefly reference than a single texel.
 fn local_luma_ref(uv: vec2<f32>) -> f32 {
     let texel = 1.0 / max(u.full_resolution, vec2(1.0));
     var y = luma(textureSampleLevel(color_tex, color_samp, uv, 0.0).rgb);
@@ -131,6 +129,107 @@ fn local_luma_ref(uv: vec2<f32>) -> f32 {
     y += luma(textureSampleLevel(color_tex, color_samp, uv + vec2(0.0, texel.y), 0.0).rgb);
     y += luma(textureSampleLevel(color_tex, color_samp, uv - vec2(0.0, texel.y), 0.0).rgb);
     return max(y * 0.2, 0.05);
+}
+
+fn hiz_depth(uv: vec2<f32>, level: f32) -> f32 {
+    return textureSampleLevel(hiz_tex, hiz_samp, uv, level).r;
+}
+
+/// Perspective-correct Hi-Z march along one GI ray.
+/// Returns xyz = hit_uv + hit_dist, w = 1 if hit else 0.
+fn march_gi(
+    origin: vec3<f32>,
+    dir: vec3<f32>,
+    ray_len: f32,
+    bias: f32,
+    thickness: f32,
+    max_steps: u32,
+    jitter: f32,
+) -> vec4<f32> {
+    let max_mip = i32(clamp(u.hiz_max_mip, 0.0, 8.0));
+    let base_step = ray_len / f32(max(max_steps, 1u));
+    var t = bias + jitter * base_step;
+    var prev_t = bias;
+    var step_i = 0u;
+
+    loop {
+        if step_i >= max_steps || t > ray_len {
+            break;
+        }
+
+        let sample_pos = origin + dir * t;
+        let projected = project_uv(sample_pos);
+        if projected.x < 0.0 || projected.x > 1.0 || projected.y < 0.0 || projected.y > 1.0 {
+            break;
+        }
+        if projected.z < 0.0 || projected.z > 1.0 {
+            break;
+        }
+
+        // Coarser mip farther along the ray — skip empty space.
+        let travel = t / max(ray_len, 1e-3);
+        let mip = min(i32(floor(travel * f32(max_mip) * 0.85)), max_mip);
+        let scene_z = hiz_depth(projected.xy, f32(mip));
+
+        if scene_z >= 0.9999 {
+            prev_t = t;
+            t += base_step * mix(1.0, 2.5, f32(mip) / max(f32(max_mip), 1.0));
+            step_i = step_i + 1u;
+            continue;
+        }
+
+        let scene_pos = view_pos(projected.xy, scene_z);
+        let delta = sample_pos.z - scene_pos.z;
+        let thick = max(thickness, base_step * 1.5);
+
+        if delta > 0.0 && delta < thick {
+            if t > bias * 1.5 {
+                // Binary refine at mip 0 between prev miss and this hit.
+                var lo = prev_t;
+                var hi = t;
+                var best_uv = projected.xy;
+                var best_t = t;
+                for (var r = 0u; r < 4u; r++) {
+                    let mid = mix(lo, hi, 0.5);
+                    let mid_pos = origin + dir * mid;
+                    let mid_p = project_uv(mid_pos);
+                    if mid_p.x < 0.0 || mid_p.x > 1.0 || mid_p.y < 0.0 || mid_p.y > 1.0 {
+                        break;
+                    }
+                    let mid_d = hiz_depth(mid_p.xy, 0.0);
+                    let mid_scene = view_pos(mid_p.xy, mid_d);
+                    if mid_pos.z - mid_scene.z > 0.0 {
+                        hi = mid;
+                        best_uv = mid_p.xy;
+                        best_t = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                return vec4(best_uv, best_t, 1.0);
+            }
+            break;
+        }
+
+        var stride = base_step;
+        if delta <= 0.0 {
+            let gap = scene_pos.z - sample_pos.z;
+            stride = clamp(gap * 0.65, base_step * 0.35, base_step * (1.5 + f32(mip) * 0.35));
+        } else {
+            // Behind without thickness window — thin miss.
+            stride = base_step * 0.5;
+        }
+
+        if step_i == 0u {
+            stride *= mix(0.6, 1.0, jitter);
+        }
+
+        prev_t = t;
+        t += stride;
+        step_i = step_i + 1u;
+    }
+
+    return vec4(0.0);
 }
 
 @fragment
@@ -164,12 +263,11 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
     let radius = max(u.radius, 0.05);
     let thickness = max(u.thickness, 0.001);
 
-    // Temporal only rotates the hemisphere — do NOT scroll noise in screen space.
     let slot = u32(u.params.w) % 8u;
     let angle_rot = f32(slot) * (PI * 0.25);
 
     let pixel = i.uv * u.full_resolution;
-    let cp = noise2(pixel); // Cranley–Patterson offset
+    let cp = noise2(pixel);
     let tbn = basis(n_view);
 
     let local_luma = local_luma_ref(i.uv);
@@ -178,67 +276,30 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
     var irradiance = vec3(0.0);
 
     for (var s = 0u; s < samples; s++) {
-        // Low-discrepancy direction + independent length/jitter channel.
         let xi = r2_cp(f32(s), cp);
         let xj = r2_cp(f32(s) + 19.0, cp.yx);
 
         let phi = 2.0 * PI * xi.x + angle_rot;
-        // Cosine-weighted hemisphere: θ from √ξ (PDF = cosθ / π).
         let cos_t = sqrt(clamp(xi.y, 0.001, 1.0));
         let sin_t = sqrt(max(1.0 - cos_t * cos_t, 0.0));
         let local = vec3(cos(phi) * sin_t, sin(phi) * sin_t, cos_t);
         let ray_dir = normalize(tbn * local);
 
-        // Stratify lengths: more short rays (local bounce) + some long ones.
         let ray_len = radius * mix(0.2, 1.0, xj.x);
-        let step_len = ray_len / f32(max_steps);
-        let jitter = xj.y * step_len;
-
-        var hit = false;
-        var hit_uv = i.uv;
-        var hit_dist = ray_len;
-        var hit_pos = pos;
-
-        for (var step_i = 1u; step_i <= max_steps; step_i++) {
-            let t = bias + jitter + step_len * f32(step_i);
-            if t > ray_len {
-                break;
-            }
-            let sample_pos = pos + ray_dir * t;
-            let projected = project_uv(sample_pos);
-            if projected.x < 0.0 || projected.x > 1.0 || projected.y < 0.0 || projected.y > 1.0 {
-                break;
-            }
-
-            let scene_depth = textureSample(depth_tex, depth_samp, projected.xy);
-            if scene_depth >= 0.9999 {
-                continue;
-            }
-
-            let scene_pos = view_pos(projected.xy, scene_depth);
-            let delta = sample_pos.z - scene_pos.z;
-            let thick = max(thickness, step_len * 1.5);
-            if delta > 0.0 && delta < thick {
-                hit = true;
-                hit_uv = projected.xy;
-                hit_dist = t;
-                hit_pos = scene_pos;
-                break;
-            }
-            if delta > thick {
-                break;
-            }
-        }
-
-        if !hit {
-            // Miss: no screen-space contributor (ambient / IBL covers the rest via ambient_dim).
+        let march = march_gi(pos, ray_dir, ray_len, bias, thickness, max_steps, xj.y);
+        if march.w < 0.5 {
             continue;
         }
+
+        let hit_uv = march.xy;
+        let hit_dist = march.z;
         if length(hit_uv - i.uv) < 1.5 / max(u.full_resolution.x, 1.0) {
             continue;
         }
 
-        // Reject back-facing / grazing emitters (wrong bounce from thin geometry).
+        let hit_depth = hiz_depth(hit_uv, 0.0);
+        let hit_pos = view_pos(hit_uv, hit_depth);
+
         var hit_n = textureSampleLevel(normal_tex, normal_samp, hit_uv, 0.0).xyz;
         if dot(hit_n, hit_n) > 1e-6 {
             hit_n = normalize((u.view * vec4(normalize(hit_n), 0.0)).xyz);
@@ -254,14 +315,12 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
 
         let dist_att = exp(-hit_dist / max(radius, 0.05));
         let fade = edge_fade(hit_uv);
-        // Mild receiver cosine (already in sampling PDF; keep a soft factor for grazing rays).
         let recv_cos = clamp(dot(n_view, ray_dir), 0.0, 1.0);
         let w = dist_att * fade * mix(0.35, 1.0, recv_cos);
 
         irradiance += radiance * w;
     }
 
-    // Normalize by sample count (unbiased for cosine MC). Misses correctly darken pockets.
     irradiance /= max(f32(samples), 1.0);
     let boost = 3.5;
     var diffuse_gi = irradiance * albedo * kd * boost;

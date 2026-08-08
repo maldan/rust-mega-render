@@ -60,7 +60,8 @@ struct SsgiUniforms {
     thickness: f32,
     params: [f32; 4],
     full_resolution: [f32; 2],
-    _pad: [f32; 2],
+    hiz_max_mip: f32,
+    _pad: f32,
 }
 
 #[repr(C)]
@@ -426,6 +427,8 @@ impl PostFx {
                 filter_samp_entry(8),
                 tex_entry(9, true),
                 filter_samp_entry(10),
+                tex_entry(11, false),
+                nearest_samp_entry(12),
             ],
         });
         let ssr_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1881,7 +1884,7 @@ impl PostFx {
         );
     }
 
-    /// Spatial SSGI (+ optional temporal AABB clamp + à-trous denoise) into the SSGI target.
+    /// Spatial SSGI (+ Hi-Z march, temporal, à-trous) into the SSGI target.
     pub fn generate_ssgi(
         &mut self,
         device: &wgpu::Device,
@@ -1905,6 +1908,9 @@ impl PostFx {
         let frame = (self.ssgi_frame % 1024) as f32;
         self.ssgi_frame = self.ssgi_frame.wrapping_add(1);
 
+        self.build_hiz(device, encoder, depth);
+        let max_mip = (self.hiz.levels.saturating_sub(1)) as f32;
+
         queue.write_buffer(
             &self.ssgi_ubo,
             0,
@@ -1922,7 +1928,8 @@ impl PostFx {
                     frame,
                 ],
                 full_resolution: [fw.max(1) as f32, fh.max(1) as f32],
-                _pad: [0.0; 2],
+                hiz_max_mip: max_mip,
+                _pad: 0.0,
             }),
         );
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1971,6 +1978,14 @@ impl PostFx {
                 },
                 wgpu::BindGroupEntry {
                     binding: 10,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(&self.hiz.srv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
                     resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
                 },
             ],

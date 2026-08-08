@@ -432,7 +432,7 @@ impl Demo for MaterialDemo {
                 });
                 ui.collapsing_header("SSGI", |ui| {
                     ui.checkbox("Enabled", &mut post.ssgi.enabled);
-                    ui.label("Screen-space GI: R2 cosine rays + à-trous + temporal.");
+                    ui.label("Screen-space GI: Hi-Z R2 rays + à-trous + velocity temporal.");
                     ui.add_enabled(post.ssgi.enabled, |ui| {
                         let mut q = match (post.ssgi.samples, post.ssgi.max_steps) {
                             (s, t) if s <= 4 && t <= 4 => 0usize,
