@@ -87,6 +87,17 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
         let a = textureSampleLevel(ao_tex, samp, i.uv, 0.0).rgb;
         return vec4(a, 1.0);
     }
+    if mode == 11u {
+        // DOF CoC: magenta = near, green = far (already encoded).
+        let c = textureSampleLevel(ao_tex, samp, i.uv, 0.0).rgb;
+        return vec4(c, 1.0);
+    }
+    if mode == 12u {
+        // DOF HDR result — expose + Reinhard.
+        var c = textureSampleLevel(ao_tex, samp, i.uv, 0.0).rgb * exposure;
+        c = tonemap_reinhard(c);
+        return vec4(c, 1.0);
+    }
     // AO (6) / Contact shadow (7) — intensity matches Final composite.
     let ao = textureSampleLevel(ao_tex, samp, i.uv, 0.0).r;
     let intensity = clamp(u.ao_params.x, 0.0, 2.0);

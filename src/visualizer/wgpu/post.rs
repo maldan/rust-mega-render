@@ -1,4 +1,7 @@
-use crate::{AoMethod, AoSettings, ContactShadowSettings, PostProcessSettings, SsgiSettings, SsrSettings};
+use crate::{
+    AoMethod, AoSettings, ContactShadowSettings, DofSettings, PostProcessSettings, SsgiSettings,
+    SsrSettings,
+};
 use glam::{Mat4, Vec3};
 
 const SSAO_KERNEL: usize = 32;
@@ -139,6 +142,40 @@ struct FxaaUniforms {
     _pad: [f32; 2],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DofUniforms {
+    inv_proj: [[f32; 4]; 4],
+    resolution: [f32; 2],
+    focus_distance: f32,
+    aperture: f32,
+    max_coc: f32,
+    samples: f32,
+    frame: f32,
+    focus_range: f32,
+    bokeh_blades: f32,
+    _pad: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DofPrelitUniforms {
+    intensities: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DofUpUniforms {
+    inv_proj: [[f32; 4]; 4],
+    focus_distance: f32,
+    aperture: f32,
+    max_coc: f32,
+    focus_range: f32,
+    half_texel: [f32; 2],
+    depth_sigma: f32,
+    _pad: f32,
+}
+
 struct Rt {
     _tex: wgpu::Texture,
     view: wgpu::TextureView,
@@ -186,6 +223,11 @@ pub struct PostFx {
     bloom_up_pipe: wgpu::RenderPipeline,
     composite_pipe: wgpu::RenderPipeline,
     fxaa_pipe: wgpu::RenderPipeline,
+    dof_pipe: wgpu::RenderPipeline,
+    dof_coc_pipe: wgpu::RenderPipeline,
+    dof_temporal_pipe: wgpu::RenderPipeline,
+    dof_prelit_pipe: wgpu::RenderPipeline,
+    dof_up_pipe: wgpu::RenderPipeline,
 
     ssao_bgl: wgpu::BindGroupLayout,
     gtao_bgl: wgpu::BindGroupLayout,
@@ -202,6 +244,10 @@ pub struct PostFx {
     bloom_bgl: wgpu::BindGroupLayout,
     composite_bgl: wgpu::BindGroupLayout,
     fxaa_bgl: wgpu::BindGroupLayout,
+    dof_bgl: wgpu::BindGroupLayout,
+    dof_temporal_bgl: wgpu::BindGroupLayout,
+    dof_prelit_bgl: wgpu::BindGroupLayout,
+    dof_up_bgl: wgpu::BindGroupLayout,
 
     ssao_ubo: wgpu::Buffer,
     gtao_ubo: wgpu::Buffer,
@@ -214,6 +260,9 @@ pub struct PostFx {
     bloom_ubo: wgpu::Buffer,
     composite_ubo: wgpu::Buffer,
     fxaa_ubo: wgpu::Buffer,
+    dof_ubo: wgpu::Buffer,
+    dof_prelit_ubo: wgpu::Buffer,
+    dof_up_ubo: wgpu::Buffer,
 
     kernel: [[f32; 4]; SSAO_KERNEL],
     noise_view: wgpu::TextureView,
@@ -235,6 +284,13 @@ pub struct PostFx {
     hiz: HizRt,
     bloom: Vec<Rt>,
     composite_temp: Rt,
+    dof: Rt,
+    dof_temp: Rt,
+    dof_hist: Rt,
+    dof_pre: Rt,
+    dof_half: Rt,
+    dof_half_temp: Rt,
+    dof_half_hist: Rt,
     white_view: wgpu::TextureView,
     _white: wgpu::Texture,
     black_view: wgpu::TextureView,
@@ -246,6 +302,12 @@ pub struct PostFx {
     ssr_prev_view_proj: Mat4,
     ssr_has_history: bool,
     ssr_frame: u32,
+    dof_prev_view_proj: Mat4,
+    dof_has_history: bool,
+    dof_frame: u32,
+    dof_prev_focus: f32,
+    dof_prev_fstop: f32,
+    dof_prev_scale: f32,
 }
 
 impl PostFx {
@@ -269,6 +331,11 @@ impl PostFx {
         let bloom_shader = device.create_shader_module(wgpu::include_wgsl!("bloom.wgsl"));
         let composite_shader = device.create_shader_module(wgpu::include_wgsl!("composite.wgsl"));
         let fxaa_shader = device.create_shader_module(wgpu::include_wgsl!("fxaa.wgsl"));
+        let dof_shader = device.create_shader_module(wgpu::include_wgsl!("dof.wgsl"));
+        let dof_prelit_shader = device.create_shader_module(wgpu::include_wgsl!("dof_prelit.wgsl"));
+        let dof_up_shader = device.create_shader_module(wgpu::include_wgsl!("dof_up.wgsl"));
+        let dof_temporal_shader =
+            device.create_shader_module(wgpu::include_wgsl!("dof_temporal.wgsl"));
 
         let ssao_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ssao"),
@@ -422,6 +489,50 @@ impl PostFx {
                 ubo_entry(0, wgpu::ShaderStages::FRAGMENT),
                 tex_entry(1, true),
                 filter_samp_entry(2),
+            ],
+        });
+        let dof_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("dof"),
+            entries: &[
+                ubo_entry(0, wgpu::ShaderStages::FRAGMENT),
+                tex_entry(1, true),
+                filter_samp_entry(2),
+                depth_entry(3),
+                nearest_samp_entry(4),
+            ],
+        });
+        let dof_temporal_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("dof_temporal"),
+            entries: &[
+                ubo_entry(0, wgpu::ShaderStages::FRAGMENT),
+                tex_entry(1, true),
+                tex_entry(2, true),
+                nearest_samp_entry(3),
+                depth_entry(4),
+                nearest_samp_entry(5),
+            ],
+        });
+        let dof_prelit_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("dof_prelit"),
+            entries: &[
+                ubo_entry(0, wgpu::ShaderStages::FRAGMENT),
+                tex_entry(1, true),
+                tex_entry(2, true),
+                tex_entry(3, true),
+                tex_entry(4, true),
+                tex_entry(5, true),
+                filter_samp_entry(6),
+            ],
+        });
+        let dof_up_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("dof_up"),
+            entries: &[
+                ubo_entry(0, wgpu::ShaderStages::FRAGMENT),
+                tex_entry(1, true),
+                tex_entry(2, true),
+                filter_samp_entry(3),
+                depth_entry(4),
+                nearest_samp_entry(5),
             ],
         });
 
@@ -594,6 +705,51 @@ impl PostFx {
             wgpu::TextureFormat::Rgba8UnormSrgb,
             None,
         );
+        let dof_pipe = fullscreen_pipe(
+            device,
+            "dof",
+            &dof_bgl,
+            &dof_shader,
+            "fs",
+            wgpu::TextureFormat::Rgba16Float,
+            None,
+        );
+        let dof_coc_pipe = fullscreen_pipe(
+            device,
+            "dof_coc",
+            &dof_bgl,
+            &dof_shader,
+            "fs_coc",
+            wgpu::TextureFormat::Rgba16Float,
+            None,
+        );
+        let dof_temporal_pipe = fullscreen_pipe(
+            device,
+            "dof_temporal",
+            &dof_temporal_bgl,
+            &dof_temporal_shader,
+            "fs",
+            wgpu::TextureFormat::Rgba16Float,
+            None,
+        );
+        let dof_prelit_pipe = fullscreen_pipe(
+            device,
+            "dof_prelit",
+            &dof_prelit_bgl,
+            &dof_prelit_shader,
+            "fs",
+            wgpu::TextureFormat::Rgba16Float,
+            None,
+        );
+        let dof_up_pipe = fullscreen_pipe(
+            device,
+            "dof_up",
+            &dof_up_bgl,
+            &dof_up_shader,
+            "fs",
+            wgpu::TextureFormat::Rgba16Float,
+            None,
+        );
 
         let ssao_ubo = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ssao_ubo"),
@@ -661,6 +817,24 @@ impl PostFx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let dof_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dof_ubo"),
+            size: std::mem::size_of::<DofUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let dof_prelit_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dof_prelit_ubo"),
+            size: std::mem::size_of::<DofPrelitUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let dof_up_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dof_up_ubo"),
+            size: std::mem::size_of::<DofUpUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let kernel = make_kernel();
         let (noise, noise_view) = make_noise(device, queue);
@@ -701,6 +875,15 @@ impl PostFx {
             .collect();
         let composite_temp =
             make_rt(device, 1, 1, wgpu::TextureFormat::Rgba8UnormSrgb, "composite_temp");
+        let dof = make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "dof");
+        let dof_temp = make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "dof_temp");
+        let dof_hist = make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "dof_hist");
+        let dof_pre = make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "dof_pre");
+        let dof_half = make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "dof_half");
+        let dof_half_temp =
+            make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "dof_half_temp");
+        let dof_half_hist =
+            make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "dof_half_hist");
 
         Self {
             ssao_pipe,
@@ -721,6 +904,11 @@ impl PostFx {
             bloom_up_pipe,
             composite_pipe,
             fxaa_pipe,
+            dof_pipe,
+            dof_coc_pipe,
+            dof_temporal_pipe,
+            dof_prelit_pipe,
+            dof_up_pipe,
             ssao_bgl,
             gtao_bgl,
             contact_bgl,
@@ -736,6 +924,10 @@ impl PostFx {
             bloom_bgl,
             composite_bgl,
             fxaa_bgl,
+            dof_bgl,
+            dof_temporal_bgl,
+            dof_prelit_bgl,
+            dof_up_bgl,
             ssao_ubo,
             gtao_ubo,
             contact_ubo,
@@ -747,6 +939,9 @@ impl PostFx {
             bloom_ubo,
             composite_ubo,
             fxaa_ubo,
+            dof_ubo,
+            dof_prelit_ubo,
+            dof_up_ubo,
             kernel,
             noise_view,
             _noise: noise,
@@ -766,6 +961,13 @@ impl PostFx {
             hiz,
             bloom,
             composite_temp,
+            dof,
+            dof_temp,
+            dof_hist,
+            dof_pre,
+            dof_half,
+            dof_half_temp,
+            dof_half_hist,
             white_view,
             _white: white,
             black_view,
@@ -776,6 +978,12 @@ impl PostFx {
             ssr_prev_view_proj: Mat4::IDENTITY,
             ssr_has_history: false,
             ssr_frame: 0,
+            dof_prev_view_proj: Mat4::IDENTITY,
+            dof_has_history: false,
+            dof_frame: 0,
+            dof_prev_focus: -1.0,
+            dof_prev_fstop: -1.0,
+            dof_prev_scale: -1.0,
         }
     }
 
@@ -792,8 +1000,23 @@ impl PostFx {
             self.ssr_hist = make_rt(device, w, h, wgpu::TextureFormat::Rgba16Float, "ssr_hist");
             self.hiz = make_hiz(device, w, h);
             self.ssr_has_history = false;
+            self.dof = make_rt(device, w, h, wgpu::TextureFormat::Rgba16Float, "dof");
+            self.dof_temp = make_rt(device, w, h, wgpu::TextureFormat::Rgba16Float, "dof_temp");
+            self.dof_hist = make_rt(device, w, h, wgpu::TextureFormat::Rgba16Float, "dof_hist");
+            self.dof_pre = make_rt(device, w, h, wgpu::TextureFormat::Rgba16Float, "dof_pre");
+            self.dof_has_history = false;
             self.composite_temp =
                 make_rt(device, w, h, wgpu::TextureFormat::Rgba8UnormSrgb, "composite_temp");
+        }
+        let dw = (w / 2).max(1);
+        let dh = (h / 2).max(1);
+        if self.dof_half.size != (dw, dh) {
+            self.dof_half = make_rt(device, dw, dh, wgpu::TextureFormat::Rgba16Float, "dof_half");
+            self.dof_half_temp =
+                make_rt(device, dw, dh, wgpu::TextureFormat::Rgba16Float, "dof_half_temp");
+            self.dof_half_hist =
+                make_rt(device, dw, dh, wgpu::TextureFormat::Rgba16Float, "dof_half_hist");
+            self.dof_has_history = false;
         }
         // SSGI gather at half-res; upsampled to ssgi_full for composite.
         let sw = (w / 2).max(1);
@@ -839,6 +1062,436 @@ impl PostFx {
     /// SSR specular result (`Rgba16Float`). Valid after [`Self::generate_ssr`] / [`Self::apply`].
     pub fn ssr_view(&self) -> &wgpu::TextureView {
         &self.ssr.view
+    }
+
+    /// DOF HDR result. Valid after [`Self::generate_dof`].
+    pub fn dof_view(&self) -> &wgpu::TextureView {
+        &self.dof.view
+    }
+
+    /// DOF CoC debug (near/far). Valid after [`Self::generate_dof_coc`].
+    pub fn dof_coc_view(&self) -> &wgpu::TextureView {
+        &self.dof_temp.view
+    }
+
+    fn write_dof_uniforms(
+        &self,
+        queue: &wgpu::Queue,
+        settings: &DofSettings,
+        proj: Mat4,
+        focus_distance: f32,
+        f_stop: f32,
+        size: (u32, u32),
+        max_coc_scale: f32,
+    ) {
+        let (w, h) = size;
+        let aperture = settings.scale / f_stop.max(0.5);
+        let blades = if settings.bokeh_blades == 0 {
+            0.0
+        } else {
+            settings.bokeh_blades.clamp(5, 8) as f32
+        };
+        queue.write_buffer(
+            &self.dof_ubo,
+            0,
+            bytemuck::bytes_of(&DofUniforms {
+                inv_proj: proj.inverse().to_cols_array_2d(),
+                resolution: [w as f32, h as f32],
+                focus_distance: focus_distance.max(0.01),
+                aperture: aperture.max(0.0),
+                max_coc: (settings.max_coc_px * max_coc_scale).max(1.0),
+                samples: settings.samples.clamp(4, 24) as f32,
+                frame: self.dof_frame as f32,
+                focus_range: settings.focus_range.max(0.0),
+                bokeh_blades: blades,
+                _pad: [0.0; 3],
+            }),
+        );
+    }
+
+    fn dof_invalidate_if_needed(
+        &mut self,
+        focus_distance: f32,
+        f_stop: f32,
+        scale: f32,
+    ) {
+        let focus_delta = (focus_distance - self.dof_prev_focus).abs();
+        let fstop_delta = (f_stop - self.dof_prev_fstop).abs();
+        let scale_delta = (scale - self.dof_prev_scale).abs();
+        if self.dof_prev_focus < 0.0
+            || focus_delta > 0.35
+            || fstop_delta > 0.4
+            || scale_delta > 1.5
+        {
+            self.dof_has_history = false;
+        }
+        self.dof_prev_focus = focus_distance;
+        self.dof_prev_fstop = f_stop;
+        self.dof_prev_scale = scale;
+    }
+
+    /// Near/far CoC visualization into `dof_temp` (magenta = near, green = far).
+    pub fn generate_dof_coc(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        settings: &DofSettings,
+        depth: &wgpu::TextureView,
+        proj: Mat4,
+        focus_distance: f32,
+        f_stop: f32,
+        size: (u32, u32),
+    ) {
+        self.write_dof_uniforms(queue, settings, proj, focus_distance, f_stop, size, 1.0);
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dof_coc"),
+            layout: &self.dof_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.dof_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.black_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+            ],
+        });
+        let mut pass = color_pass(
+            encoder,
+            "dof_coc",
+            &self.dof_temp.view,
+            wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+        );
+        pass.set_pipeline(&self.dof_coc_pipe);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// Bake lighting layers into `dof_pre` so DOF blurs AO/SSGI/SSR together.
+    pub fn generate_dof_prelit(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        settings: &PostProcessSettings,
+        scene_color: &wgpu::TextureView,
+        light_dir_world: Option<Vec3>,
+    ) {
+        let ao_i = if settings.ao.enabled {
+            settings.ao.intensity
+        } else {
+            0.0
+        };
+        let cs_i = if settings.contact_shadow.enabled && light_dir_world.is_some() {
+            settings.contact_shadow.intensity
+        } else {
+            0.0
+        };
+        let ssgi_i = if settings.ssgi.enabled {
+            settings.ssgi.intensity
+        } else {
+            0.0
+        };
+        let ssr_i = if settings.ssr.enabled {
+            settings.ssr.intensity
+        } else {
+            0.0
+        };
+        queue.write_buffer(
+            &self.dof_prelit_ubo,
+            0,
+            bytemuck::bytes_of(&DofPrelitUniforms {
+                intensities: [ao_i, cs_i, ssgi_i, ssr_i],
+            }),
+        );
+        let ao_view = if settings.ao.enabled {
+            &self.ao.view
+        } else {
+            &self.white_view
+        };
+        let contact_view = if settings.contact_shadow.enabled && light_dir_world.is_some() {
+            &self.contact.view
+        } else {
+            &self.white_view
+        };
+        let ssgi_view = if settings.ssgi.enabled {
+            &self.ssgi_full.view
+        } else {
+            &self.black_view
+        };
+        let ssr_view = if settings.ssr.enabled {
+            &self.ssr.view
+        } else {
+            &self.black_view
+        };
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dof_prelit"),
+            layout: &self.dof_prelit_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.dof_prelit_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(scene_color),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(ao_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(contact_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(ssgi_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(ssr_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                },
+            ],
+        });
+        let mut pass = color_pass(
+            encoder,
+            "dof_prelit",
+            &self.dof_pre.view,
+            wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+        );
+        pass.set_pipeline(&self.dof_prelit_pipe);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// Dual-field CoC gather + temporal + optional half-res upsample into `dof`.
+    pub fn generate_dof(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        settings: &DofSettings,
+        scene_color: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        proj: Mat4,
+        view_proj: Mat4,
+        focus_distance: f32,
+        f_stop: f32,
+        size: (u32, u32),
+    ) {
+        self.dof_invalidate_if_needed(focus_distance, f_stop, settings.scale);
+
+        let half = settings.half_res;
+        let (gw, gh) = if half {
+            ((size.0 / 2).max(1), (size.1 / 2).max(1))
+        } else {
+            size
+        };
+        let coc_scale = if half { 0.5 } else { 1.0 };
+        self.write_dof_uniforms(
+            queue,
+            settings,
+            proj,
+            focus_distance,
+            f_stop,
+            (gw, gh),
+            coc_scale,
+        );
+
+        let gather_dst = if half {
+            if settings.temporal {
+                &self.dof_half_temp.view
+            } else {
+                &self.dof_half.view
+            }
+        } else if settings.temporal {
+            &self.dof_temp.view
+        } else {
+            &self.dof.view
+        };
+
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dof"),
+            layout: &self.dof_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.dof_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(scene_color),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+            ],
+        });
+        {
+            let mut pass =
+                color_pass(encoder, "dof", gather_dst, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
+            pass.set_pipeline(&self.dof_pipe);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        let half_resolved = if settings.temporal {
+            let (cur, hist, dst) = if half {
+                (
+                    &self.dof_half_temp.view,
+                    &self.dof_half_hist.view,
+                    &self.dof_half.view,
+                )
+            } else {
+                (&self.dof_temp.view, &self.dof_hist.view, &self.dof.view)
+            };
+            let has_hist = self.dof_has_history;
+            queue.write_buffer(
+                &self.ssgi_temporal_ubo,
+                0,
+                bytemuck::bytes_of(&SsgiTemporalUniforms {
+                    inv_view_proj: view_proj.inverse().to_cols_array_2d(),
+                    prev_view_proj: self.dof_prev_view_proj.to_cols_array_2d(),
+                    params: [
+                        settings.history.clamp(0.0, 0.98),
+                        settings.depth_reject.max(0.001),
+                        if has_hist { 1.0 } else { 0.0 },
+                        0.0,
+                    ],
+                }),
+            );
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dof_temporal"),
+                layout: &self.dof_temporal_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.ssgi_temporal_ubo.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(cur),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(hist),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(depth),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                    },
+                ],
+            });
+            {
+                let mut pass =
+                    color_pass(encoder, "dof_temporal", dst, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
+                pass.set_pipeline(&self.dof_temporal_pipe);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            self.copy_hdr(device, encoder, dst, hist);
+            self.dof_prev_view_proj = view_proj;
+            self.dof_has_history = true;
+            dst
+        } else {
+            self.dof_has_history = false;
+            gather_dst
+        };
+
+        if half {
+            let aperture = settings.scale / f_stop.max(0.5);
+            queue.write_buffer(
+                &self.dof_up_ubo,
+                0,
+                bytemuck::bytes_of(&DofUpUniforms {
+                    inv_proj: proj.inverse().to_cols_array_2d(),
+                    focus_distance: focus_distance.max(0.01),
+                    aperture: aperture.max(0.0),
+                    max_coc: settings.max_coc_px.max(1.0),
+                    focus_range: settings.focus_range.max(0.0),
+                    half_texel: [1.0 / gw as f32, 1.0 / gh as f32],
+                    depth_sigma: 80.0,
+                    _pad: 0.0,
+                }),
+            );
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dof_up"),
+                layout: &self.dof_up_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.dof_up_ubo.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(half_resolved),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(scene_color),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(depth),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                    },
+                ],
+            });
+            let mut pass = color_pass(
+                encoder,
+                "dof_up",
+                &self.dof.view,
+                wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+            );
+            pass.set_pipeline(&self.dof_up_pipe);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        self.dof_frame = self.dof_frame.wrapping_add(1);
     }
 
     /// Screen-space contact shadows (+ light bilateral blur) into the contact target.
@@ -1693,6 +2346,8 @@ impl PostFx {
         view: Mat4,
         view_proj: Mat4,
         camera_pos: [f32; 3],
+        focus_distance: f32,
+        f_stop: f32,
         light_dir_world: Option<Vec3>,
         env: &SsrEnvInput<'_>,
         size: (u32, u32),
@@ -1771,6 +2426,37 @@ impl PostFx {
             self.ssr_has_history = false;
         }
 
+        let lit_color = if settings.dof.enabled {
+            self.generate_dof_prelit(
+                device,
+                queue,
+                encoder,
+                settings,
+                scene_color,
+                light_dir_world,
+            );
+            let prelit = self.dof_pre.view.clone();
+            self.generate_dof(
+                device,
+                queue,
+                encoder,
+                &settings.dof,
+                &prelit,
+                depth,
+                proj,
+                view_proj,
+                focus_distance,
+                f_stop,
+                size,
+            );
+            &self.dof.view
+        } else {
+            self.dof_has_history = false;
+            scene_color
+        };
+
+        let dof_baked = settings.dof.enabled;
+
         if settings.bloom.enabled {
             let thr = settings.bloom.threshold;
             self.bloom_pass(
@@ -1778,7 +2464,7 @@ impl PostFx {
                 queue,
                 encoder,
                 &self.bloom_extract_pipe,
-                scene_color,
+                lit_color,
                 &self.bloom[0].view,
                 self.bloom[0].size,
                 thr,
@@ -1879,7 +2565,7 @@ impl PostFx {
                 fog_height: fog.height,
                 fog_height_falloff: fog.height_falloff,
                 fog_enabled: if fog.enabled { 1.0 } else { 0.0 },
-                ao_intensity: if settings.ao.enabled {
+                ao_intensity: if settings.ao.enabled && !dof_baked {
                     settings.ao.intensity
                 } else {
                     0.0
@@ -1901,18 +2587,20 @@ impl PostFx {
                 vignette_intensity: vig_i,
                 vignette_smoothness: vig_s,
                 grain_intensity: grain,
-                contact_intensity: if settings.contact_shadow.enabled && light_dir_world.is_some()
+                contact_intensity: if settings.contact_shadow.enabled
+                    && light_dir_world.is_some()
+                    && !dof_baked
                 {
                     settings.contact_shadow.intensity
                 } else {
                     0.0
                 },
-                ssgi_intensity: if settings.ssgi.enabled {
+                ssgi_intensity: if settings.ssgi.enabled && !dof_baked {
                     settings.ssgi.intensity
                 } else {
                     0.0
                 },
-                ssr_intensity: if settings.ssr.enabled {
+                ssr_intensity: if settings.ssr.enabled && !dof_baked {
                     settings.ssr.intensity
                 } else {
                     0.0
@@ -1935,7 +2623,7 @@ impl PostFx {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(scene_color),
+                    resource: wgpu::BindingResource::TextureView(lit_color),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,

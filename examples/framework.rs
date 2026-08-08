@@ -181,7 +181,15 @@ impl FlyCam {
     fn apply(&self, scene: &mut Scene) {
         let eye = self.eye;
         let target = eye + self.forward();
+        let focus_distance = scene.camera.focus_distance;
+        let focus_target = scene.camera.focus_target;
+        let focus_smooth = scene.camera.focus_smooth;
+        let f_stop = scene.camera.f_stop;
         scene.camera = Camera::look_at(eye, target);
+        scene.camera.focus_distance = focus_distance;
+        scene.camera.focus_target = focus_target;
+        scene.camera.focus_smooth = focus_smooth;
+        scene.camera.f_stop = f_stop;
     }
 }
 
@@ -544,6 +552,12 @@ impl<D: Demo> Host<D> {
         self.scene.update_animations(dt);
         let demo_anim = D::update(&mut self.scene, dt);
         self.fly.apply(&mut self.scene);
+        if let Some(gpu) = self.gpu.as_mut() {
+            if gpu.visualizer.post_process().dof.auto_focus {
+                self.scene.camera.autofocus_ground(0.0);
+            }
+        }
+        self.scene.camera.tick_focus(dt);
 
         let viewport = Vec2::new(size.width as f32, size.height as f32);
         // While looking, starve UI of mouse so dock widgets don't steal the grab.

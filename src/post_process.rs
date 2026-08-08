@@ -12,6 +12,7 @@ pub struct PostProcessSettings {
     pub grain: GrainSettings,
     pub fxaa: FxaaSettings,
     pub fog: FogSettings,
+    pub dof: DofSettings,
 }
 
 /// Equirect env reflections + skybox (no heavy IBL bake).
@@ -184,6 +185,34 @@ pub struct FogSettings {
     pub height_falloff: f32,
 }
 
+/// Temporal screen-space depth of field (CoC gather + optional reprojection).
+///
+/// Focus / f-stop live on [`crate::Camera`]; these tune the post effect only.
+#[derive(Clone, Debug)]
+pub struct DofSettings {
+    pub enabled: bool,
+    /// Max blur radius in pixels (full-res).
+    pub max_coc_px: f32,
+    /// Overall CoC scale (pairs with camera `f_stop`).
+    pub scale: f32,
+    /// Soft in-focus half-range in world units around `focus_distance`.
+    pub focus_range: f32,
+    /// Spiral gather taps per pixel (4..=24).
+    pub samples: u32,
+    /// 0 = circular bokeh, 5..=8 = blade count (hex etc.).
+    pub bokeh_blades: u32,
+    /// Gather at half resolution (cheaper, still sharp in focus via upsample).
+    pub half_res: bool,
+    /// Continuously pull focus toward the view-ray / ground (see camera autofocus).
+    pub auto_focus: bool,
+    /// Camera-reprojection temporal accumulation.
+    pub temporal: bool,
+    /// Blend toward history (0 = current only, ~0.9 = stable).
+    pub history: f32,
+    /// Relative clip-depth rejection threshold for disocclusion.
+    pub depth_reject: f32,
+}
+
 impl Default for PostProcessSettings {
     fn default() -> Self {
         Self {
@@ -221,15 +250,15 @@ impl Default for PostProcessSettings {
             },
             ssr: SsrSettings {
                 enabled: false,
-                max_distance: 12.0,
-                thickness: 0.22,
-                intensity: 1.0,
-                max_steps: 48,
-                bias: 0.05,
-                roughness_cutoff: 0.55,
+                max_distance: 5.0,
+                thickness: 0.24,
+                intensity: 0.63,
+                max_steps: 37,
+                bias: 0.0,
+                roughness_cutoff: 0.48,
                 temporal: true,
-                history: 0.85,
-                depth_reject: 0.03,
+                history: 0.98,
+                depth_reject: 0.1,
             },
             bloom: BloomSettings {
                 enabled: false,
@@ -264,6 +293,19 @@ impl Default for PostProcessSettings {
                 height: 0.0,
                 height_falloff: 0.15,
             },
+            dof: DofSettings {
+                enabled: false,
+                max_coc_px: 28.0,
+                scale: 12.0,
+                focus_range: 0.25,
+                samples: 12,
+                bokeh_blades: 6,
+                half_res: true,
+                auto_focus: false,
+                temporal: true,
+                history: 0.9,
+                depth_reject: 0.03,
+            },
         }
     }
 }
@@ -281,5 +323,6 @@ impl PostProcessSettings {
             || self.grain.enabled
             || self.fxaa.enabled
             || self.fog.enabled
+            || self.dof.enabled
     }
 }

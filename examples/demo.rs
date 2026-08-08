@@ -136,12 +136,17 @@ fn build_demo_scene() -> Scene {
 
     let models = [
         (r"C:\Users\black\OneDrive\Desktop\tank.glb", Vec3::new(0.0, 0.0, -4.5)),
-        (r"F:\3d\tripo_ai\boa.glb", Vec3::new(0.0, 0.0, -4.5)),
+        (r"C:\Users\black\OneDrive\Desktop\tank_2.glb", Vec3::new(1.5, 0.0, -4.5)),
+        (r"C:\Users\black\OneDrive\Desktop\ammo.glb", Vec3::new(4.0, 0.0, -4.5)),
+        (r"C:\Users\black\OneDrive\Desktop\cyborg.glb", Vec3::new(-1.0, 0.0, -4.5)),
+        
+        /*(r"F:\3d\tripo_ai\boa.glb", Vec3::new(0.0, 0.0, -4.5)),
         (r"F:\3d\tripo_ai\bulma_full.glb", Vec3::new(0.5, 0.0, -4.5)),
         (r"F:\3d\tripo_ai\cammy_full.glb", Vec3::new(1.0, 0.0, -4.5)),
         (r"F:\3d\tripo_ai\chunli_full.glb", Vec3::new(1.5, 0.0, -4.5)),
         (r"F:\3d\tripo_ai\zangya_full.glb", Vec3::new(2.0, 0.0, -4.5)),
         (r"F:/csharp/VR_Waifu/asset/model/Bulma/Bulma2.gltf", Vec3::new(2.5, 0.0, -4.5)),
+        */
     ];
     for &(path, offset) in &models {
         scene.load_gltf_async(path, Some(root), move |scene, h| {
@@ -174,7 +179,7 @@ impl Demo for MaterialDemo {
     }
 
     fn configure(visualizer: &mut WgpuVisualizer) {
-        visualizer.set_env_map_async(r"F:\3d\garbage\hdri\cowboy_town_saloon_4k.exr");
+        visualizer.set_env_map_async(r"F:\3d\garbage\hdri\ferndale_studio_12_4k.exr");
 
         let shadow = visualizer.shadow_settings();
         shadow.filter = ShadowFilter::Pcss;
@@ -211,18 +216,29 @@ impl Demo for MaterialDemo {
         post.ssgi.history = 0.88;
         post.ssgi.depth_reject = 0.025;
         post.ssr.enabled = true;
-        post.ssr.max_distance = 12.0;
-        post.ssr.thickness = 0.22;
-        post.ssr.intensity = 1.0;
-        post.ssr.max_steps = 48;
-        post.ssr.bias = 0.05;
-        post.ssr.roughness_cutoff = 0.55;
+        post.ssr.max_distance = 5.0;
+        post.ssr.thickness = 0.24;
+        post.ssr.intensity = 0.63;
+        post.ssr.max_steps = 37;
+        post.ssr.bias = 0.0;
+        post.ssr.roughness_cutoff = 0.48;
         post.ssr.temporal = true;
-        post.ssr.history = 0.85;
-        post.ssr.depth_reject = 0.03;
+        post.ssr.history = 0.98;
+        post.ssr.depth_reject = 0.1;
         post.bloom.enabled = true;
         post.bloom.threshold = 1.2;
         post.bloom.intensity = 0.2;
+        post.dof.enabled = true;
+        post.dof.max_coc_px = 28.0;
+        post.dof.scale = 14.0;
+        post.dof.focus_range = 0.25;
+        post.dof.samples = 12;
+        post.dof.bokeh_blades = 6;
+        post.dof.half_res = true;
+        post.dof.auto_focus = false;
+        post.dof.temporal = true;
+        post.dof.history = 0.9;
+        post.dof.depth_reject = 0.03;
         post.tonemap.enabled = true;
         post.tonemap.aces = true;
         post.tonemap.exposure = 1.4;
@@ -446,6 +462,62 @@ impl Demo for MaterialDemo {
                         ui.slider("Threshold", &mut post.bloom.threshold, 0.0..=4.0);
                         ui.label("Intensity — сила свечения");
                         ui.slider("Intensity", &mut post.bloom.intensity, 0.0..=2.0);
+                    });
+                });
+                ui.collapsing_header("DOF", |ui| {
+                    ui.checkbox("Enabled", &mut post.dof.enabled);
+                    ui.label("Temporal dual-field CoC + bokeh (optics на камере).");
+                    ui.add_enabled(post.dof.enabled, |ui| {
+                        ui.checkbox("Auto focus (ground)", &mut post.dof.auto_focus);
+                        ui.label("Focus distance — плоскость фокуса (мир)");
+                        if ui
+                            .slider(
+                                "Focus distance",
+                                &mut scene.camera.focus_target,
+                                0.2..=40.0,
+                            )
+                            .changed()
+                        {
+                            // Keep display distance in sync when not smoothing hard.
+                            if scene.camera.focus_smooth <= 1e-3 {
+                                scene.camera.focus_distance = scene.camera.focus_target;
+                            }
+                        }
+                        ui.label("Focus smooth — скорость focus pull");
+                        ui.slider("Focus smooth", &mut scene.camera.focus_smooth, 0.0..=20.0);
+                        if ui.button("Focus → scene center").clicked() {
+                            let center = Vec3::new(0.0, 0.5, 0.0);
+                            scene.camera.autofocus_point(center);
+                        }
+                        ui.label("F-stop — меньше = сильнее blur");
+                        ui.slider("F-stop", &mut scene.camera.f_stop, 0.8..=22.0);
+                        ui.label("Focus range — зона резкости (мир)");
+                        ui.slider("Focus range", &mut post.dof.focus_range, 0.0..=2.0);
+                        ui.label("Max CoC — радиус в пикселях");
+                        ui.slider("Max CoC", &mut post.dof.max_coc_px, 4.0..=48.0);
+                        ui.label("Scale — сила относительно f-stop");
+                        ui.slider("Scale", &mut post.dof.scale, 1.0..=40.0);
+                        let mut samples = post.dof.samples as f32;
+                        ui.label("Samples — тапов gather");
+                        if ui.slider("Samples", &mut samples, 4.0..=24.0).changed() {
+                            post.dof.samples = samples.round() as u32;
+                        }
+                        let mut blades = post.dof.bokeh_blades as f32;
+                        ui.label("Bokeh blades — 0=круг, 6=hex");
+                        if ui.slider("Bokeh blades", &mut blades, 0.0..=8.0).changed() {
+                            let b = blades.round() as u32;
+                            post.dof.bokeh_blades = if b > 0 && b < 5 { 5 } else { b };
+                        }
+                        ui.checkbox("Half-res gather", &mut post.dof.half_res);
+                        ui.separator();
+                        ui.checkbox("Temporal", &mut post.dof.temporal);
+                        ui.label("Camera reprojection + depth rejection.");
+                        ui.add_enabled(post.dof.temporal, |ui| {
+                            ui.label("History — вес прошлого кадра");
+                            ui.slider("History", &mut post.dof.history, 0.5..=0.98);
+                            ui.label("Depth reject — порог disocclusion");
+                            ui.slider("Depth reject", &mut post.dof.depth_reject, 0.005..=0.1);
+                        });
                     });
                 });
                 ui.collapsing_header("Tonemap", |ui| {

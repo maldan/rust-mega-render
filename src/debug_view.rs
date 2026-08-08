@@ -29,6 +29,10 @@ pub enum DebugView {
     Ssr,
     /// Base-color albedo G-buffer.
     Albedo,
+    /// DOF CoC map (magenta = near, green = far).
+    DofCoc,
+    /// DOF HDR result (expose + Reinhard preview).
+    Dof,
 }
 
 impl DebugView {
@@ -44,6 +48,8 @@ impl DebugView {
         DebugView::Ssgi,
         DebugView::Ssr,
         DebugView::Albedo,
+        DebugView::DofCoc,
+        DebugView::Dof,
     ];
 
     pub fn label(self) -> &'static str {
@@ -59,6 +65,8 @@ impl DebugView {
             DebugView::Ssgi => "SSGI",
             DebugView::Ssr => "SSR",
             DebugView::Albedo => "Albedo",
+            DebugView::DofCoc => "DOF CoC",
+            DebugView::Dof => "DOF",
         }
     }
 
@@ -75,6 +83,8 @@ impl DebugView {
             DebugView::Ssgi => 8,
             DebugView::Ssr => 9,
             DebugView::Albedo => 10,
+            DebugView::DofCoc => 11,
+            DebugView::Dof => 12,
         }
     }
 }

@@ -1169,6 +1169,8 @@ impl WgpuVisualizer {
                 view,
                 view_proj,
                 [eye.x, eye.y, eye.z],
+                scene.camera.focus_distance,
+                scene.camera.f_stop,
                 light_dir,
                 &env,
                 self.size,
@@ -1258,6 +1260,34 @@ impl WgpuVisualizer {
                     self.size,
                 );
                 Some(self.post_fx.ssr_view())
+            } else if self.debug_view == DebugView::DofCoc {
+                self.post_fx.generate_dof_coc(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    &self.post.dof,
+                    &self.frames.depth_view,
+                    proj,
+                    scene.camera.focus_distance,
+                    scene.camera.f_stop,
+                    self.size,
+                );
+                Some(self.post_fx.dof_coc_view())
+            } else if self.debug_view == DebugView::Dof {
+                self.post_fx.generate_dof(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    &self.post.dof,
+                    &self.frames.color_view,
+                    &self.frames.depth_view,
+                    proj,
+                    view_proj,
+                    scene.camera.focus_distance,
+                    scene.camera.f_stop,
+                    self.size,
+                );
+                Some(self.post_fx.dof_view())
             } else if self.debug_view == DebugView::Albedo {
                 Some(&self.frames.albedo_view)
             } else {
