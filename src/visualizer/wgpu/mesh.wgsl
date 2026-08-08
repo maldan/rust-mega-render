@@ -7,7 +7,7 @@ struct FrameUniforms {
     ibl: vec4<f32>,
     // x = filter (0=pcf, 1=pcss), y = light_size, z = 1/shadow_map_size, w = blocker samples
     shadow: vec4<f32>,
-    // x = constant-ambient scale, y = env yaw rotation (radians)
+    // x = constant-ambient scale, y = env yaw rotation (radians), z = shadow bias
     gi: vec4<f32>,
     lights: array<GpuLight, 8>,
     prev_view_proj: mat4x4<f32>,
@@ -180,7 +180,8 @@ fn shadow_factor(world_pos: vec3<f32>, n: vec3<f32>, l: vec3<f32>) -> f32 {
     if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z < 0.0 || ndc.z > 1.0 {
         return 1.0;
     }
-    let bias = max(0.0005 * (1.0 - dot(n, l)), 0.00015);
+    let bias_scale = max(frame.gi.z, 0.0);
+    let bias = max(bias_scale * (1.0 - dot(n, l)), bias_scale * 0.3);
     let z_recv = ndc.z - bias;
     let texel = frame.shadow.z;
     let use_pcss = frame.shadow.x > 0.5;

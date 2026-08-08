@@ -141,17 +141,20 @@ fn build_demo_scene() -> Scene {
         (r"C:\Users\black\OneDrive\Desktop\ammo.glb", Vec3::new(4.0, 0.0, -4.5)),
         (r"C:\Users\black\OneDrive\Desktop\cyborg.glb", Vec3::new(-1.0, 0.0, -4.5)),*/
         
-        (r"F:\3d\tripo_ai\boa.glb", Vec3::new(0.0, 0.0, -4.5)),
+        /*(r"F:\3d\tripo_ai\boa.glb", Vec3::new(0.0, 0.0, -4.5)),
         (r"F:\3d\tripo_ai\bulma_full.glb", Vec3::new(0.5, 0.0, -4.5)),
         (r"F:\3d\tripo_ai\cammy_full.glb", Vec3::new(1.0, 0.0, -4.5)),
         (r"F:\3d\tripo_ai\chunli_full.glb", Vec3::new(1.5, 0.0, -4.5)),
         (r"F:\3d\tripo_ai\zangya_full.glb", Vec3::new(2.0, 0.0, -4.5)),
-        (r"F:/csharp/VR_Waifu/asset/model/Bulma/Bulma2.gltf", Vec3::new(2.5, 0.0, -4.5)),
+        (r"F:\3d\tripo_ai\rangiku_full.glb", Vec3::new(2.5, 0.0, -4.5)),*/
+        (r"F:\3d\tripo_ai\2b.glb", Vec3::new(3.0, 0.0, -4.5)),
+        
+        /*(r"F:/csharp/VR_Waifu/asset/model/Bulma/Bulma2.gltf", Vec3::new(2.5, 0.0, -4.5)),
         //(r"F:/csharp/VR_Waifu/asset/model/Miruko/Miruko.gltf", Vec3::new(3.0, 0.0, -4.5)),
         (r"F:/csharp/VR_Waifu/asset/model/ChunLi/ChunLi.gltf", Vec3::new(3.5, 0.0, -4.5)),
         (r"F:/csharp/VR_Waifu/asset/model/Tatsumaki/Tatsumaki_2.gltf", Vec3::new(4.0, 0.0, -4.5)),
         (r"F:/csharp/VR_Waifu/asset/model/Zangya/Zangya2.gltf", Vec3::new(4.5, 0.0, -4.5)),
-        (r"F:/csharp/VR_Waifu/asset/model/Yoruichi/Yoruichi.gltf", Vec3::new(5.0, 0.0, -4.5)),
+        (r"F:/csharp/VR_Waifu/asset/model/Yoruichi/Yoruichi.gltf", Vec3::new(5.0, 0.0, -4.5)),*/
         
         
     ];
@@ -704,6 +707,8 @@ impl Demo for MaterialDemo {
                             if d.cast_shadows {
                                 ui.separator();
                                 ui.label("Shadows (visualizer)");
+                                ui.label("Bias — acne ↔ peter-panning");
+                                ui.slider("Shadow bias", &mut shadow.bias, 0.0..=0.01);
                                 ui.label("Shadow map size");
                                 let mut map_idx = match shadow.map_size {
                                     1024 => 0usize,

@@ -16,6 +16,9 @@ pub struct ShadowSettings {
     pub filter: ShadowFilter,
     /// Shadow map resolution: typically `1024`, `2048`, or `4096`.
     pub map_size: u32,
+    /// Receiver depth bias scale (acne ↔ peter-panning). Used as
+    /// `max(bias * (1 - n·l), bias * 0.3)`.
+    pub bias: f32,
     /// PCSS softness `0` = sharp, `1` = max soft (quadratic curve).
     pub pcss_light_size: f32,
     /// PCSS blocker-search taps (4..=16).
@@ -29,6 +32,7 @@ impl Default for ShadowSettings {
         Self {
             filter: ShadowFilter::Pcss,
             map_size: 4096,
+            bias: 0.0005,
             pcss_light_size: 0.35,
             pcss_blocker_samples: 16,
             pcss_filter_samples: 48,

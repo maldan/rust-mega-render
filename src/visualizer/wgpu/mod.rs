@@ -85,7 +85,7 @@ struct FrameUniforms {
     ibl: [f32; 4],
     /// x = filter (0=pcf, 1=pcss), y = light_size, z = 1/map_size, w = blocker samples
     shadow: [f32; 4],
-    /// x = constant-ambient scale, y = env yaw (radians)
+    /// x = constant-ambient scale, y = env yaw (radians), z = shadow bias scale
     gi: [f32; 4],
     lights: [GpuLight; MAX_LIGHTS],
     prev_view_proj: [[f32; 4]; 4],
@@ -995,6 +995,7 @@ impl WgpuVisualizer {
         let pcss_light_size = self.shadow.pcss_light_size.clamp(0.0, 1.0);
         let blocker_samples = self.shadow.pcss_blocker_samples.clamp(4, 16) as f32;
         let filter_samples = self.shadow.pcss_filter_samples.clamp(8, 48) as f32;
+        let shadow_bias = self.shadow.bias.max(0.0);
 
         let eye = scene.camera.eye;
         let view_proj = scene.camera.view_proj(aspect);
@@ -1045,7 +1046,7 @@ impl WgpuVisualizer {
                     1.0 / self.shadow_map_size as f32,
                     blocker_samples,
                 ],
-                gi: [ambient_gi, env_rot, 0.0, 0.0],
+                gi: [ambient_gi, env_rot, shadow_bias, 0.0],
                 lights: gpu_lights,
                 prev_view_proj: prev_vp.to_cols_array_2d(),
                 resolution: [self.size.0 as f32, self.size.1 as f32, 0.0, 0.0],
