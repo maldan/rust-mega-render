@@ -6,6 +6,7 @@ struct ObjectUniforms {
     model: mat4x4<f32>,
     albedo: vec4<f32>,
     params: vec4<f32>,
+    sss: vec4<f32>,
     bones: array<mat4x4<f32>, 128>,
 }
 

@@ -21,8 +21,10 @@ struct GpuLight {
 struct ObjectUniforms {
     model: mat4x4<f32>,
     albedo: vec4<f32>,
-    // x = metallic, y = roughness, z = skinned
+    // x = metallic, y = roughness, z = skinned, w = sss strength
     params: vec4<f32>,
+    // rgb = scatter tint, w = curvature (0..1)
+    sss: vec4<f32>,
     bones: array<mat4x4<f32>, 128>,
 }
 
@@ -33,6 +35,8 @@ struct ObjectUniforms {
 @group(0) @binding(4) var env_blur: texture_2d_array<f32>;
 @group(0) @binding(5) var env_samp: sampler;
 @group(0) @binding(6) var shadow_depth_samp: sampler;
+@group(0) @binding(7) var sss_lut: texture_2d<f32>;
+@group(0) @binding(8) var sss_samp: sampler;
 @group(1) @binding(0) var<uniform> object: ObjectUniforms;
 @group(1) @binding(1) var albedo_tex: texture_2d<f32>;
 @group(1) @binding(2) var normal_tex: texture_2d<f32>;
@@ -219,6 +223,11 @@ fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
+fn sample_sss_lut(ndotl: f32, curvature: f32) -> vec3<f32> {
+    let uv = vec2<f32>(ndotl * 0.5 + 0.5, clamp(curvature, 0.0, 1.0));
+    return textureSampleLevel(sss_lut, sss_samp, uv, 0.0).rgb;
+}
+
 fn light_contrib(
     light: GpuLight,
     world_pos: vec3<f32>,
@@ -227,6 +236,9 @@ fn light_contrib(
     albedo: vec3<f32>,
     metallic: f32,
     roughness: f32,
+    sss_strength: f32,
+    sss_color: vec3<f32>,
+    sss_curvature: f32,
 ) -> vec3<f32> {
     var l: vec3<f32>;
     var atten = 1.0;
@@ -245,8 +257,10 @@ fn light_contrib(
     }
 
     let h = normalize(v + l);
-    let ndotl = max(dot(n, l), 0.0);
-    if ndotl <= 0.0 {
+    let ndotl_raw = dot(n, l);
+    let ndotl = max(ndotl_raw, 0.0);
+    let use_sss = sss_strength > 0.001 && metallic < 0.95;
+    if !use_sss && ndotl <= 0.0 {
         return vec3<f32>(0.0);
     }
 
@@ -256,14 +270,30 @@ fn light_contrib(
     }
 
     let f0 = mix(vec3<f32>(0.04), albedo, metallic);
-    let d = distribution_ggx(n, h, roughness);
-    let g = geometry_smith(n, v, l, roughness);
     let f = fresnel_schlick(max(dot(h, v), 0.0), f0);
-    let specular = (d * g * f) / max(4.0 * max(dot(n, v), 0.0) * ndotl, 0.001);
     let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
-    let diffuse = kd * albedo / PI;
     let radiance = light.color.xyz * light.color.w * atten * s;
-    return (diffuse + specular) * radiance * ndotl;
+
+    var diffuse = vec3<f32>(0.0);
+    if use_sss {
+        let pre = sample_sss_lut(ndotl_raw, sss_curvature);
+        let scatter_alb = mix(albedo, albedo * sss_color, 0.7);
+        let lambert = albedo * (ndotl / PI);
+        let sss_diff = scatter_alb * (pre / PI);
+        diffuse = kd * mix(lambert, sss_diff, sss_strength);
+    } else {
+        diffuse = kd * albedo / PI * ndotl;
+    }
+
+    var specular = vec3<f32>(0.0);
+    if ndotl > 0.0 {
+        let d = distribution_ggx(n, h, roughness);
+        let g = geometry_smith(n, v, l, roughness);
+        specular = (d * g * f) / max(4.0 * max(dot(n, v), 0.0) * ndotl, 0.001);
+        specular = specular * ndotl;
+    }
+
+    return (diffuse + specular) * radiance;
 }
 
 // Sharp full-res + discrete blurred ≤1024 maps (no mip pyramid).
@@ -348,18 +378,37 @@ fn fs_main(in: VertexOutput) -> GBufferOut {
     let n = normalize(mat3x3(t, b, n0) * n_ts);
 
     let v = normalize(frame.camera_pos.xyz - in.world_pos);
+    let sss_strength = object.params.w;
+    let sss_color = object.sss.xyz;
+    let sss_curvature = object.sss.w;
 
     // Scale down constant ambient when SSGI is active (frame.gi.x).
     let ambient_gi = clamp(frame.gi.x, 0.0, 1.0);
+    let ambient_alb = select(
+        albedo,
+        mix(albedo, albedo * sss_color, 0.35),
+        sss_strength > 0.001 && metallic < 0.95,
+    );
 
-    var lit = frame.ambient.xyz * albedo * ambient_gi;
+    var lit = frame.ambient.xyz * ambient_alb * ambient_gi;
     if frame.ibl.z > 0.5 {
         lit += env_reflect(n, v, albedo, metallic, roughness);
     }
 
     let count = u32(frame.ambient.w);
     for (var i = 0u; i < count; i++) {
-        lit += light_contrib(frame.lights[i], in.world_pos, n, v, albedo, metallic, roughness);
+        lit += light_contrib(
+            frame.lights[i],
+            in.world_pos,
+            n,
+            v,
+            albedo,
+            metallic,
+            roughness,
+            sss_strength,
+            sss_color,
+            sss_curvature,
+        );
     }
     // Always linear HDR into G-buffer color (present/tonemap happens later).
     var out: GBufferOut;

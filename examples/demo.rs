@@ -15,7 +15,7 @@ mod framework;
 use framework::{Demo, Host, SCENE_TEX, UiCtx};
 use glam::{Vec2, Vec3};
 use mega_render::{
-    cube, plane, sphere, AoMethod, DebugView, Light, Material, Node, PointLight, Scene,
+    cube, plane, sphere, AoMethod, DebugView, Handle, Light, Material, Node, PointLight, Scene,
     ShadowFilter, Transform, Visualizer, WgpuVisualizer,
 };
 use mega_ui::{DockNode, DockState, ScrollAxes, TextStyle, Ui};
@@ -135,28 +135,60 @@ fn build_demo_scene() -> Scene {
     }
 
     let models = [
-        (r"C:\Users\black\OneDrive\Desktop\tank.glb", Vec3::new(0.0, 0.0, -4.5)),
+        /*(r"C:\Users\black\OneDrive\Desktop\tank.glb", Vec3::new(0.0, 0.0, -4.5)),
         (r"C:\Users\black\OneDrive\Desktop\tank_2.glb", Vec3::new(1.5, 0.0, -4.5)),
         (r"C:\Users\black\OneDrive\Desktop\ammo.glb", Vec3::new(4.0, 0.0, -4.5)),
-        (r"C:\Users\black\OneDrive\Desktop\cyborg.glb", Vec3::new(-1.0, 0.0, -4.5)),
+        (r"C:\Users\black\OneDrive\Desktop\cyborg.glb", Vec3::new(-1.0, 0.0, -4.5)),*/
         
-        /*(r"F:\3d\tripo_ai\boa.glb", Vec3::new(0.0, 0.0, -4.5)),
+        (r"F:\3d\tripo_ai\boa.glb", Vec3::new(0.0, 0.0, -4.5)),
         (r"F:\3d\tripo_ai\bulma_full.glb", Vec3::new(0.5, 0.0, -4.5)),
         (r"F:\3d\tripo_ai\cammy_full.glb", Vec3::new(1.0, 0.0, -4.5)),
         (r"F:\3d\tripo_ai\chunli_full.glb", Vec3::new(1.5, 0.0, -4.5)),
         (r"F:\3d\tripo_ai\zangya_full.glb", Vec3::new(2.0, 0.0, -4.5)),
         (r"F:/csharp/VR_Waifu/asset/model/Bulma/Bulma2.gltf", Vec3::new(2.5, 0.0, -4.5)),
-        */
+        
     ];
     for &(path, offset) in &models {
         scene.load_gltf_async(path, Some(root), move |scene, h| {
             if let Some(n) = scene.nodes.get_mut(h) {
                 n.local.translation += offset;
             }
+            enable_sss_on_subtree(scene, h);
         });
     }
 
     scene
+}
+
+/// Enable pre-integrated SSS on every material under a loaded model (test hack).
+fn enable_sss_on_subtree(scene: &mut Scene, root: Handle<Node>) {
+    let mut stack = vec![root];
+    let mut mats = Vec::new();
+    while let Some(h) = stack.pop() {
+        if let Some(n) = scene.nodes.get(h) {
+            if let Some(m) = n.material {
+                mats.push(m);
+            }
+        }
+        for (child, node) in scene.nodes.iter() {
+            if node.parent.map(|p| p.key()) == Some(h.key()) {
+                stack.push(child);
+            }
+        }
+    }
+    mats.sort_by_key(|m| m.key());
+    mats.dedup_by_key(|m| m.key());
+    for m in mats {
+        if let Some(mat) = scene.materials.get_mut(m) {
+            // Skip obvious metals so chrome bits don't go waxy.
+            if mat.metallic > 0.85 {
+                continue;
+            }
+            mat.sss_strength = 1.0;
+            mat.sss_color = [1.0, 0.32, 0.18];
+            mat.sss_curvature = 0.7;
+        }
+    }
 }
 
 fn default_dock() -> DockState {

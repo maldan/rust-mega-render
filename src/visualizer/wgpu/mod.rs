@@ -11,10 +11,12 @@ mod post;
 mod ibl_gpu;
 mod frame_targets;
 mod debug_blit;
+mod sss_lut;
 use ibl_gpu::GpuIbl;
 use post::{PostFx, SsrEnvInput};
 use frame_targets::FrameTargets;
 use debug_blit::DebugBlit;
+use sss_lut::GpuSssLut;
 
 const DEFAULT_SHADOW_SIZE: u32 = 2048;
 const MAX_LIGHTS: usize = 8;
@@ -99,7 +101,10 @@ struct ShadowFrame {
 struct ObjectUniforms {
     model: [[f32; 4]; 4],
     albedo: [f32; 4],
-    params: [f32; 4], // metallic, roughness, skinned, _
+    /// metallic, roughness, skinned, sss_strength
+    params: [f32; 4],
+    /// rgb scatter tint, w = curvature
+    sss: [f32; 4],
     bones: [[[f32; 4]; 4]; MAX_BONES],
 }
 
@@ -146,6 +151,7 @@ pub struct WgpuVisualizer {
     flat_normal: GpuTexture,
     default_mr: GpuTexture,
     ibl: GpuIbl,
+    sss_lut: GpuSssLut,
     /// Background CPU env prepare; uploaded on [`Self::poll_env_map`].
     pending_env: Option<mpsc::Receiver<Result<crate::ibl::EnvMaps, String>>>,
     meshes: HashMap<(u32, u32), GpuMesh>,
@@ -212,6 +218,7 @@ impl WgpuVisualizer {
 
         let (shadow_tex, shadow_view) = create_shadow_map(device, DEFAULT_SHADOW_SIZE);
         let ibl = GpuIbl::black(device, queue);
+        let sss_lut = GpuSssLut::bake(device, queue);
 
         let frame_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
@@ -272,6 +279,22 @@ impl WgpuVisualizer {
                     binding: 6,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -406,6 +429,7 @@ impl WgpuVisualizer {
             &shadow_samp,
             &shadow_depth_samp,
             &ibl,
+            &sss_lut,
         );
         let sky_bind_group = make_sky_bind_group(device, &sky_bind_layout, &sky_uniform_buf, &ibl);
         let debug_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -608,6 +632,7 @@ impl WgpuVisualizer {
             flat_normal,
             default_mr,
             ibl,
+            sss_lut,
             pending_env: None,
             meshes: HashMap::new(),
             textures: HashMap::new(),
@@ -701,6 +726,7 @@ impl WgpuVisualizer {
             &self.shadow_samp,
             &self.shadow_depth_samp,
             &self.ibl,
+            &self.sss_lut,
         );
         self.sky_bind_group = make_sky_bind_group(
             &self.device,
@@ -826,6 +852,7 @@ impl WgpuVisualizer {
             Mat4,
             [f32; 4],
             [f32; 4],
+            [f32; 4],
             [[[f32; 4]; 4]; MAX_BONES],
         )> = Vec::new();
         for (h, node) in scene.nodes.iter() {
@@ -837,11 +864,17 @@ impl WgpuVisualizer {
             if !self.meshes.contains_key(&mesh_key) {
                 continue;
             }
-            let (albedo, mut params, albedo_key, normal_key, mr_key) =
+            let (albedo, mut params, sss, albedo_key, normal_key, mr_key) =
                 match node.material.and_then(|m| scene.materials.get(m)) {
                     Some(mat) => (
                         mat.albedo,
-                        [mat.metallic, mat.roughness, 0.0, 0.0],
+                        [mat.metallic, mat.roughness, 0.0, mat.sss_strength],
+                        [
+                            mat.sss_color[0],
+                            mat.sss_color[1],
+                            mat.sss_color[2],
+                            mat.sss_curvature,
+                        ],
                         mat.albedo_map.map(|t| t.key()),
                         mat.normal_map.map(|t| t.key()),
                         mat.metallic_roughness_map.map(|t| t.key()),
@@ -849,6 +882,7 @@ impl WgpuVisualizer {
                     None => (
                         [1.0, 1.0, 1.0, 1.0],
                         [0.0, 0.5, 0.0, 0.0],
+                        [1.0, 0.35, 0.2, 0.3],
                         None,
                         None,
                         None,
@@ -873,6 +907,7 @@ impl WgpuVisualizer {
                 scene.world_matrix(h),
                 albedo,
                 params,
+                sss,
                 bones,
             ));
         }
@@ -883,11 +918,12 @@ impl WgpuVisualizer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        for (i, (_, _, _, _, model, albedo, params, bones)) in draws.iter().enumerate() {
+        for (i, (_, _, _, _, model, albedo, params, sss, bones)) in draws.iter().enumerate() {
             let data = ObjectUniforms {
                 model: model.to_cols_array_2d(),
                 albedo: *albedo,
                 params: *params,
+                sss: *sss,
                 bones: *bones,
             };
             self.queue
@@ -950,7 +986,7 @@ impl WgpuVisualizer {
             });
             pass.set_pipeline(&self.shadow_pipeline);
             pass.set_bind_group(0, &self.shadow_frame_bind_group, &[]);
-            for (i, (mesh_key, _, _, _, _, _, _, _)) in draws.iter().enumerate() {
+            for (i, (mesh_key, _, _, _, _, _, _, _, _)) in draws.iter().enumerate() {
                 let Some(mesh) = self.meshes.get(mesh_key) else {
                     continue;
                 };
@@ -1027,7 +1063,8 @@ impl WgpuVisualizer {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.frame_bind_group, &[]);
 
-            for (i, (mesh_key, albedo_key, normal_key, mr_key, _, _, _, _)) in draws.iter().enumerate()
+            for (i, (mesh_key, albedo_key, normal_key, mr_key, _, _, _, _, _)) in
+                draws.iter().enumerate()
             {
                 let Some(mesh) = self.meshes.get(mesh_key) else {
                     continue;
@@ -1538,6 +1575,7 @@ fn make_frame_bind_group(
     shadow_samp: &wgpu::Sampler,
     shadow_depth_samp: &wgpu::Sampler,
     ibl: &GpuIbl,
+    sss_lut: &GpuSssLut,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("frame"),
@@ -1570,6 +1608,14 @@ fn make_frame_bind_group(
             wgpu::BindGroupEntry {
                 binding: 6,
                 resource: wgpu::BindingResource::Sampler(shadow_depth_samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(&sss_lut.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::Sampler(&sss_lut.samp),
             },
         ],
     })
