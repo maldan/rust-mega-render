@@ -16,6 +16,7 @@ use framework::{Demo, Host, SCENE_TEX, UiCtx};
 use glam::{Vec2, Vec3};
 use mega_render::{
     cube, plane, sphere, AoMethod, DebugView, Handle, Light, Material, Node, PointLight, Scene,
+    SsgiQuality,
     ShadowFilter, Transform, Visualizer, WgpuVisualizer,
 };
 use mega_ui::{DockNode, DockState, ScrollAxes, TextStyle, Ui};
@@ -157,6 +158,11 @@ fn build_demo_scene() -> Scene {
         });
     }
 
+    scene.camera.focus_distance = 0.7;
+    scene.camera.focus_target = 0.7;
+    scene.camera.focus_smooth = 2.1;
+    scene.camera.f_stop = 0.9;
+
     scene
 }
 
@@ -240,8 +246,7 @@ impl Demo for MaterialDemo {
         post.ssgi.radius = 2.5;
         post.ssgi.thickness = 0.45;
         post.ssgi.intensity = 1.8;
-        post.ssgi.samples = 6;
-        post.ssgi.max_steps = 6;
+        SsgiQuality::Medium.apply(&mut post.ssgi);
         post.ssgi.bias = 0.02;
         post.ssgi.ambient_dim = 0.2;
         post.ssgi.temporal = true;
@@ -261,16 +266,16 @@ impl Demo for MaterialDemo {
         post.bloom.threshold = 1.2;
         post.bloom.intensity = 0.2;
         post.dof.enabled = true;
-        post.dof.max_coc_px = 28.0;
-        post.dof.scale = 14.0;
-        post.dof.focus_range = 0.25;
-        post.dof.samples = 12;
-        post.dof.bokeh_blades = 6;
-        post.dof.half_res = true;
+        post.dof.max_coc_px = 40.1;
+        post.dof.scale = 15.6;
+        post.dof.focus_range = 0.21;
+        post.dof.samples = 14;
+        post.dof.bokeh_blades = 5;
+        post.dof.half_res = false;
         post.dof.auto_focus = false;
         post.dof.temporal = true;
-        post.dof.history = 0.9;
-        post.dof.depth_reject = 0.03;
+        post.dof.history = 0.58;
+        post.dof.depth_reject = 0.02;
         post.motion_blur.enabled = true;
         post.motion_blur.intensity = 1.0;
         post.motion_blur.max_blur_px = 64.0;
@@ -427,8 +432,21 @@ impl Demo for MaterialDemo {
                 });
                 ui.collapsing_header("SSGI", |ui| {
                     ui.checkbox("Enabled", &mut post.ssgi.enabled);
-                    ui.label("Spatial screen-space GI (без temporal).");
+                    ui.label("Screen-space GI: R2 cosine rays + à-trous + temporal.");
                     ui.add_enabled(post.ssgi.enabled, |ui| {
+                        let mut q = match (post.ssgi.samples, post.ssgi.max_steps) {
+                            (s, t) if s <= 4 && t <= 4 => 0usize,
+                            (s, t) if s >= 12 || t >= 12 => 2,
+                            _ => 1,
+                        };
+                        ui.label("Quality — rays × march steps");
+                        if ui
+                            .select("ssgi_quality", &mut q, &["Low (4×4)", "Medium (8×8)", "High (12×12)"])
+                            .changed()
+                        {
+                            SsgiQuality::ALL[q].apply(&mut post.ssgi);
+                        }
+                        ui.separator();
                         ui.label("Radius — длина луча (мир)");
                         ui.slider("Radius", &mut post.ssgi.radius, 0.2..=4.0);
                         ui.label("Thickness — допуск по глубине");
@@ -451,7 +469,7 @@ impl Demo for MaterialDemo {
                         ui.slider("Ambient dim", &mut post.ssgi.ambient_dim, 0.0..=1.0);
                         ui.separator();
                         ui.checkbox("Temporal", &mut post.ssgi.temporal);
-                        ui.label("Camera reprojection + depth rejection.");
+                        ui.label("Camera reprojection + AABB clamp + depth reject.");
                         ui.add_enabled(post.ssgi.temporal, |ui| {
                             ui.label("History — вес прошлого кадра");
                             ui.slider("History", &mut post.ssgi.history, 0.5..=0.98);

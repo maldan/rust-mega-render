@@ -146,6 +146,48 @@ pub struct SsgiSettings {
     pub depth_reject: f32,
 }
 
+/// Sample/step presets for [`SsgiSettings`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SsgiQuality {
+    /// 4 rays × 4 steps — cheapest, relies on denoise + temporal.
+    Low,
+    /// 8 rays × 8 steps — default balance.
+    #[default]
+    Medium,
+    /// 12 rays × 12 steps — cleaner spatial, higher cost.
+    High,
+}
+
+impl SsgiQuality {
+    /// Apply ray counts to `settings` (leaves radius / intensity alone).
+    pub fn apply(self, settings: &mut SsgiSettings) {
+        match self {
+            Self::Low => {
+                settings.samples = 4;
+                settings.max_steps = 4;
+            }
+            Self::Medium => {
+                settings.samples = 8;
+                settings.max_steps = 8;
+            }
+            Self::High => {
+                settings.samples = 12;
+                settings.max_steps = 12;
+            }
+        }
+    }
+
+    pub const ALL: [Self; 3] = [Self::Low, Self::Medium, Self::High];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BloomSettings {
     pub enabled: bool,
@@ -260,8 +302,8 @@ impl Default for PostProcessSettings {
                 radius: 2.5,
                 thickness: 0.45,
                 intensity: 1.8,
-                samples: 6,
-                max_steps: 6,
+                samples: 8,
+                max_steps: 8,
                 bias: 0.02,
                 ambient_dim: 0.2,
                 temporal: true,

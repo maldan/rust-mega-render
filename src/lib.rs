@@ -31,7 +31,7 @@ pub use node::{Node, Transform};
 pub use post_process::{
     AoMethod, AoSettings, BloomSettings, ColorGradeSettings, ContactShadowSettings, DofSettings,
     EnvMapSettings, FogSettings, FxaaSettings, GrainSettings, MotionBlurSettings,
-    PostProcessSettings, SsgiSettings, SsrSettings, TonemapSettings, VignetteSettings,
+    PostProcessSettings, SsgiQuality, SsgiSettings, SsrSettings, TonemapSettings, VignetteSettings,
 };
 pub use primitives::{cube, plane, sphere};
 pub use scene::Scene;
