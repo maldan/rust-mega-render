@@ -147,6 +147,12 @@ fn build_demo_scene() -> Scene {
         (r"F:\3d\tripo_ai\chunli_full.glb", Vec3::new(1.5, 0.0, -4.5)),
         (r"F:\3d\tripo_ai\zangya_full.glb", Vec3::new(2.0, 0.0, -4.5)),
         (r"F:/csharp/VR_Waifu/asset/model/Bulma/Bulma2.gltf", Vec3::new(2.5, 0.0, -4.5)),
+        //(r"F:/csharp/VR_Waifu/asset/model/Miruko/Miruko.gltf", Vec3::new(3.0, 0.0, -4.5)),
+        (r"F:/csharp/VR_Waifu/asset/model/ChunLi/ChunLi.gltf", Vec3::new(3.5, 0.0, -4.5)),
+        (r"F:/csharp/VR_Waifu/asset/model/Tatsumaki/Tatsumaki_2.gltf", Vec3::new(4.0, 0.0, -4.5)),
+        (r"F:/csharp/VR_Waifu/asset/model/Zangya/Zangya2.gltf", Vec3::new(4.5, 0.0, -4.5)),
+        (r"F:/csharp/VR_Waifu/asset/model/Yoruichi/Yoruichi.gltf", Vec3::new(5.0, 0.0, -4.5)),
+        
         
     ];
     for &(path, offset) in &models {
@@ -278,7 +284,7 @@ impl Demo for MaterialDemo {
         post.dof.temporal = true;
         post.dof.history = 0.58;
         post.dof.depth_reject = 0.02;
-        post.motion_blur.enabled = true;
+        post.motion_blur.enabled = false;
         post.motion_blur.intensity = 1.0;
         post.motion_blur.max_blur_px = 64.0;
         post.motion_blur.samples = 16;

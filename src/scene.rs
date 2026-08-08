@@ -9,6 +9,7 @@ use super::skin::Skin;
 use super::store::{Handle, Store};
 use super::texture::Texture;
 use glam::{Mat4, Vec3};
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 pub(crate) enum PendingLoad {
@@ -92,6 +93,34 @@ impl Scene {
         m
     }
 
+    /// Build world matrices for every node once (parent before child via recursion + memo).
+    pub fn world_matrices(&self) -> HashMap<(u32, u32), Mat4> {
+        let mut cache = HashMap::new();
+        for (h, _) in self.nodes.iter() {
+            let _ = self.world_matrix_cached(h, &mut cache);
+        }
+        cache
+    }
+
+    fn world_matrix_cached(
+        &self,
+        node: Handle<Node>,
+        cache: &mut HashMap<(u32, u32), Mat4>,
+    ) -> Mat4 {
+        if let Some(&m) = cache.get(&node.key()) {
+            return m;
+        }
+        let Some(n) = self.nodes.get(node) else {
+            return Mat4::IDENTITY;
+        };
+        let m = match n.parent {
+            Some(p) => self.world_matrix_cached(p, cache) * n.local.matrix(),
+            None => n.local.matrix(),
+        };
+        cache.insert(node.key(), m);
+        m
+    }
+
     /// First enabled directional light with `cast_shadows`.
     pub fn shadow_directional(&self) -> Option<&DirectionalLight> {
         self.lights.iter().find_map(|l| match l {
@@ -158,14 +187,34 @@ impl Scene {
     }
 
     pub fn joint_matrices(&self, skin: Handle<Skin>, mesh_node: Handle<Node>) -> Vec<Mat4> {
+        let world = self.world_matrices();
+        self.joint_matrices_with_cache(skin, mesh_node, &world)
+    }
+
+    pub fn joint_matrices_with_cache(
+        &self,
+        skin: Handle<Skin>,
+        mesh_node: Handle<Node>,
+        world: &HashMap<(u32, u32), Mat4>,
+    ) -> Vec<Mat4> {
         let Some(skin) = self.skins.get(skin) else {
             return Vec::new();
         };
-        let inv_mesh = self.world_matrix(mesh_node).inverse();
+        let mesh_world = world
+            .get(&mesh_node.key())
+            .copied()
+            .unwrap_or(Mat4::IDENTITY);
+        let inv_mesh = mesh_world.inverse();
         skin.joints
             .iter()
             .zip(skin.inverse_bind.iter())
-            .map(|(&joint, &ibm)| inv_mesh * self.world_matrix(joint) * ibm)
+            .map(|(&joint, &ibm)| {
+                let jw = world
+                    .get(&joint.key())
+                    .copied()
+                    .unwrap_or(Mat4::IDENTITY);
+                inv_mesh * jw * ibm
+            })
             .collect()
     }
 

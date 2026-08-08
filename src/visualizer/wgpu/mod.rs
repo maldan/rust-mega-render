@@ -24,10 +24,13 @@ const MAX_LIGHTS: usize = 8;
 const MAX_BONES: usize = 128;
 const OBJECT_UBO_SIZE: u64 = (std::mem::size_of::<ObjectUniforms>() as u64 + 255) & !255;
 const OBJECT_STRIDE: u64 = OBJECT_UBO_SIZE;
-const OBJECT_BONES_OFFSET: u64 = std::mem::offset_of!(ObjectUniforms, bones) as u64;
-const OBJECT_PREV_MODEL_OFFSET: u64 = std::mem::offset_of!(ObjectUniforms, prev_model) as u64;
-const OBJECT_PREV_BONES_OFFSET: u64 = std::mem::offset_of!(ObjectUniforms, prev_bones) as u64;
 const SHADOW_EXTENT: f32 = 14.0;
+
+/// `write_texture` requires bytes_per_row % 256 == 0 → width % 16 == 0 for RGBA32Float.
+fn bone_tex_width(joint_count: usize) -> u32 {
+    let w = joint_count.max(1).min(MAX_BONES) as u32 * 4;
+    w.div_ceil(16) * 16
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -114,24 +117,17 @@ struct ObjectUniforms {
     params: [f32; 4],
     /// rgb scatter tint, w = curvature
     sss: [f32; 4],
-    bones: [[[f32; 4]; 4]; MAX_BONES],
     prev_model: [[f32; 4]; 4],
-    prev_bones: [[[f32; 4]; 4]; MAX_BONES],
 }
 
-struct PrevPose {
-    model: Mat4,
-    /// Only for skinned draws (avoids 8KB×N CPU traffic on static meshes).
-    bones: Option<Box<[[[f32; 4]; 4]; MAX_BONES]>>,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct ObjectHeader {
-    model: [[f32; 4]; 4],
-    albedo: [f32; 4],
-    params: [f32; 4],
-    sss: [f32; 4],
+/// Per-skin bone palette texture (RGBA32F, row0=current, row1=prev).
+struct GpuSkinBones {
+    texture: wgpu::Texture,
+    _view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+    width: u32,
+    prev: Vec<Mat4>,
+    has_history: bool,
 }
 
 struct GpuMesh {
@@ -167,6 +163,7 @@ pub struct WgpuVisualizer {
     sky_uniform_buf: wgpu::Buffer,
     object_bind_layout: wgpu::BindGroupLayout,
     shadow_object_layout: wgpu::BindGroupLayout,
+    bone_bind_layout: wgpu::BindGroupLayout,
     sky_bind_layout: wgpu::BindGroupLayout,
     sky_pipeline: wgpu::RenderPipeline,
     sky_bind_group: wgpu::BindGroup,
@@ -199,7 +196,12 @@ pub struct WgpuVisualizer {
     default_object_bg: wgpu::BindGroup,
     /// Material bind groups keyed by albedo/normal/MR texture keys.
     object_material_bgs: HashMap<[(u32, u32); 3], wgpu::BindGroup>,
-    prev_poses: HashMap<(u32, u32), PrevPose>,
+    /// One small bone texture per skin.
+    skin_bones: HashMap<(u32, u32), GpuSkinBones>,
+    _identity_bone_tex: wgpu::Texture,
+    identity_bone_bg: wgpu::BindGroup,
+    /// Previous model matrix per mesh node (for velocity).
+    prev_models: HashMap<(u32, u32), Mat4>,
     prev_view_proj: Mat4,
     motion_has_history: bool,
     last_frame: Instant,
@@ -457,6 +459,19 @@ impl WgpuVisualizer {
                 count: None,
             }],
         });
+        let bone_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bone_palette"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
 
         let frame_bind_group = make_frame_bind_group(
             device,
@@ -488,12 +503,20 @@ impl WgpuVisualizer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[Some(&frame_bind_layout), Some(&object_bind_layout)],
+            bind_group_layouts: &[
+                Some(&frame_bind_layout),
+                Some(&object_bind_layout),
+                Some(&bone_bind_layout),
+            ],
             immediate_size: 0,
         });
         let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[Some(&shadow_frame_layout), Some(&shadow_object_layout)],
+            bind_group_layouts: &[
+                Some(&shadow_frame_layout),
+                Some(&shadow_object_layout),
+                Some(&bone_bind_layout),
+            ],
             immediate_size: 0,
         });
         let debug_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -667,6 +690,8 @@ impl WgpuVisualizer {
             &default_mr.view,
             &sampler,
         );
+        let (identity_bone_tex, identity_bone_bg) =
+            identity_bone_palette(device, queue, &bone_bind_layout);
 
         Self {
             device: device.clone(),
@@ -687,6 +712,7 @@ impl WgpuVisualizer {
             sky_uniform_buf,
             object_bind_layout,
             shadow_object_layout,
+            bone_bind_layout,
             sky_bind_layout,
             sky_pipeline,
             sky_bind_group,
@@ -716,7 +742,10 @@ impl WgpuVisualizer {
             shadow_object_bg,
             default_object_bg,
             object_material_bgs: HashMap::new(),
-            prev_poses: HashMap::new(),
+            skin_bones: HashMap::new(),
+            _identity_bone_tex: identity_bone_tex,
+            identity_bone_bg,
+            prev_models: HashMap::new(),
             prev_view_proj: Mat4::IDENTITY,
             motion_has_history: false,
             last_frame: Instant::now(),
@@ -762,6 +791,75 @@ impl WgpuVisualizer {
         });
         self.object_slots = new_slots;
         self.invalidate_object_bind_groups();
+    }
+
+    fn ensure_skin_bones(&mut self, skin_key: (u32, u32), joint_count: usize) {
+        let width = bone_tex_width(joint_count);
+        let needs_new = match self.skin_bones.get(&skin_key) {
+            Some(s) => s.width < width,
+            None => true,
+        };
+        if !needs_new {
+            return;
+        }
+        let prev = self
+            .skin_bones
+            .remove(&skin_key)
+            .map(|s| (s.prev, s.has_history))
+            .unwrap_or_else(|| (Vec::new(), false));
+        let gpu = create_skin_bone_tex(
+            &self.device,
+            &self.bone_bind_layout,
+            width,
+            prev.0,
+            prev.1,
+        );
+        self.skin_bones.insert(skin_key, gpu);
+    }
+
+    fn upload_skin_bones(&mut self, skin_key: (u32, u32), mats: &[Mat4]) {
+        self.ensure_skin_bones(skin_key, mats.len());
+        let Some(gpu) = self.skin_bones.get_mut(&skin_key) else {
+            return;
+        };
+        let width = gpu.width as usize;
+        let mut pixels = vec![[0.0f32; 4]; width * 2];
+        let n = mats.len().min(MAX_BONES);
+        for i in 0..n {
+            let cur = mats[i].to_cols_array_2d();
+            let prev = if gpu.has_history {
+                gpu.prev.get(i).copied().unwrap_or(mats[i])
+            } else {
+                mats[i]
+            }
+            .to_cols_array_2d();
+            for c in 0..4 {
+                pixels[i * 4 + c] = cur[c];
+                pixels[width + i * 4 + c] = prev[c];
+            }
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &gpu.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&pixels),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(gpu.width * 16),
+                rows_per_image: Some(2),
+            },
+            wgpu::Extent3d {
+                width: gpu.width,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+        );
+        gpu.prev.clear();
+        gpu.prev.extend_from_slice(mats);
+        gpu.has_history = true;
     }
 
     fn ensure_shadow_map(&mut self, requested: u32) {
@@ -970,6 +1068,7 @@ impl WgpuVisualizer {
             }),
         );
 
+        let world = scene.world_matrices();
         let mut draws: Vec<(
             (u32, u32),
             (u32, u32),
@@ -980,8 +1079,11 @@ impl WgpuVisualizer {
             [f32; 4],
             [f32; 4],
             [f32; 4],
-            Option<Box<[[[f32; 4]; 4]; MAX_BONES]>>,
+            Option<(u32, u32)>,
         )> = Vec::new();
+        // One palette upload per skin (shared by all mesh prims).
+        let mut skins_to_upload: HashMap<(u32, u32), (crate::Handle<crate::Skin>, crate::Handle<crate::Node>)> =
+            HashMap::new();
         for (h, node) in scene.nodes.iter() {
             if !node.visible {
                 continue;
@@ -1015,82 +1117,58 @@ impl WgpuVisualizer {
                         None,
                     ),
                 };
-            let mut bones = None;
+            let mut skin_key = None;
             if let Some(skin_h) = node.skin {
                 if scene.meshes.get(mesh_h).is_some_and(|m| m.joints.is_some()) {
-                    let mats = scene.joint_matrices(skin_h, h);
                     params[2] = 1.0;
-                    let mut bone_mats = Box::new([[[0.0; 4]; 4]; MAX_BONES]);
-                    bone_mats[0] = Mat4::IDENTITY.to_cols_array_2d();
-                    for (i, m) in mats.iter().take(MAX_BONES).enumerate() {
-                        bone_mats[i] = m.to_cols_array_2d();
-                    }
-                    bones = Some(bone_mats);
+                    let key = skin_h.key();
+                    skins_to_upload.entry(key).or_insert((skin_h, h));
+                    skin_key = Some(key);
                 }
             }
+            let model = world.get(&h.key()).copied().unwrap_or(Mat4::IDENTITY);
             draws.push((
                 h.key(),
                 mesh_key,
                 albedo_key,
                 normal_key,
                 mr_key,
-                scene.world_matrix(h),
+                model,
                 albedo,
                 params,
                 sss,
-                bones,
+                skin_key,
             ));
         }
 
+        for (skin_key, (skin_h, mesh_node)) in &skins_to_upload {
+            let mats = scene.joint_matrices_with_cache(*skin_h, *mesh_node, &world);
+            if mats.is_empty() {
+                continue;
+            }
+            self.upload_skin_bones(*skin_key, &mats);
+        }
+
         self.ensure_object_slots(draws.len() as u64);
-        let mut next_poses: HashMap<(u32, u32), PrevPose> = HashMap::with_capacity(draws.len());
-        for (i, (node_key, _, _, _, _, model, albedo, params, sss, bones)) in
-            draws.iter().enumerate()
-        {
-            let skinned = params[2] > 0.5;
-            let (prev_model, prev_bones) = match self.prev_poses.get(node_key) {
-                Some(p) if self.motion_has_history => (p.model, p.bones.as_deref()),
-                _ => (*model, bones.as_deref()),
+        let mut next_models: HashMap<(u32, u32), Mat4> = HashMap::with_capacity(draws.len());
+        for (i, (node_key, _, _, _, _, model, albedo, params, sss, _)) in draws.iter().enumerate() {
+            let prev_model = match self.prev_models.get(node_key) {
+                Some(m) if self.motion_has_history => *m,
+                _ => *model,
             };
             let base = i as u64 * OBJECT_STRIDE;
-            let header = ObjectHeader {
+            let uniforms = ObjectUniforms {
                 model: model.to_cols_array_2d(),
                 albedo: *albedo,
                 params: *params,
                 sss: *sss,
+                prev_model: prev_model.to_cols_array_2d(),
             };
             self.queue
-                .write_buffer(&self.object_buf, base, bytemuck::bytes_of(&header));
-            self.queue.write_buffer(
-                &self.object_buf,
-                base + OBJECT_PREV_MODEL_OFFSET,
-                bytemuck::bytes_of(&prev_model.to_cols_array_2d()),
-            );
-            if skinned {
-                if let Some(b) = bones.as_deref() {
-                    self.queue.write_buffer(
-                        &self.object_buf,
-                        base + OBJECT_BONES_OFFSET,
-                        bytemuck::bytes_of(b),
-                    );
-                }
-                if let Some(p) = prev_bones.or(bones.as_deref()) {
-                    self.queue.write_buffer(
-                        &self.object_buf,
-                        base + OBJECT_PREV_BONES_OFFSET,
-                        bytemuck::bytes_of(p),
-                    );
-                }
-            }
-            next_poses.insert(
-                *node_key,
-                PrevPose {
-                    model: *model,
-                    bones: bones.clone(),
-                },
-            );
+                .write_buffer(&self.object_buf, base, bytemuck::bytes_of(&uniforms));
+            next_models.insert(*node_key, *model);
         }
-        self.prev_poses = next_poses;
+        self.prev_models = next_models;
         self.prev_view_proj = view_proj;
         self.motion_has_history = true;
 
@@ -1158,11 +1236,16 @@ impl WgpuVisualizer {
             });
             pass.set_pipeline(&self.shadow_pipeline);
             pass.set_bind_group(0, &self.shadow_frame_bind_group, &[]);
-            for (i, (_, mesh_key, _, _, _, _, _, _, _, _)) in draws.iter().enumerate() {
+            for (i, (_, mesh_key, _, _, _, _, _, _, _, skin_key)) in draws.iter().enumerate() {
                 let Some(mesh) = self.meshes.get(mesh_key) else {
                     continue;
                 };
                 pass.set_bind_group(1, &self.shadow_object_bg, &[(i as u32) * OBJECT_STRIDE as u32]);
+                if let Some(s) = skin_key.as_ref().and_then(|k| self.skin_bones.get(k)) {
+                    pass.set_bind_group(2, &s.bind_group, &[]);
+                } else {
+                    pass.set_bind_group(2, &self.identity_bone_bg, &[]);
+                }
                 pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                 pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -1245,7 +1328,7 @@ impl WgpuVisualizer {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.frame_bind_group, &[]);
 
-            for (i, (_, mesh_key, albedo_key, normal_key, mr_key, _, _, _, _, _)) in
+            for (i, (_, mesh_key, albedo_key, normal_key, mr_key, _, _, _, _, skin_key)) in
                 draws.iter().enumerate()
             {
                 let Some(mesh) = self.meshes.get(mesh_key) else {
@@ -1262,6 +1345,11 @@ impl WgpuVisualizer {
                     &self.object_material_bgs[&cache_key]
                 };
                 pass.set_bind_group(1, bg, &[(i as u32) * OBJECT_STRIDE as u32]);
+                if let Some(s) = skin_key.as_ref().and_then(|k| self.skin_bones.get(k)) {
+                    pass.set_bind_group(2, &s.bind_group, &[]);
+                } else {
+                    pass.set_bind_group(2, &self.identity_bone_bg, &[]);
+                }
                 pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                 pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -2026,6 +2114,103 @@ fn object_bind_group(
             },
         ],
     })
+}
+
+fn create_skin_bone_tex(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    width: u32,
+    prev: Vec<Mat4>,
+    has_history: bool,
+) -> GpuSkinBones {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("skin_bones"),
+        size: wgpu::Extent3d {
+            width,
+            height: 2,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("skin_bones_bg"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&view),
+        }],
+    });
+    GpuSkinBones {
+        texture,
+        _view: view,
+        bind_group,
+        width,
+        prev,
+        has_history,
+    }
+}
+
+fn identity_bone_palette(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+) -> (wgpu::Texture, wgpu::BindGroup) {
+    let width = bone_tex_width(1);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("identity_bones"),
+        size: wgpu::Extent3d {
+            width,
+            height: 2,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let id = Mat4::IDENTITY.to_cols_array_2d();
+    let mut pixels = vec![[0.0f32; 4]; width as usize * 2];
+    for c in 0..4 {
+        pixels[c] = id[c];
+        pixels[width as usize + c] = id[c];
+    }
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(&pixels),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 16),
+            rows_per_image: Some(2),
+        },
+        wgpu::Extent3d {
+            width,
+            height: 2,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("identity_bones_bg"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&view),
+        }],
+    });
+    (texture, bind_group)
 }
 
 fn upload_mesh(device: &wgpu::Device, mesh: &Mesh) -> GpuMesh {

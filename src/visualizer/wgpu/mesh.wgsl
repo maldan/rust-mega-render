@@ -28,9 +28,7 @@ struct ObjectUniforms {
     params: vec4<f32>,
     // rgb = scatter tint, w = curvature (0..1)
     sss: vec4<f32>,
-    bones: array<mat4x4<f32>, 128>,
     prev_model: mat4x4<f32>,
-    prev_bones: array<mat4x4<f32>, 128>,
 }
 
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
@@ -47,6 +45,8 @@ struct ObjectUniforms {
 @group(1) @binding(2) var normal_tex: texture_2d<f32>;
 @group(1) @binding(3) var mr_tex: texture_2d<f32>;
 @group(1) @binding(4) var samp: sampler;
+// Per-skin bone palette: width = joints*4 (mat columns), row0 = current, row1 = prev.
+@group(2) @binding(0) var bone_tex: texture_2d<f32>;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -77,24 +77,34 @@ fn identity4() -> mat4x4<f32> {
     );
 }
 
+fn load_bone(index: u32, row: i32) -> mat4x4<f32> {
+    let i = i32(index) * 4;
+    return mat4x4<f32>(
+        textureLoad(bone_tex, vec2(i, row), 0),
+        textureLoad(bone_tex, vec2(i + 1, row), 0),
+        textureLoad(bone_tex, vec2(i + 2, row), 0),
+        textureLoad(bone_tex, vec2(i + 3, row), 0),
+    );
+}
+
 fn skin_matrix(in: VertexInput) -> mat4x4<f32> {
     if object.params.z < 0.5 {
         return identity4();
     }
-    return object.bones[in.joints.x] * in.weights.x
-        + object.bones[in.joints.y] * in.weights.y
-        + object.bones[in.joints.z] * in.weights.z
-        + object.bones[in.joints.w] * in.weights.w;
+    return load_bone(in.joints.x, 0) * in.weights.x
+        + load_bone(in.joints.y, 0) * in.weights.y
+        + load_bone(in.joints.z, 0) * in.weights.z
+        + load_bone(in.joints.w, 0) * in.weights.w;
 }
 
 fn prev_skin_matrix(in: VertexInput) -> mat4x4<f32> {
     if object.params.z < 0.5 {
         return identity4();
     }
-    return object.prev_bones[in.joints.x] * in.weights.x
-        + object.prev_bones[in.joints.y] * in.weights.y
-        + object.prev_bones[in.joints.z] * in.weights.z
-        + object.prev_bones[in.joints.w] * in.weights.w;
+    return load_bone(in.joints.x, 1) * in.weights.x
+        + load_bone(in.joints.y, 1) * in.weights.y
+        + load_bone(in.joints.z, 1) * in.weights.z
+        + load_bone(in.joints.w, 1) * in.weights.w;
 }
 
 fn clip_to_uv(clip: vec4<f32>) -> vec2<f32> {
