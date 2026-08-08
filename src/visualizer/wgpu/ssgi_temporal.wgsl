@@ -1,4 +1,5 @@
-//! Temporal resolve for SSGI — camera-only reprojection + depth rejection.
+//! Temporal resolve for SSGI — camera-only reprojection + depth rejection
+//! + neighborhood variance clamp (AABB) to kill ghosting / fireflies.
 //! LH view (+Z forward), DirectX clip depth.
 //!
 //! History RGB = accumulated GI, A = clip depth of that sample.
@@ -43,6 +44,48 @@ fn world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     return w.xyz / max(w.w, 1e-6);
 }
 
+fn luma(c: vec3<f32>) -> f32 {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+/// Clamp history into a soft neighborhood box (mean ± γ·σ) of the current 3×3.
+fn variance_clamp(hist: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    let dims = vec2<f32>(textureDimensions(current_tex));
+    let texel = 1.0 / max(dims, vec2(1.0));
+
+    var m1 = vec3(0.0);
+    var m2 = vec3(0.0);
+    var n_min = vec3(1e10);
+    var n_max = vec3(-1e10);
+
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let suv = uv + vec2(f32(x), f32(y)) * texel;
+            let s = textureSampleLevel(current_tex, samp, suv, 0.0).rgb;
+            m1 += s;
+            m2 += s * s;
+            n_min = min(n_min, s);
+            n_max = max(n_max, s);
+        }
+    }
+
+    let inv_n = 1.0 / 9.0;
+    let mu = m1 * inv_n;
+    let var_ = max(m2 * inv_n - mu * mu, vec3(0.0));
+    let sigma = sqrt(var_);
+
+    // Slightly generous γ — GI is noisier than TAA color.
+    let gamma = 1.25;
+    var box_min = max(mu - sigma * gamma, n_min);
+    var box_max = min(mu + sigma * gamma, n_max);
+    // Expand a hair so stable dark bounce isn't crushed.
+    let pad = (box_max - box_min) * 0.05 + vec3(0.002);
+    box_min -= pad;
+    box_max += pad;
+
+    return clamp(hist, box_min, box_max);
+}
+
 @fragment
 fn fs(i: VsOut) -> @location(0) vec4<f32> {
     let depth = textureSample(depth_tex, depth_samp, i.uv);
@@ -52,7 +95,6 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
         return vec4(0.0, 0.0, 0.0, depth);
     }
 
-    // Prefer depth from G-buffer; spatial pass also packs it in alpha.
     let cur_gi = current.rgb;
     let out_depth = depth;
 
@@ -85,13 +127,16 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
     let conf = 1.0 - smoothstep(reject * 0.5, reject, depth_err);
     var w_hist = clamp(u.params.x, 0.0, 0.98) * conf;
 
-    // Firefly gate: if current is much brighter than history, trust history.
-    let cur_y = dot(cur_gi, vec3(0.2126, 0.7152, 0.0722));
-    let hist_y = dot(hist.rgb, vec3(0.2126, 0.7152, 0.0722));
+    // Neighborhood variance clamp — kills ghost trails and one-frame fireflies.
+    var hist_gi = variance_clamp(hist.rgb, i.uv);
+
+    // Firefly gate: if current is much brighter than clamped history, trust history.
+    let cur_y = luma(cur_gi);
+    let hist_y = luma(hist_gi);
     if cur_y > hist_y * 3.0 + 0.35 {
         w_hist = max(w_hist, 0.85);
     }
 
-    let gi = mix(cur_gi, hist.rgb, w_hist);
+    let gi = mix(cur_gi, hist_gi, w_hist);
     return vec4(gi, out_depth);
 }

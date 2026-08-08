@@ -97,6 +97,17 @@ struct SsgiUpsampleUniforms {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SsgiAtrousUniforms {
+    texel: [f32; 2],
+    step_size: f32,
+    depth_sigma: f32,
+    normal_sigma: f32,
+    luma_sigma: f32,
+    _pad: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct BlurUniforms {
     direction: [f32; 2],
     depth_sigma: f32,
@@ -228,6 +239,7 @@ pub struct PostFx {
     hiz_down_pipe: wgpu::RenderPipeline,
     ssgi_temporal_pipe: wgpu::RenderPipeline,
     ssgi_upsample_pipe: wgpu::RenderPipeline,
+    ssgi_atrous_pipe: wgpu::RenderPipeline,
     copy_hdr_pipe: wgpu::RenderPipeline,
     blur_pipe: wgpu::RenderPipeline,
     blur_hdr_pipe: wgpu::RenderPipeline,
@@ -254,6 +266,7 @@ pub struct PostFx {
     hiz_down_bgl: wgpu::BindGroupLayout,
     ssgi_temporal_bgl: wgpu::BindGroupLayout,
     ssgi_upsample_bgl: wgpu::BindGroupLayout,
+    ssgi_atrous_bgl: wgpu::BindGroupLayout,
     copy_bgl: wgpu::BindGroupLayout,
     blur_bgl: wgpu::BindGroupLayout,
     bloom_bgl: wgpu::BindGroupLayout,
@@ -273,6 +286,7 @@ pub struct PostFx {
     ssr_ubo: wgpu::Buffer,
     ssgi_temporal_ubo: wgpu::Buffer,
     ssgi_upsample_ubo: wgpu::Buffer,
+    ssgi_atrous_ubo: wgpu::Buffer,
     blur_ubo: wgpu::Buffer,
     bloom_ubo: wgpu::Buffer,
     composite_ubo: wgpu::Buffer,
@@ -348,6 +362,8 @@ impl PostFx {
             device.create_shader_module(wgpu::include_wgsl!("ssgi_temporal.wgsl"));
         let ssgi_upsample_shader =
             device.create_shader_module(wgpu::include_wgsl!("ssgi_upsample.wgsl"));
+        let ssgi_atrous_shader =
+            device.create_shader_module(wgpu::include_wgsl!("ssgi_atrous.wgsl"));
         let copy_shader = device.create_shader_module(wgpu::include_wgsl!("copy.wgsl"));
         let blur_shader = device.create_shader_module(wgpu::include_wgsl!("blur.wgsl"));
         let bloom_shader = device.create_shader_module(wgpu::include_wgsl!("bloom.wgsl"));
@@ -468,6 +484,18 @@ impl PostFx {
                 filter_samp_entry(2),
                 depth_entry(3),
                 nearest_samp_entry(4),
+            ],
+        });
+        let ssgi_atrous_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ssgi_atrous"),
+            entries: &[
+                ubo_entry(0, wgpu::ShaderStages::FRAGMENT),
+                tex_entry(1, true),
+                nearest_samp_entry(2),
+                depth_entry(3),
+                nearest_samp_entry(4),
+                tex_entry(5, true),
+                nearest_samp_entry(6),
             ],
         });
         let copy_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -671,6 +699,15 @@ impl PostFx {
             wgpu::TextureFormat::Rgba16Float,
             None,
         );
+        let ssgi_atrous_pipe = fullscreen_pipe(
+            device,
+            "ssgi_atrous",
+            &ssgi_atrous_bgl,
+            &ssgi_atrous_shader,
+            "fs",
+            wgpu::TextureFormat::Rgba16Float,
+            None,
+        );
         let copy_hdr_pipe = fullscreen_pipe(
             device,
             "copy_hdr",
@@ -856,6 +893,13 @@ impl PostFx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let ssgi_atrous_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ssgi_atrous_ubo"),
+            // 4 à-trous steps × 256-byte aligned slots (avoid overwrite in one encoder).
+            size: 256 * 4,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let blur_ubo = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("blur_ubo"),
             size: std::mem::size_of::<BlurUniforms>() as u64,
@@ -973,6 +1017,7 @@ impl PostFx {
             hiz_down_pipe,
             ssgi_temporal_pipe,
             ssgi_upsample_pipe,
+            ssgi_atrous_pipe,
             copy_hdr_pipe,
             blur_pipe,
             blur_hdr_pipe,
@@ -998,6 +1043,7 @@ impl PostFx {
             hiz_down_bgl,
             ssgi_temporal_bgl,
             ssgi_upsample_bgl,
+            ssgi_atrous_bgl,
             copy_bgl,
             blur_bgl,
             bloom_bgl,
@@ -1016,6 +1062,7 @@ impl PostFx {
             ssr_ubo,
             ssgi_temporal_ubo,
             ssgi_upsample_ubo,
+            ssgi_atrous_ubo,
             blur_ubo,
             bloom_ubo,
             composite_ubo,
@@ -1825,7 +1872,7 @@ impl PostFx {
         );
     }
 
-    /// Spatial SSGI (+ optional temporal + HDR bilateral blur) into the SSGI target.
+    /// Spatial SSGI (+ optional temporal AABB clamp + à-trous denoise) into the SSGI target.
     pub fn generate_ssgi(
         &mut self,
         device: &wgpu::Device,
@@ -1995,31 +2042,33 @@ impl PostFx {
             self.ssgi_has_history = false;
         }
 
-        // Mild bilateral denoise (preserves alpha / depth).
-        self.blur_pass(
-            device,
-            queue,
-            encoder,
-            &self.ssgi.view,
-            &self.ssgi_temp.view,
-            depth,
-            [2.0 / w as f32, 0.0],
-            true,
-            60.0,
-            true,
-        );
-        self.blur_pass(
-            device,
-            queue,
-            encoder,
-            &self.ssgi_temp.view,
-            &self.ssgi.view,
-            depth,
-            [0.0, 2.0 / h as f32],
-            true,
-            60.0,
-            true,
-        );
+        // Edge-aware à-trous denoise (steps 1→2→4→8), ping-pong ssgi ↔ ssgi_temp.
+        // 4 passes (0..3): last is odd → result lands in ssgi.
+        // Prefill all UBO slots before encoding (same buffer must not be rewritten mid-encoder).
+        let texel = [1.0 / w as f32, 1.0 / h as f32];
+        let steps = [1.0_f32, 2.0, 4.0, 8.0];
+        for (i, &step) in steps.iter().enumerate() {
+            queue.write_buffer(
+                &self.ssgi_atrous_ubo,
+                (i * 256) as u64,
+                bytemuck::bytes_of(&SsgiAtrousUniforms {
+                    texel,
+                    step_size: step,
+                    depth_sigma: 80.0,
+                    normal_sigma: 32.0,
+                    luma_sigma: 0.35,
+                    _pad: [0.0; 2],
+                }),
+            );
+        }
+        for (i, _) in steps.iter().enumerate() {
+            let (src, dst) = if i % 2 == 0 {
+                (&self.ssgi.view, &self.ssgi_temp.view)
+            } else {
+                (&self.ssgi_temp.view, &self.ssgi.view)
+            };
+            self.ssgi_atrous_pass(device, encoder, src, dst, depth, normals, i);
+        }
 
         if settings.temporal {
             self.copy_hdr(device, encoder, &self.ssgi.view, &self.ssgi_hist.view);
@@ -2364,6 +2413,67 @@ impl PostFx {
             pass.set_bind_group(0, &bg, &[]);
             pass.draw(0..3, 0..1);
         }
+    }
+
+    fn ssgi_atrous_pass(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        normals: &wgpu::TextureView,
+        slot: usize,
+    ) {
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ssgi_atrous"),
+            layout: &self.ssgi_atrous_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.ssgi_atrous_ubo,
+                        offset: (slot * 256) as u64,
+                        size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<SsgiAtrousUniforms>() as u64,
+                        ),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(normals),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+            ],
+        });
+        let mut pass = color_pass(
+            encoder,
+            "ssgi_atrous",
+            dst,
+            wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+        );
+        pass.set_pipeline(&self.ssgi_atrous_pipe);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     fn copy_hdr(
