@@ -1,6 +1,7 @@
 use super::animation::{sample_quat, sample_vec3, AnimPath, AnimValues, AnimationClip, Animator};
 use super::camera::Camera;
 use super::debug_draw::DebugDraw;
+use super::hud::Hud;
 use super::light::{DirectionalLight, Light};
 use super::material::Material;
 use super::mesh::Mesh;
@@ -33,6 +34,8 @@ pub struct Scene {
     /// Flat ambient (diffuse fill). Always applied; SSGI can dim it via ambient_dim.
     pub ambient: [f32; 3],
     pub debug: DebugDraw,
+    /// Immediate screen-space HUD (built each frame, drawn on top).
+    pub hud: Hud,
     pub(crate) pending_loads: Vec<PendingLoad>,
 }
 
@@ -50,6 +53,7 @@ impl Scene {
             lights: vec![Light::Directional(DirectionalLight::default())],
             ambient: [0.03, 0.03, 0.04],
             debug: DebugDraw::default(),
+            hud: Hud::new(),
             pending_loads: Vec::new(),
         }
     }

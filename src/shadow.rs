@@ -32,7 +32,7 @@ impl Default for ShadowSettings {
         Self {
             filter: ShadowFilter::Pcss,
             map_size: 4096,
-            bias: 0.0005,
+            bias: 0.00001,
             pcss_light_size: 0.35,
             pcss_blocker_samples: 16,
             pcss_filter_samples: 48,

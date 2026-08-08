@@ -24,3 +24,7 @@ winit = "0.30"
 [[example]]
 name = "demo"
 path = "examples/demo.rs"
+
+[[example]]
+name = "hud_demo"
+path = "examples/hud_demo.rs"

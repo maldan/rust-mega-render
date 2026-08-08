@@ -12,11 +12,13 @@ mod post;
 mod ibl_gpu;
 mod frame_targets;
 mod debug_blit;
+mod hud_pass;
 mod sss_lut;
 use ibl_gpu::GpuIbl;
 use post::{PostFx, SsrEnvInput};
 use frame_targets::FrameTargets;
 use debug_blit::DebugBlit;
+use hud_pass::HudPass;
 use sss_lut::GpuSssLut;
 
 const DEFAULT_SHADOW_SIZE: u32 = 2048;
@@ -181,6 +183,7 @@ pub struct WgpuVisualizer {
     textures: HashMap<(u32, u32), GpuTexture>,
     frames: FrameTargets,
     debug_blit: DebugBlit,
+    hud_pass: HudPass,
     debug_view: DebugView,
     post_fx: PostFx,
     post: PostProcessSettings,
@@ -662,6 +665,7 @@ impl WgpuVisualizer {
         let default_mr = upload_texture(device, queue, &Texture::solid_linear(255, 255, 255, 255));
         let post_fx = PostFx::new(device, queue);
         let debug_blit = DebugBlit::new(device, queue);
+        let hud_pass = HudPass::new(device, queue);
 
         let object_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("object_uniforms"),
@@ -729,6 +733,7 @@ impl WgpuVisualizer {
             textures: HashMap::new(),
             frames,
             debug_blit,
+            hud_pass,
             debug_view: DebugView::Final,
             post_fx,
             post: PostProcessSettings::default(),
@@ -1614,6 +1619,16 @@ impl WgpuVisualizer {
                 occlusion_intensity,
             );
         }
+
+        // HUD overlay on present (after post / debug blit).
+        self.hud_pass.draw(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &scene.hud,
+            out,
+            (self.size.0 as f32, self.size.1 as f32),
+        );
 
         self.queue.submit(Some(encoder.finish()));
     }
