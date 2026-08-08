@@ -128,7 +128,7 @@ pub struct SsgiSettings {
     pub radius: f32,
     /// Depth thickness tolerance (world units) for hit acceptance.
     pub thickness: f32,
-    /// Additive strength in composite.
+    /// Additive strength in composite (after albedo × kd).
     pub intensity: f32,
     /// Hemisphere rays per pixel (4..=32).
     pub samples: u32,
@@ -138,6 +138,10 @@ pub struct SsgiSettings {
     pub bias: f32,
     /// How much to reduce constant ambient (0..=1) to avoid double-counting with SSGI.
     pub ambient_dim: f32,
+    /// Irradiance scale in the spatial pass (1 = neutral).
+    pub energy: f32,
+    /// Cheap screen-space 2nd bounce from denoised irradiance (0 = off).
+    pub second_bounce: f32,
     /// Camera-reprojection temporal accumulation.
     pub temporal: bool,
     /// Blend toward history (0 = current only, ~0.9 = stable).
@@ -301,11 +305,13 @@ impl Default for PostProcessSettings {
                 enabled: false,
                 radius: 2.5,
                 thickness: 0.45,
-                intensity: 1.8,
+                intensity: 1.15,
                 samples: 8,
                 max_steps: 8,
                 bias: 0.02,
-                ambient_dim: 0.2,
+                ambient_dim: 0.55,
+                energy: 1.25,
+                second_bounce: 0.35,
                 temporal: true,
                 history: 0.88,
                 depth_reject: 0.025,

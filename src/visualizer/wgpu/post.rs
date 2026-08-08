@@ -61,7 +61,7 @@ struct SsgiUniforms {
     params: [f32; 4],
     full_resolution: [f32; 2],
     hiz_max_mip: f32,
-    _pad: f32,
+    energy: f32,
 }
 
 #[repr(C)]
@@ -108,6 +108,14 @@ struct SsgiAtrousUniforms {
     normal_sigma: f32,
     luma_sigma: f32,
     _pad: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SsgiBounceUniforms {
+    texel: [f32; 2],
+    strength: f32,
+    depth_sigma: f32,
 }
 
 #[repr(C)]
@@ -244,6 +252,7 @@ pub struct PostFx {
     ssgi_temporal_pipe: wgpu::RenderPipeline,
     ssgi_upsample_pipe: wgpu::RenderPipeline,
     ssgi_atrous_pipe: wgpu::RenderPipeline,
+    ssgi_bounce_pipe: wgpu::RenderPipeline,
     copy_hdr_pipe: wgpu::RenderPipeline,
     blur_pipe: wgpu::RenderPipeline,
     blur_hdr_pipe: wgpu::RenderPipeline,
@@ -271,6 +280,7 @@ pub struct PostFx {
     ssgi_temporal_bgl: wgpu::BindGroupLayout,
     ssgi_upsample_bgl: wgpu::BindGroupLayout,
     ssgi_atrous_bgl: wgpu::BindGroupLayout,
+    ssgi_bounce_bgl: wgpu::BindGroupLayout,
     copy_bgl: wgpu::BindGroupLayout,
     blur_bgl: wgpu::BindGroupLayout,
     bloom_bgl: wgpu::BindGroupLayout,
@@ -291,6 +301,7 @@ pub struct PostFx {
     ssgi_temporal_ubo: wgpu::Buffer,
     ssgi_upsample_ubo: wgpu::Buffer,
     ssgi_atrous_ubo: wgpu::Buffer,
+    ssgi_bounce_ubo: wgpu::Buffer,
     blur_ubo: wgpu::Buffer,
     bloom_ubo: wgpu::Buffer,
     composite_ubo: wgpu::Buffer,
@@ -368,6 +379,8 @@ impl PostFx {
             device.create_shader_module(wgpu::include_wgsl!("ssgi_upsample.wgsl"));
         let ssgi_atrous_shader =
             device.create_shader_module(wgpu::include_wgsl!("ssgi_atrous.wgsl"));
+        let ssgi_bounce_shader =
+            device.create_shader_module(wgpu::include_wgsl!("ssgi_bounce.wgsl"));
         let copy_shader = device.create_shader_module(wgpu::include_wgsl!("copy.wgsl"));
         let blur_shader = device.create_shader_module(wgpu::include_wgsl!("blur.wgsl"));
         let bloom_shader = device.create_shader_module(wgpu::include_wgsl!("bloom.wgsl"));
@@ -508,6 +521,18 @@ impl PostFx {
                 nearest_samp_entry(6),
             ],
         });
+        let ssgi_bounce_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ssgi_bounce"),
+            entries: &[
+                ubo_entry(0, wgpu::ShaderStages::FRAGMENT),
+                tex_entry(1, true),
+                nearest_samp_entry(2),
+                depth_entry(3),
+                nearest_samp_entry(4),
+                tex_entry(5, true),
+                nearest_samp_entry(6),
+            ],
+        });
         let copy_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("copy_hdr"),
             entries: &[tex_entry(0, true), nearest_samp_entry(1)],
@@ -543,6 +568,8 @@ impl PostFx {
                 tex_entry(7, true),
                 tex_entry(8, true),
                 tex_entry(9, true),
+                tex_entry(10, true),
+                tex_entry(11, true),
             ],
         });
         let fxaa_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -584,6 +611,8 @@ impl PostFx {
                 tex_entry(4, true),
                 tex_entry(5, true),
                 filter_samp_entry(6),
+                tex_entry(7, true),
+                tex_entry(8, true),
             ],
         });
         let dof_up_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -714,6 +743,15 @@ impl PostFx {
             "ssgi_atrous",
             &ssgi_atrous_bgl,
             &ssgi_atrous_shader,
+            "fs",
+            wgpu::TextureFormat::Rgba16Float,
+            None,
+        );
+        let ssgi_bounce_pipe = fullscreen_pipe(
+            device,
+            "ssgi_bounce",
+            &ssgi_bounce_bgl,
+            &ssgi_bounce_shader,
             "fs",
             wgpu::TextureFormat::Rgba16Float,
             None,
@@ -910,6 +948,12 @@ impl PostFx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let ssgi_bounce_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ssgi_bounce_ubo"),
+            size: std::mem::size_of::<SsgiBounceUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let blur_ubo = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("blur_ubo"),
             size: std::mem::size_of::<BlurUniforms>() as u64,
@@ -1028,6 +1072,7 @@ impl PostFx {
             ssgi_temporal_pipe,
             ssgi_upsample_pipe,
             ssgi_atrous_pipe,
+            ssgi_bounce_pipe,
             copy_hdr_pipe,
             blur_pipe,
             blur_hdr_pipe,
@@ -1054,6 +1099,7 @@ impl PostFx {
             ssgi_temporal_bgl,
             ssgi_upsample_bgl,
             ssgi_atrous_bgl,
+            ssgi_bounce_bgl,
             copy_bgl,
             blur_bgl,
             bloom_bgl,
@@ -1073,6 +1119,7 @@ impl PostFx {
             ssgi_temporal_ubo,
             ssgi_upsample_ubo,
             ssgi_atrous_ubo,
+            ssgi_bounce_ubo,
             blur_ubo,
             bloom_ubo,
             composite_ubo,
@@ -1478,6 +1525,8 @@ impl PostFx {
         encoder: &mut wgpu::CommandEncoder,
         settings: &PostProcessSettings,
         scene_color: &wgpu::TextureView,
+        albedo: &wgpu::TextureView,
+        orm: &wgpu::TextureView,
         light_dir_world: Option<Vec3>,
     ) {
         let ao_i = if settings.ao.enabled {
@@ -1558,6 +1607,14 @@ impl PostFx {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(albedo),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(orm),
                 },
             ],
         });
@@ -1929,7 +1986,7 @@ impl PostFx {
                 ],
                 full_resolution: [fw.max(1) as f32, fh.max(1) as f32],
                 hiz_max_mip: max_mip,
-                _pad: 0.0,
+                energy: settings.energy.max(0.0),
             }),
         );
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2112,6 +2169,65 @@ impl PostFx {
                 (&self.ssgi_temp.view, &self.ssgi.view)
             };
             self.ssgi_atrous_pass(device, encoder, src, dst, depth, normals, i);
+        }
+
+        // Cheap 2nd bounce: gather denoised irradiance into neighbors (albedo still in composite).
+        if settings.second_bounce > 1e-4 {
+            queue.write_buffer(
+                &self.ssgi_bounce_ubo,
+                0,
+                bytemuck::bytes_of(&SsgiBounceUniforms {
+                    texel,
+                    strength: settings.second_bounce.clamp(0.0, 2.0),
+                    depth_sigma: 70.0,
+                }),
+            );
+            let bbg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ssgi_bounce"),
+                layout: &self.ssgi_bounce_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.ssgi_bounce_ubo.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.ssgi.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(depth),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(normals),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                    },
+                ],
+            });
+            {
+                let mut pass = color_pass(
+                    encoder,
+                    "ssgi_bounce",
+                    &self.ssgi_temp.view,
+                    wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                );
+                pass.set_pipeline(&self.ssgi_bounce_pipe);
+                pass.set_bind_group(0, &bbg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            self.copy_hdr(device, encoder, &self.ssgi_temp.view, &self.ssgi.view);
         }
 
         if settings.temporal {
@@ -2824,6 +2940,8 @@ impl PostFx {
                 encoder,
                 settings,
                 scene_color,
+                albedo,
+                orm,
                 light_dir_world,
             );
             let prelit = self.dof_pre.view.clone();
@@ -3065,6 +3183,14 @@ impl PostFx {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: wgpu::BindingResource::TextureView(ssr_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(albedo),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(orm),
                 },
             ],
         });

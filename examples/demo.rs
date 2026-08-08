@@ -245,10 +245,12 @@ impl Demo for MaterialDemo {
         post.ssgi.enabled = true;
         post.ssgi.radius = 2.5;
         post.ssgi.thickness = 0.45;
-        post.ssgi.intensity = 1.8;
+        post.ssgi.intensity = 1.15;
         SsgiQuality::Medium.apply(&mut post.ssgi);
         post.ssgi.bias = 0.02;
-        post.ssgi.ambient_dim = 0.2;
+        post.ssgi.ambient_dim = 0.55;
+        post.ssgi.energy = 1.25;
+        post.ssgi.second_bounce = 0.35;
         post.ssgi.temporal = true;
         post.ssgi.history = 0.88;
         post.ssgi.depth_reject = 0.025;
@@ -432,7 +434,7 @@ impl Demo for MaterialDemo {
                 });
                 ui.collapsing_header("SSGI", |ui| {
                     ui.checkbox("Enabled", &mut post.ssgi.enabled);
-                    ui.label("Screen-space GI: Hi-Z R2 rays + à-trous + velocity temporal.");
+                    ui.label("Screen-space GI: Hi-Z + à-trous + velocity temporal + 2nd bounce.");
                     ui.add_enabled(post.ssgi.enabled, |ui| {
                         let mut q = match (post.ssgi.samples, post.ssgi.max_steps) {
                             (s, t) if s <= 4 && t <= 4 => 0usize,
@@ -451,8 +453,12 @@ impl Demo for MaterialDemo {
                         ui.slider("Radius", &mut post.ssgi.radius, 0.2..=4.0);
                         ui.label("Thickness — допуск по глубине");
                         ui.slider("Thickness", &mut post.ssgi.thickness, 0.02..=1.0);
-                        ui.label("Intensity — сила additive GI");
+                        ui.label("Intensity — сила в composite (× albedo × kd)");
                         ui.slider("Intensity", &mut post.ssgi.intensity, 0.0..=5.0);
+                        ui.label("Energy — масштаб irradiance в spatial pass");
+                        ui.slider("Energy", &mut post.ssgi.energy, 0.25..=3.0);
+                        ui.label("2nd bounce — дешёвый screen-space bleed");
+                        ui.slider("2nd bounce", &mut post.ssgi.second_bounce, 0.0..=1.5);
                         let mut samples = post.ssgi.samples as f32;
                         let mut steps = post.ssgi.max_steps as f32;
                         ui.label("Samples — лучей на пиксель");

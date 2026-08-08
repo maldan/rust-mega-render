@@ -31,6 +31,12 @@ struct PrelitUniforms {
 @group(0) @binding(4) var ssgi_tex: texture_2d<f32>;
 @group(0) @binding(5) var ssr_tex: texture_2d<f32>;
 @group(0) @binding(6) var samp: sampler;
+@group(0) @binding(7) var albedo_tex: texture_2d<f32>;
+@group(0) @binding(8) var orm_tex: texture_2d<f32>;
+
+fn luma(c: vec3<f32>) -> f32 {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
 
 @fragment
 fn fs(i: VsOut) -> @location(0) vec4<f32> {
@@ -46,7 +52,13 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
         color *= mix(1.0, cs, clamp(inten.y, 0.0, 2.0));
     }
     if inten.z > 0.0 {
-        color += textureSampleLevel(ssgi_tex, samp, i.uv, 0.0).rgb * inten.z;
+        let irr = textureSampleLevel(ssgi_tex, samp, i.uv, 0.0).rgb;
+        let albedo = textureSampleLevel(albedo_tex, samp, i.uv, 0.0).rgb;
+        let metallic = textureSampleLevel(orm_tex, samp, i.uv, 0.0).b;
+        var contrib = irr * albedo * (1.0 - metallic) * inten.z;
+        let y = luma(contrib);
+        contrib = contrib / (1.0 + y * 0.35);
+        color += contrib;
     }
     if inten.w > 0.0 {
         color += textureSampleLevel(ssr_tex, samp, i.uv, 0.0).rgb * inten.w;

@@ -49,6 +49,8 @@ struct CompositeUniforms {
 @group(0) @binding(7) var contact_tex: texture_2d<f32>;
 @group(0) @binding(8) var ssgi_tex: texture_2d<f32>;
 @group(0) @binding(9) var ssr_tex: texture_2d<f32>;
+@group(0) @binding(10) var albedo_tex: texture_2d<f32>;
+@group(0) @binding(11) var orm_tex: texture_2d<f32>;
 
 fn world_pos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
@@ -81,6 +83,22 @@ fn hash12(p: vec2<f32>) -> f32 {
     return fract((p3.x + p3.y) * p3.z);
 }
 
+fn luma(c: vec3<f32>) -> f32 {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+/// Irradiance × albedo × kd with soft knee so additive GI doesn't blow highlights.
+fn apply_ssgi(uv: vec2<f32>) -> vec3<f32> {
+    let irr = textureSample(ssgi_tex, samp, uv).rgb;
+    let albedo = textureSample(albedo_tex, samp, uv).rgb;
+    let metallic = textureSample(orm_tex, samp, uv).b;
+    let kd = 1.0 - metallic;
+    var contrib = irr * albedo * kd * u.ssgi_intensity;
+    let y = luma(contrib);
+    contrib = contrib / (1.0 + y * 0.35);
+    return contrib;
+}
+
 @fragment
 fn fs(i: VsOut) -> @location(0) vec4<f32> {
     var color = textureSample(scene_tex, samp, i.uv).rgb;
@@ -95,7 +113,7 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
         color *= mix(1.0, cs, clamp(u.contact_intensity, 0.0, 2.0));
     }
     if u.ssgi_intensity > 0.0 {
-        color += textureSample(ssgi_tex, samp, i.uv).rgb * u.ssgi_intensity;
+        color += apply_ssgi(i.uv);
     }
     if u.ssr_intensity > 0.0 {
         color += textureSample(ssr_tex, samp, i.uv).rgb * u.ssr_intensity;
@@ -123,20 +141,17 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
         color = reinhard_tonemap(color);
     }
 
-    if u.contrast != 1.0 || u.saturation != 1.0 || u.brightness != 0.0 {
-        color = apply_grade(color);
-    }
+    color = apply_grade(color);
 
     if u.vignette_intensity > 0.0 {
-        let d = length(i.uv - vec2(0.5));
-        let soft = max(u.vignette_smoothness, 0.05);
-        let vig = 1.0 - smoothstep(0.35, 0.35 + soft, d);
-        color *= mix(1.0, vig, u.vignette_intensity);
+        let d = distance(i.uv, vec2(0.5));
+        let vig = smoothstep(0.8, u.vignette_smoothness * 0.5, d);
+        color *= 1.0 - u.vignette_intensity * vig;
     }
 
     if u.grain_intensity > 0.0 {
-        let n = hash12(i.uv * vec2(1920.0, 1080.0)) * 2.0 - 1.0;
-        color += n * u.grain_intensity;
+        let g = hash12(i.uv * 2048.0) * 2.0 - 1.0;
+        color += g * u.grain_intensity * 0.04;
     }
 
     return vec4(clamp(color, vec3(0.0), vec3(1.0)), 1.0);

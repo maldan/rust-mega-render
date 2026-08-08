@@ -3,7 +3,7 @@
 //!
 //! Cosine-weighted hemisphere with R2 low-discrepancy directions,
 //! Hi-Z hierarchical march (empty-space skip + binary refine),
-//! gather lit HDR as irradiance → `albedo * (1 - metallic) * boost`.
+//! gather lit HDR as **irradiance** (albedo × kd applied in composite).
 //! Alpha stores clip depth for temporal reprojection.
 
 struct VsOut {
@@ -39,7 +39,8 @@ struct SsgiUniforms {
     full_resolution: vec2<f32>,
     /// Max Hi-Z mip level.
     hiz_max_mip: f32,
-    _pad: f32,
+    /// Irradiance energy scale (1 = neutral).
+    energy: f32,
 }
 
 @group(0) @binding(0) var<uniform> u: SsgiUniforms;
@@ -239,7 +240,6 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
         return vec4(0.0, 0.0, 0.0, depth);
     }
 
-    let albedo = textureSampleLevel(albedo_tex, albedo_samp, i.uv, 0.0).rgb;
     let metallic = textureSampleLevel(orm_tex, orm_samp, i.uv, 0.0).b;
     let kd = 1.0 - metallic;
     if kd < 0.02 {
@@ -322,8 +322,7 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
     }
 
     irradiance /= max(f32(samples), 1.0);
-    let boost = 3.5;
-    var diffuse_gi = irradiance * albedo * kd * boost;
-    diffuse_gi = suppress_firefly(diffuse_gi, hit_max_luma * 1.35);
-    return vec4(max(diffuse_gi, vec3(0.0)), depth);
+    var gi = irradiance * max(u.energy, 0.0);
+    gi = suppress_firefly(gi, hit_max_luma * 1.35);
+    return vec4(max(gi, vec3(0.0)), depth);
 }
