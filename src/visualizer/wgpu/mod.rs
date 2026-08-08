@@ -1429,6 +1429,7 @@ impl WgpuVisualizer {
                     &self.frames.normal_view,
                     &self.frames.albedo_view,
                     &self.frames.orm_view,
+                    &self.frames.velocity_view,
                     proj,
                     view,
                     view_proj,

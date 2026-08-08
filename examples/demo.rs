@@ -469,7 +469,7 @@ impl Demo for MaterialDemo {
                         ui.slider("Ambient dim", &mut post.ssgi.ambient_dim, 0.0..=1.0);
                         ui.separator();
                         ui.checkbox("Temporal", &mut post.ssgi.temporal);
-                        ui.label("Camera reprojection + AABB clamp + depth reject.");
+                        ui.label("Velocity reprojection + AABB clamp + soft depth/normal reject.");
                         ui.add_enabled(post.ssgi.temporal, |ui| {
                             ui.label("History — вес прошлого кадра");
                             ui.slider("History", &mut post.ssgi.history, 0.5..=0.98);

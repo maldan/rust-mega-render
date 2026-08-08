@@ -84,7 +84,10 @@ struct SsrUniforms {
 struct SsgiTemporalUniforms {
     inv_view_proj: [[f32; 4]; 4],
     prev_view_proj: [[f32; 4]; 4],
+    /// x = history, y = depth reject, z = has_history, w = normal reject (1-min_dot)
     params: [f32; 4],
+    resolution: [f32; 2],
+    _pad: [f32; 2],
 }
 
 #[repr(C)]
@@ -474,6 +477,10 @@ impl PostFx {
                 nearest_samp_entry(3),
                 depth_entry(4),
                 nearest_samp_entry(5),
+                tex_entry(6, true),
+                nearest_samp_entry(7),
+                tex_entry(8, true),
+                nearest_samp_entry(9),
             ],
         });
         let ssgi_upsample_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1665,6 +1672,8 @@ impl PostFx {
                         if has_hist { 1.0 } else { 0.0 },
                         0.0,
                     ],
+                    resolution: [size.0.max(1) as f32, size.1.max(1) as f32],
+                    _pad: [0.0; 2],
                 }),
             );
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1884,6 +1893,7 @@ impl PostFx {
         normals: &wgpu::TextureView,
         albedo: &wgpu::TextureView,
         orm: &wgpu::TextureView,
+        velocity: &wgpu::TextureView,
         proj: Mat4,
         view: Mat4,
         view_proj: Mat4,
@@ -1991,8 +2001,11 @@ impl PostFx {
                         settings.history.clamp(0.0, 0.98),
                         settings.depth_reject.max(0.001),
                         if has_hist { 1.0 } else { 0.0 },
-                        0.0,
+                        // Normal reject: 1 - min_dot → ~0.15 allows mild curvature.
+                        0.15,
                     ],
+                    resolution: [fw.max(1) as f32, fh.max(1) as f32],
+                    _pad: [0.0; 2],
                 }),
             );
             let tbg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2021,6 +2034,22 @@ impl PostFx {
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(velocity),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::TextureView(normals),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
                         resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
                     },
                 ],
@@ -2275,6 +2304,8 @@ impl PostFx {
                         if has_hist { 1.0 } else { 0.0 },
                         0.0,
                     ],
+                    resolution: [size.0.max(1) as f32, size.1.max(1) as f32],
+                    _pad: [0.0; 2],
                 }),
             );
             let tbg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2739,6 +2770,7 @@ impl PostFx {
                 normals,
                 albedo,
                 orm,
+                velocity,
                 proj,
                 view,
                 view_proj,
