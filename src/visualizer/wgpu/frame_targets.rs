@@ -1,18 +1,24 @@
 //! Thin G-buffer / frame targets for the wgpu visualizer.
 //!
 //! Layout (foundation for GTAO / SSR / SSGI / …):
-//! - `color`  — HDR lighting (`Rgba16Float`)
-//! - `normal` — world-space normals (`Rgba16Float`, xyz)
-//! - `orm`    — occlusion / roughness / metallic (`Rgba8Unorm`)
-//! - `albedo` — base color (`Rgba8Unorm`, rgb) for diffuse SSGI
-//! - `depth`  — `Depth32Float`
-//! - `present`— internal sRGB present target when no external view is given
+//! - `color`    — HDR lighting (`Rgba16Float`)
+//! - `normal`   — world-space normals (`Rgba16Float`, xyz)
+//! - `velocity` — screen-space motion in pixels (`Rg16Float`); needs device
+//!                `max_color_attachment_bytes_per_sample` ≥ 36 (rgba8 costs 8
+//!                in the WebGPU attachment budget, so the old 4-target G-buffer
+//!                already filled the default 32)
+//! - `orm`      — occlusion / roughness / metallic (`Rgba8Unorm`)
+//! - `albedo`   — base color (`Rgba8Unorm`, rgb) for diffuse SSGI
+//! - `depth`    — `Depth32Float`
+//! - `present`  — internal sRGB present target when no external view is given
 
 pub struct FrameTargets {
     pub _color: wgpu::Texture,
     pub color_view: wgpu::TextureView,
     pub _normal: wgpu::Texture,
     pub normal_view: wgpu::TextureView,
+    pub _velocity: wgpu::Texture,
+    pub velocity_view: wgpu::TextureView,
     pub _orm: wgpu::Texture,
     pub orm_view: wgpu::TextureView,
     pub _albedo: wgpu::Texture,
@@ -60,6 +66,11 @@ impl FrameTargets {
             wgpu::TextureFormat::Rgba16Float,
             wgpu::TextureUsages::empty(),
         );
+        let (velocity, velocity_view) = make_tex(
+            "gbuffer_velocity",
+            wgpu::TextureFormat::Rg16Float,
+            wgpu::TextureUsages::empty(),
+        );
         let (orm, orm_view) = make_tex(
             "gbuffer_orm",
             wgpu::TextureFormat::Rgba8Unorm,
@@ -92,6 +103,8 @@ impl FrameTargets {
             color_view,
             _normal: normal,
             normal_view,
+            _velocity: velocity,
+            velocity_view,
             _orm: orm,
             orm_view,
             _albedo: albedo,
@@ -115,10 +128,11 @@ impl FrameTargets {
     }
 
     /// Color formats for the opaque G-buffer pass (mesh / sky / debug overlay).
-    pub fn color_formats() -> [wgpu::TextureFormat; 4] {
+    pub fn color_formats() -> [wgpu::TextureFormat; 5] {
         [
             wgpu::TextureFormat::Rgba16Float,
             wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureFormat::Rg16Float,
             wgpu::TextureFormat::Rgba8Unorm,
             wgpu::TextureFormat::Rgba8Unorm,
         ]

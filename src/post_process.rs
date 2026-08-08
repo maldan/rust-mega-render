@@ -13,6 +13,26 @@ pub struct PostProcessSettings {
     pub fxaa: FxaaSettings,
     pub fog: FogSettings,
     pub dof: DofSettings,
+    pub motion_blur: MotionBlurSettings,
+}
+
+/// Screen-space motion blur from object / skin / camera velocity.
+#[derive(Clone, Debug)]
+pub struct MotionBlurSettings {
+    pub enabled: bool,
+    /// Extra artistic scale on top of shutter (1 = physical).
+    pub intensity: f32,
+    /// Hard clamp on blur radius in pixels.
+    pub max_blur_px: f32,
+    /// Gather taps along the streak (4..=24).
+    pub samples: u32,
+    /// Full-res velocity dilate radius in pixels (1..=3). Softens silhouettes only.
+    pub dilate_radius: u32,
+    /// Soft closer-surface reject width in clip depth.
+    pub depth_sigma: f32,
+    /// Exposure time in seconds. Velocity is scaled by `shutter / frame_dt`
+    /// so blur stays visible at high FPS (film ≈ 1/48..=1/24).
+    pub shutter: f32,
 }
 
 /// Equirect env reflections + skybox (no heavy IBL bake).
@@ -306,6 +326,15 @@ impl Default for PostProcessSettings {
                 history: 0.9,
                 depth_reject: 0.03,
             },
+            motion_blur: MotionBlurSettings {
+                enabled: false,
+                intensity: 1.0,
+                max_blur_px: 64.0,
+                samples: 16,
+                dilate_radius: 2,
+                depth_sigma: 0.02,
+                shutter: 1.0 / 24.0,
+            },
         }
     }
 }
@@ -324,5 +353,6 @@ impl PostProcessSettings {
             || self.fxaa.enabled
             || self.fog.enabled
             || self.dof.enabled
+            || self.motion_blur.enabled
     }
 }

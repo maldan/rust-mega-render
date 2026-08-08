@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Instant;
 use wgpu::util::DeviceExt;
 
 mod post;
@@ -81,12 +82,17 @@ struct FrameUniforms {
     /// x = constant-ambient scale, y = env yaw (radians)
     gi: [f32; 4],
     lights: [GpuLight; MAX_LIGHTS],
+    prev_view_proj: [[f32; 4]; 4],
+    /// xy = framebuffer pixels, zw unused
+    resolution: [f32; 4],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SkyUniforms {
     inv_view_proj: [[f32; 4]; 4],
+    prev_view_proj: [[f32; 4]; 4],
+    /// x = intensity, y = yaw, zw = resolution
     params: [f32; 4],
 }
 
@@ -106,6 +112,13 @@ struct ObjectUniforms {
     /// rgb scatter tint, w = curvature
     sss: [f32; 4],
     bones: [[[f32; 4]; 4]; MAX_BONES],
+    prev_model: [[f32; 4]; 4],
+    prev_bones: [[[f32; 4]; 4]; MAX_BONES],
+}
+
+struct PrevPose {
+    model: Mat4,
+    bones: [[[f32; 4]; 4]; MAX_BONES],
 }
 
 struct GpuMesh {
@@ -124,7 +137,7 @@ struct GpuTexture {
 pub struct WgpuVisualizer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    /// MRT HDR mesh pipeline — 4 color targets (color / normal / orm / albedo).
+    /// MRT HDR mesh pipeline — 5 color targets (color / normal / orm / albedo / velocity).
     pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
@@ -166,6 +179,10 @@ pub struct WgpuVisualizer {
     shadow_view: wgpu::TextureView,
     shadow_map_size: u32,
     size: (u32, u32),
+    prev_poses: HashMap<(u32, u32), PrevPose>,
+    prev_view_proj: Mat4,
+    motion_has_history: bool,
+    last_frame: Instant,
 }
 
 impl WgpuVisualizer {
@@ -646,6 +663,10 @@ impl WgpuVisualizer {
             shadow_view,
             shadow_map_size: DEFAULT_SHADOW_SIZE,
             size: (1, 1),
+            prev_poses: HashMap::new(),
+            prev_view_proj: Mat4::IDENTITY,
+            motion_has_history: false,
+            last_frame: Instant::now(),
         }
     }
 
@@ -749,6 +770,7 @@ impl WgpuVisualizer {
         self.size = (w, h);
         self.frames.resize(&self.device, w, h);
         self.post_fx.resize(&self.device, w, h);
+        self.motion_has_history = false;
         true
     }
 
@@ -784,6 +806,9 @@ impl WgpuVisualizer {
 
         let eye = scene.camera.eye;
         let view_proj = scene.camera.view_proj(aspect);
+        let now = Instant::now();
+        let frame_dt = (now - self.last_frame).as_secs_f32().clamp(1.0 / 240.0, 0.05);
+        self.last_frame = now;
 
         let ambient_gi = if self.post.ssgi.enabled {
             (1.0 - self.post.ssgi.ambient_dim.clamp(0.0, 1.0)).max(0.0)
@@ -797,6 +822,11 @@ impl WgpuVisualizer {
         let env_intensity = self.post.env.intensity;
 
         // Always output linear HDR into the G-buffer.
+        let prev_vp = if self.motion_has_history {
+            self.prev_view_proj
+        } else {
+            view_proj
+        };
         self.queue.write_buffer(
             &self.frame_uniform_buf,
             0,
@@ -825,6 +855,8 @@ impl WgpuVisualizer {
                 ],
                 gi: [ambient_gi, env_rot, 0.0, 0.0],
                 lights: gpu_lights,
+                prev_view_proj: prev_vp.to_cols_array_2d(),
+                resolution: [self.size.0 as f32, self.size.1 as f32, 0.0, 0.0],
             }),
         );
         self.queue.write_buffer(
@@ -845,6 +877,7 @@ impl WgpuVisualizer {
         );
 
         let mut draws: Vec<(
+            (u32, u32),
             (u32, u32),
             Option<(u32, u32)>,
             Option<(u32, u32)>,
@@ -900,6 +933,7 @@ impl WgpuVisualizer {
                 }
             }
             draws.push((
+                h.key(),
                 mesh_key,
                 albedo_key,
                 normal_key,
@@ -918,17 +952,36 @@ impl WgpuVisualizer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        for (i, (_, _, _, _, model, albedo, params, sss, bones)) in draws.iter().enumerate() {
+        let mut next_poses: HashMap<(u32, u32), PrevPose> = HashMap::with_capacity(draws.len());
+        for (i, (node_key, _, _, _, _, model, albedo, params, sss, bones)) in
+            draws.iter().enumerate()
+        {
+            let (prev_model, prev_bones) = match self.prev_poses.get(node_key) {
+                Some(p) if self.motion_has_history => (p.model, p.bones),
+                _ => (*model, *bones),
+            };
             let data = ObjectUniforms {
                 model: model.to_cols_array_2d(),
                 albedo: *albedo,
                 params: *params,
                 sss: *sss,
                 bones: *bones,
+                prev_model: prev_model.to_cols_array_2d(),
+                prev_bones,
             };
             self.queue
                 .write_buffer(&object_buf, i as u64 * OBJECT_STRIDE, bytemuck::bytes_of(&data));
+            next_poses.insert(
+                *node_key,
+                PrevPose {
+                    model: *model,
+                    bones: *bones,
+                },
+            );
         }
+        self.prev_poses = next_poses;
+        self.prev_view_proj = view_proj;
+        self.motion_has_history = true;
 
         let shadow_object_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -986,7 +1039,7 @@ impl WgpuVisualizer {
             });
             pass.set_pipeline(&self.shadow_pipeline);
             pass.set_bind_group(0, &self.shadow_frame_bind_group, &[]);
-            for (i, (mesh_key, _, _, _, _, _, _, _, _)) in draws.iter().enumerate() {
+            for (i, (_, mesh_key, _, _, _, _, _, _, _, _)) in draws.iter().enumerate() {
                 let Some(mesh) = self.meshes.get(mesh_key) else {
                     continue;
                 };
@@ -1027,7 +1080,17 @@ impl WgpuVisualizer {
                             store: wgpu::StoreOp::Store,
                         },
                     }),
-                    // color2: ORM (clear to white = full roughness / occlusion)
+                    // color2: velocity in pixels (clear to zero)
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.frames.velocity_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    // color3: ORM (clear to white = full roughness / occlusion)
                     Some(wgpu::RenderPassColorAttachment {
                         view: &self.frames.orm_view,
                         resolve_target: None,
@@ -1037,7 +1100,7 @@ impl WgpuVisualizer {
                             store: wgpu::StoreOp::Store,
                         },
                     }),
-                    // color3: albedo (clear to black)
+                    // color4: albedo (clear to black)
                     Some(wgpu::RenderPassColorAttachment {
                         view: &self.frames.albedo_view,
                         resolve_target: None,
@@ -1063,7 +1126,7 @@ impl WgpuVisualizer {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.frame_bind_group, &[]);
 
-            for (i, (mesh_key, albedo_key, normal_key, mr_key, _, _, _, _, _)) in
+            for (i, (_, mesh_key, albedo_key, normal_key, mr_key, _, _, _, _, _)) in
                 draws.iter().enumerate()
             {
                 let Some(mesh) = self.meshes.get(mesh_key) else {
@@ -1151,7 +1214,13 @@ impl WgpuVisualizer {
                     0,
                     bytemuck::bytes_of(&SkyUniforms {
                         inv_view_proj: inv_view_proj.to_cols_array_2d(),
-                        params: [env_intensity, env_rot, 0.0, 0.0],
+                        prev_view_proj: prev_vp.to_cols_array_2d(),
+                        params: [
+                            env_intensity,
+                            env_rot,
+                            self.size.0 as f32,
+                            self.size.1 as f32,
+                        ],
                     }),
                 );
                 pass.set_pipeline(&self.sky_pipeline);
@@ -1201,6 +1270,7 @@ impl WgpuVisualizer {
                 &self.frames.normal_view,
                 &self.frames.albedo_view,
                 &self.frames.orm_view,
+                &self.frames.velocity_view,
                 out,
                 proj,
                 view,
@@ -1211,6 +1281,7 @@ impl WgpuVisualizer {
                 light_dir,
                 &env,
                 self.size,
+                frame_dt,
             );
         } else {
             let view = glam::camera::lh::view::look_at_mat4(
@@ -1327,6 +1398,8 @@ impl WgpuVisualizer {
                 Some(self.post_fx.dof_view())
             } else if self.debug_view == DebugView::Albedo {
                 Some(&self.frames.albedo_view)
+            } else if self.debug_view == DebugView::Velocity {
+                Some(&self.frames.velocity_view)
             } else {
                 None
             };
@@ -1335,6 +1408,8 @@ impl WgpuVisualizer {
                 DebugView::ContactShadow => self.post.contact_shadow.intensity,
                 DebugView::Ssgi => self.post.ssgi.intensity,
                 DebugView::Ssr => self.post.ssr.intensity,
+                // Velocity display scale in pixels (matches typical max_blur).
+                DebugView::Velocity => 40.0,
                 _ => 1.0,
             };
             self.debug_blit.blit(
@@ -1647,7 +1722,7 @@ fn make_sky_bind_group(
     })
 }
 
-/// Sky pipeline targeting the G-buffer MRT (4 color targets).
+/// Sky pipeline targeting the G-buffer MRT (5 color targets).
 fn make_sky_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -1684,7 +1759,7 @@ fn make_sky_pipeline(
     })
 }
 
-/// Mesh pipeline targeting the G-buffer MRT (4 color targets).
+/// Mesh pipeline targeting the G-buffer MRT (5 color targets).
 fn mesh_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -1723,8 +1798,8 @@ fn mesh_pipeline(
     })
 }
 
-/// Debug line/point pipeline targeting the G-buffer MRT (4 color targets).
-/// Alpha blend on color0; no writes to normal/ORM/albedo targets.
+/// Debug line/point pipeline targeting the G-buffer MRT (5 color targets).
+/// Alpha blend on color0; no writes to normal/ORM/albedo/velocity targets.
 fn debug_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -1768,9 +1843,9 @@ fn debug_pipeline(
 }
 
 fn gbuffer_targets(
-    formats: &[wgpu::TextureFormat; 4],
+    formats: &[wgpu::TextureFormat; 5],
     debug_overlay: bool,
-) -> [Option<wgpu::ColorTargetState>; 4] {
+) -> [Option<wgpu::ColorTargetState>; 5] {
     let side_mask = if debug_overlay {
         wgpu::ColorWrites::empty()
     } else {
@@ -1799,6 +1874,11 @@ fn gbuffer_targets(
         }),
         Some(wgpu::ColorTargetState {
             format: formats[3],
+            blend: None,
+            write_mask: side_mask,
+        }),
+        Some(wgpu::ColorTargetState {
+            format: formats[4],
             blend: None,
             write_mask: side_mask,
         }),

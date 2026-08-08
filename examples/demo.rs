@@ -271,6 +271,13 @@ impl Demo for MaterialDemo {
         post.dof.temporal = true;
         post.dof.history = 0.9;
         post.dof.depth_reject = 0.03;
+        post.motion_blur.enabled = true;
+        post.motion_blur.intensity = 1.0;
+        post.motion_blur.max_blur_px = 64.0;
+        post.motion_blur.samples = 16;
+        post.motion_blur.dilate_radius = 2;
+        post.motion_blur.depth_sigma = 0.02;
+        post.motion_blur.shutter = 1.0 / 24.0;
         post.tonemap.enabled = true;
         post.tonemap.aces = true;
         post.tonemap.exposure = 1.4;
@@ -550,6 +557,33 @@ impl Demo for MaterialDemo {
                             ui.label("Depth reject — порог disocclusion");
                             ui.slider("Depth reject", &mut post.dof.depth_reject, 0.005..=0.1);
                         });
+                    });
+                });
+                ui.collapsing_header("Motion Blur", |ui| {
+                    ui.checkbox("Enabled", &mut post.motion_blur.enabled);
+                    ui.label("Shutter масштабирует velocity под FPS. Debug → Velocity.");
+                    ui.add_enabled(post.motion_blur.enabled, |ui| {
+                        ui.label("Intensity — доп. сила");
+                        ui.slider("Intensity", &mut post.motion_blur.intensity, 0.0..=3.0);
+                        let mut shutter_ms = post.motion_blur.shutter * 1000.0;
+                        ui.label("Shutter — экспозиция (ms), кино ~42ms");
+                        if ui.slider("Shutter ms", &mut shutter_ms, 4.0..=80.0).changed() {
+                            post.motion_blur.shutter = shutter_ms / 1000.0;
+                        }
+                        ui.label("Max blur — clamp в пикселях");
+                        ui.slider("Max blur", &mut post.motion_blur.max_blur_px, 8.0..=128.0);
+                        let mut samples = post.motion_blur.samples as f32;
+                        ui.label("Samples — тапов gather");
+                        if ui.slider("Samples", &mut samples, 4.0..=24.0).changed() {
+                            post.motion_blur.samples = samples.round() as u32;
+                        }
+                        let mut dilate = post.motion_blur.dilate_radius as f32;
+                        ui.label("Dilate — силуэт (px)");
+                        if ui.slider("Dilate", &mut dilate, 1.0..=3.0).changed() {
+                            post.motion_blur.dilate_radius = dilate.round() as u32;
+                        }
+                        ui.label("Depth sigma — reject ближнего плана");
+                        ui.slider("Depth sigma", &mut post.motion_blur.depth_sigma, 0.005..=0.1);
                     });
                 });
                 ui.collapsing_header("Tonemap", |ui| {

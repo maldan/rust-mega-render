@@ -98,6 +98,15 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
         c = tonemap_reinhard(c);
         return vec4(c, 1.0);
     }
+    if mode == 13u {
+        // Velocity: encode direction in RG, magnitude as brightness.
+        // ao_params.x = scale (pixels → display), default ~1/40.
+        let v = textureSampleLevel(ao_tex, samp, i.uv, 0.0).xy;
+        let scale = max(u.ao_params.x, 1.0);
+        let enc = v / scale * 0.5 + 0.5;
+        let mag = saturate(length(v) / scale);
+        return vec4(enc, mag, 1.0);
+    }
     // AO (6) / Contact shadow (7) — intensity matches Final composite.
     let ao = textureSampleLevel(ao_tex, samp, i.uv, 0.0).r;
     let intensity = clamp(u.ao_params.x, 0.0, 2.0);

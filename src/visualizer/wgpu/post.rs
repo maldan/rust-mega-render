@@ -1,6 +1,6 @@
 use crate::{
-    AoMethod, AoSettings, ContactShadowSettings, DofSettings, PostProcessSettings, SsgiSettings,
-    SsrSettings,
+    AoMethod, AoSettings, ContactShadowSettings, DofSettings, MotionBlurSettings,
+    PostProcessSettings, SsgiSettings, SsrSettings,
 };
 use glam::{Mat4, Vec3};
 
@@ -176,6 +176,19 @@ struct DofUpUniforms {
     _pad: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MbDilateUniforms {
+    params: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MbGatherUniforms {
+    params: [f32; 4],
+    gather: [f32; 4],
+}
+
 struct Rt {
     _tex: wgpu::Texture,
     view: wgpu::TextureView,
@@ -228,6 +241,8 @@ pub struct PostFx {
     dof_temporal_pipe: wgpu::RenderPipeline,
     dof_prelit_pipe: wgpu::RenderPipeline,
     dof_up_pipe: wgpu::RenderPipeline,
+    mb_dilate_pipe: wgpu::RenderPipeline,
+    mb_gather_pipe: wgpu::RenderPipeline,
 
     ssao_bgl: wgpu::BindGroupLayout,
     gtao_bgl: wgpu::BindGroupLayout,
@@ -248,6 +263,8 @@ pub struct PostFx {
     dof_temporal_bgl: wgpu::BindGroupLayout,
     dof_prelit_bgl: wgpu::BindGroupLayout,
     dof_up_bgl: wgpu::BindGroupLayout,
+    mb_dilate_bgl: wgpu::BindGroupLayout,
+    mb_gather_bgl: wgpu::BindGroupLayout,
 
     ssao_ubo: wgpu::Buffer,
     gtao_ubo: wgpu::Buffer,
@@ -263,6 +280,8 @@ pub struct PostFx {
     dof_ubo: wgpu::Buffer,
     dof_prelit_ubo: wgpu::Buffer,
     dof_up_ubo: wgpu::Buffer,
+    mb_dilate_ubo: wgpu::Buffer,
+    mb_gather_ubo: wgpu::Buffer,
 
     kernel: [[f32; 4]; SSAO_KERNEL],
     noise_view: wgpu::TextureView,
@@ -291,6 +310,8 @@ pub struct PostFx {
     dof_half: Rt,
     dof_half_temp: Rt,
     dof_half_hist: Rt,
+    mb_dilate: Rt,
+    mb: Rt,
     white_view: wgpu::TextureView,
     _white: wgpu::Texture,
     black_view: wgpu::TextureView,
@@ -308,6 +329,7 @@ pub struct PostFx {
     dof_prev_focus: f32,
     dof_prev_fstop: f32,
     dof_prev_scale: f32,
+    mb_frame: u32,
 }
 
 impl PostFx {
@@ -336,6 +358,8 @@ impl PostFx {
         let dof_up_shader = device.create_shader_module(wgpu::include_wgsl!("dof_up.wgsl"));
         let dof_temporal_shader =
             device.create_shader_module(wgpu::include_wgsl!("dof_temporal.wgsl"));
+        let mb_dilate_shader = device.create_shader_module(wgpu::include_wgsl!("mb_dilate.wgsl"));
+        let mb_gather_shader = device.create_shader_module(wgpu::include_wgsl!("mb_gather.wgsl"));
 
         let ssao_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ssao"),
@@ -533,6 +557,27 @@ impl PostFx {
                 filter_samp_entry(3),
                 depth_entry(4),
                 nearest_samp_entry(5),
+            ],
+        });
+        let mb_dilate_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mb_dilate"),
+            entries: &[
+                ubo_entry(0, wgpu::ShaderStages::FRAGMENT),
+                tex_entry(1, true),
+                nearest_samp_entry(2),
+            ],
+        });
+        let mb_gather_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mb_gather"),
+            entries: &[
+                ubo_entry(0, wgpu::ShaderStages::FRAGMENT),
+                tex_entry(1, true),
+                filter_samp_entry(2),
+                tex_entry(3, true),
+                tex_entry(4, true),
+                nearest_samp_entry(5),
+                depth_entry(6),
+                nearest_samp_entry(7),
             ],
         });
 
@@ -750,6 +795,24 @@ impl PostFx {
             wgpu::TextureFormat::Rgba16Float,
             None,
         );
+        let mb_dilate_pipe = fullscreen_pipe(
+            device,
+            "mb_dilate",
+            &mb_dilate_bgl,
+            &mb_dilate_shader,
+            "fs",
+            wgpu::TextureFormat::Rg16Float,
+            None,
+        );
+        let mb_gather_pipe = fullscreen_pipe(
+            device,
+            "mb_gather",
+            &mb_gather_bgl,
+            &mb_gather_shader,
+            "fs",
+            wgpu::TextureFormat::Rgba16Float,
+            None,
+        );
 
         let ssao_ubo = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ssao_ubo"),
@@ -835,6 +898,18 @@ impl PostFx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let mb_dilate_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mb_dilate_ubo"),
+            size: std::mem::size_of::<MbDilateUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mb_gather_ubo = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mb_gather_ubo"),
+            size: std::mem::size_of::<MbGatherUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let kernel = make_kernel();
         let (noise, noise_view) = make_noise(device, queue);
@@ -884,6 +959,8 @@ impl PostFx {
             make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "dof_half_temp");
         let dof_half_hist =
             make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "dof_half_hist");
+        let mb_dilate = make_rt(device, 1, 1, wgpu::TextureFormat::Rg16Float, "mb_dilate");
+        let mb = make_rt(device, 1, 1, wgpu::TextureFormat::Rgba16Float, "mb");
 
         Self {
             ssao_pipe,
@@ -909,6 +986,8 @@ impl PostFx {
             dof_temporal_pipe,
             dof_prelit_pipe,
             dof_up_pipe,
+            mb_dilate_pipe,
+            mb_gather_pipe,
             ssao_bgl,
             gtao_bgl,
             contact_bgl,
@@ -928,6 +1007,8 @@ impl PostFx {
             dof_temporal_bgl,
             dof_prelit_bgl,
             dof_up_bgl,
+            mb_dilate_bgl,
+            mb_gather_bgl,
             ssao_ubo,
             gtao_ubo,
             contact_ubo,
@@ -942,6 +1023,8 @@ impl PostFx {
             dof_ubo,
             dof_prelit_ubo,
             dof_up_ubo,
+            mb_dilate_ubo,
+            mb_gather_ubo,
             kernel,
             noise_view,
             _noise: noise,
@@ -968,6 +1051,8 @@ impl PostFx {
             dof_half,
             dof_half_temp,
             dof_half_hist,
+            mb_dilate,
+            mb,
             white_view,
             _white: white,
             black_view,
@@ -984,6 +1069,7 @@ impl PostFx {
             dof_prev_focus: -1.0,
             dof_prev_fstop: -1.0,
             dof_prev_scale: -1.0,
+            mb_frame: 0,
         }
     }
 
@@ -1005,6 +1091,8 @@ impl PostFx {
             self.dof_hist = make_rt(device, w, h, wgpu::TextureFormat::Rgba16Float, "dof_hist");
             self.dof_pre = make_rt(device, w, h, wgpu::TextureFormat::Rgba16Float, "dof_pre");
             self.dof_has_history = false;
+            self.mb = make_rt(device, w, h, wgpu::TextureFormat::Rgba16Float, "mb");
+            self.mb_dilate = make_rt(device, w, h, wgpu::TextureFormat::Rg16Float, "mb_dilate");
             self.composite_temp =
                 make_rt(device, w, h, wgpu::TextureFormat::Rgba8UnormSrgb, "composite_temp");
         }
@@ -1072,6 +1160,150 @@ impl PostFx {
     /// DOF CoC debug (near/far). Valid after [`Self::generate_dof_coc`].
     pub fn dof_coc_view(&self) -> &wgpu::TextureView {
         &self.dof_temp.view
+    }
+
+    /// Motion blur HDR result. Valid after [`Self::generate_motion_blur`].
+    pub fn mb_view(&self) -> &wgpu::TextureView {
+        &self.mb.view
+    }
+
+    /// Dilate velocity → directional gather into `mb`.
+    pub fn generate_motion_blur(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        settings: &MotionBlurSettings,
+        color: &wgpu::TextureView,
+        velocity: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        size: (u32, u32),
+        frame_dt: f32,
+    ) {
+        let (w, h) = size;
+        if self.mb_dilate.size != (w, h) {
+            self.mb_dilate = make_rt(device, w, h, wgpu::TextureFormat::Rg16Float, "mb_dilate");
+        }
+        if self.mb.size != (w, h) {
+            self.mb = make_rt(device, w, h, wgpu::TextureFormat::Rgba16Float, "mb");
+        }
+
+        // Map per-frame velocity → shutter exposure (keeps blur strong at high FPS).
+        let dt = frame_dt.clamp(1.0 / 240.0, 0.05);
+        let shutter_scale = (settings.shutter.max(1e-4) / dt).clamp(0.5, 12.0);
+        let strength = settings.intensity.max(0.0) * shutter_scale;
+
+        queue.write_buffer(
+            &self.mb_dilate_ubo,
+            0,
+            bytemuck::bytes_of(&MbDilateUniforms {
+                params: [
+                    w as f32,
+                    h as f32,
+                    settings.dilate_radius.clamp(1, 3) as f32,
+                    0.0,
+                ],
+            }),
+        );
+
+        let dilate_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mb_dilate"),
+            layout: &self.mb_dilate_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.mb_dilate_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(velocity),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+            ],
+        });
+        {
+            let mut pass = color_pass(
+                encoder,
+                "mb_dilate",
+                &self.mb_dilate.view,
+                wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+            );
+            pass.set_pipeline(&self.mb_dilate_pipe);
+            pass.set_bind_group(0, &dilate_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        queue.write_buffer(
+            &self.mb_gather_ubo,
+            0,
+            bytemuck::bytes_of(&MbGatherUniforms {
+                params: [
+                    w as f32,
+                    h as f32,
+                    strength,
+                    settings.max_blur_px.max(1.0),
+                ],
+                gather: [
+                    settings.samples.clamp(4, 24) as f32,
+                    settings.depth_sigma.max(1e-4),
+                    self.mb_frame as f32,
+                    0.0,
+                ],
+            }),
+        );
+        let gather_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mb_gather"),
+            layout: &self.mb_gather_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.mb_gather_ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(color),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(velocity),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&self.mb_dilate.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                },
+            ],
+        });
+        {
+            let mut pass = color_pass(
+                encoder,
+                "mb_gather",
+                &self.mb.view,
+                wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+            );
+            pass.set_pipeline(&self.mb_gather_pipe);
+            pass.set_bind_group(0, &gather_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.mb_frame = self.mb_frame.wrapping_add(1);
     }
 
     fn write_dof_uniforms(
@@ -2341,6 +2573,7 @@ impl PostFx {
         normals: &wgpu::TextureView,
         albedo: &wgpu::TextureView,
         orm: &wgpu::TextureView,
+        velocity: &wgpu::TextureView,
         target: &wgpu::TextureView,
         proj: Mat4,
         view: Mat4,
@@ -2351,6 +2584,7 @@ impl PostFx {
         light_dir_world: Option<Vec3>,
         env: &SsrEnvInput<'_>,
         size: (u32, u32),
+        frame_dt: f32,
     ) {
         let (w, h) = size;
         if settings.ao.enabled {
@@ -2453,6 +2687,24 @@ impl PostFx {
         } else {
             self.dof_has_history = false;
             scene_color
+        };
+
+        let lit_color = if settings.motion_blur.enabled {
+            let src = (*lit_color).clone();
+            self.generate_motion_blur(
+                device,
+                queue,
+                encoder,
+                &settings.motion_blur,
+                &src,
+                velocity,
+                depth,
+                size,
+                frame_dt,
+            );
+            &self.mb.view
+        } else {
+            lit_color
         };
 
         let dof_baked = settings.dof.enabled;

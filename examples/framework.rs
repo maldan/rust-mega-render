@@ -426,15 +426,27 @@ impl<D: Demo> Host<D> {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
-            apply_limit_buckets: true,
+            // Need real hardware limits — buckets pin color-attachment bytes to 32,
+            // which is already full for our 4-target G-buffer before velocity.
+            apply_limit_buckets: false,
         }))
         .expect("no suitable GPU adapter");
+
+        let mut limits = wgpu::Limits::default();
+        // G-buffer is already 2×rgba16float + 2×rgba8unorm = 32 bytes/sample
+        // (rgba8 counts as 8 in the WebGPU table). Velocity (rg16float = 4) needs ≥36.
+        let adapter_bytes = adapter.limits().max_color_attachment_bytes_per_sample;
+        assert!(
+            adapter_bytes >= 36,
+            "GPU max_color_attachment_bytes_per_sample={adapter_bytes}, need ≥36 for velocity MRT"
+        );
+        limits.max_color_attachment_bytes_per_sample = adapter_bytes.min(64);
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("mega-render demo"),
             required_features: wgpu::Features::empty(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            required_limits: wgpu::Limits::default(),
+            required_limits: limits,
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
         }))

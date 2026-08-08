@@ -33,6 +33,8 @@ pub enum DebugView {
     DofCoc,
     /// DOF HDR result (expose + Reinhard preview).
     Dof,
+    /// Screen-space velocity (R=vx, G=vy magnitude preview).
+    Velocity,
 }
 
 impl DebugView {
@@ -50,6 +52,7 @@ impl DebugView {
         DebugView::Albedo,
         DebugView::DofCoc,
         DebugView::Dof,
+        DebugView::Velocity,
     ];
 
     pub fn label(self) -> &'static str {
@@ -67,6 +70,7 @@ impl DebugView {
             DebugView::Albedo => "Albedo",
             DebugView::DofCoc => "DOF CoC",
             DebugView::Dof => "DOF",
+            DebugView::Velocity => "Velocity",
         }
     }
 
@@ -85,6 +89,7 @@ impl DebugView {
             DebugView::Albedo => 10,
             DebugView::DofCoc => 11,
             DebugView::Dof => 12,
+            DebugView::Velocity => 13,
         }
     }
 }

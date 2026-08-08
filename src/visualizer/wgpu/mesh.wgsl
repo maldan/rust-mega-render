@@ -10,6 +10,9 @@ struct FrameUniforms {
     // x = constant-ambient scale, y = env yaw rotation (radians)
     gi: vec4<f32>,
     lights: array<GpuLight, 8>,
+    prev_view_proj: mat4x4<f32>,
+    // xy = framebuffer size in pixels (for velocity)
+    resolution: vec4<f32>,
 }
 
 struct GpuLight {
@@ -26,6 +29,8 @@ struct ObjectUniforms {
     // rgb = scatter tint, w = curvature (0..1)
     sss: vec4<f32>,
     bones: array<mat4x4<f32>, 128>,
+    prev_model: mat4x4<f32>,
+    prev_bones: array<mat4x4<f32>, 128>,
 }
 
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
@@ -58,18 +63,23 @@ struct VertexOutput {
     @location(1) uv: vec2<f32>,
     @location(2) world_pos: vec3<f32>,
     @location(3) world_tangent: vec4<f32>,
+    @location(4) velocity_px: vec2<f32>,
 }
 
 const PI: f32 = 3.14159265;
 
+fn identity4() -> mat4x4<f32> {
+    return mat4x4<f32>(
+        vec4<f32>(1.0, 0.0, 0.0, 0.0),
+        vec4<f32>(0.0, 1.0, 0.0, 0.0),
+        vec4<f32>(0.0, 0.0, 1.0, 0.0),
+        vec4<f32>(0.0, 0.0, 0.0, 1.0),
+    );
+}
+
 fn skin_matrix(in: VertexInput) -> mat4x4<f32> {
     if object.params.z < 0.5 {
-        return mat4x4<f32>(
-            vec4<f32>(1.0, 0.0, 0.0, 0.0),
-            vec4<f32>(0.0, 1.0, 0.0, 0.0),
-            vec4<f32>(0.0, 0.0, 1.0, 0.0),
-            vec4<f32>(0.0, 0.0, 0.0, 1.0),
-        );
+        return identity4();
     }
     return object.bones[in.joints.x] * in.weights.x
         + object.bones[in.joints.y] * in.weights.y
@@ -77,17 +87,41 @@ fn skin_matrix(in: VertexInput) -> mat4x4<f32> {
         + object.bones[in.joints.w] * in.weights.w;
 }
 
+fn prev_skin_matrix(in: VertexInput) -> mat4x4<f32> {
+    if object.params.z < 0.5 {
+        return identity4();
+    }
+    return object.prev_bones[in.joints.x] * in.weights.x
+        + object.prev_bones[in.joints.y] * in.weights.y
+        + object.prev_bones[in.joints.z] * in.weights.z
+        + object.prev_bones[in.joints.w] * in.weights.w;
+}
+
+fn clip_to_uv(clip: vec4<f32>) -> vec2<f32> {
+    let ndc = clip.xy / max(clip.w, 1e-6);
+    return vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+}
+
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     let model = object.model * skin_matrix(in);
     let world = model * vec4<f32>(in.position, 1.0);
-    out.clip_position = frame.view_proj * world;
+    let clip = frame.view_proj * world;
+    out.clip_position = clip;
     out.world_normal = normalize((model * vec4<f32>(in.normal, 0.0)).xyz);
     let tw = (model * vec4<f32>(in.tangent.xyz, 0.0)).xyz;
     out.world_tangent = vec4<f32>(normalize(tw), in.tangent.w);
     out.uv = in.uv;
     out.world_pos = world.xyz;
+
+    let prev_model = object.prev_model * prev_skin_matrix(in);
+    let prev_world = prev_model * vec4<f32>(in.position, 1.0);
+    let prev_clip = frame.prev_view_proj * prev_world;
+    let curr_uv = clip_to_uv(clip);
+    let prev_uv = clip_to_uv(prev_clip);
+    // Clamp insane teleports / first-frame glitches.
+    out.velocity_px = clamp((curr_uv - prev_uv) * frame.resolution.xy, vec2(-256.0), vec2(256.0));
     return out;
 }
 
@@ -359,8 +393,9 @@ fn env_reflect(
 struct GBufferOut {
     @location(0) color: vec4<f32>,
     @location(1) normal: vec4<f32>,
-    @location(2) orm: vec4<f32>,
-    @location(3) albedo: vec4<f32>,
+    @location(2) velocity: vec2<f32>,
+    @location(3) orm: vec4<f32>,
+    @location(4) albedo: vec4<f32>,
 }
 
 @fragment
@@ -414,6 +449,7 @@ fn fs_main(in: VertexOutput) -> GBufferOut {
     var out: GBufferOut;
     out.color = vec4<f32>(lit, base.a);
     out.normal = vec4<f32>(n, 0.0);
+    out.velocity = in.velocity_px;
     // R = occlusion placeholder, G = roughness, B = metallic
     out.orm = vec4<f32>(1.0, roughness, metallic, 1.0);
     out.albedo = vec4<f32>(albedo, 1.0);
