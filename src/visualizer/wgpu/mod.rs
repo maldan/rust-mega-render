@@ -141,7 +141,10 @@ struct GpuMesh {
 
 struct GpuTexture {
     view: wgpu::TextureView,
-    _texture: wgpu::Texture,
+    texture: wgpu::Texture,
+    width: u32,
+    height: u32,
+    srgb: bool,
     synced: u64,
 }
 
@@ -1651,11 +1654,23 @@ impl Visualizer for WgpuVisualizer {
         for (h, tex) in scene.textures.iter() {
             let key = h.key();
             live.insert(key, ());
-            if self.textures.get(&key).map(|g| g.synced) != Some(tex.version) {
-                self.textures
-                    .insert(key, upload_texture(&self.device, &self.queue, tex));
-                textures_changed = true;
+            let needs = self.textures.get(&key).map(|g| g.synced) != Some(tex.version);
+            if !needs {
+                continue;
             }
+            let w = tex.width.max(1);
+            let h = tex.height.max(1);
+            if let Some(gpu) = self.textures.get_mut(&key) {
+                if gpu.width == w && gpu.height == h && gpu.srgb == tex.srgb {
+                    // Same resource — rewrite pixels without recreating views/bind groups.
+                    write_texture_pixels(&self.queue, &gpu.texture, tex);
+                    gpu.synced = tex.version;
+                    continue;
+                }
+            }
+            self.textures
+                .insert(key, upload_texture(&self.device, &self.queue, tex));
+            textures_changed = true;
         }
         let tex_count_before = self.textures.len();
         self.textures.retain(|k, _| live.contains_key(k));
@@ -2267,17 +2282,86 @@ fn upload_mesh(device: &wgpu::Device, mesh: &Mesh) -> GpuMesh {
     }
 }
 
+fn write_texture_pixels(queue: &wgpu::Queue, texture: &wgpu::Texture, tex: &Texture) {
+    let full_w = tex.width.max(1);
+    let full_h = tex.height.max(1);
+
+    let (x, y, w, h) = match tex.dirty {
+        Some((x, y, w, h)) if w > 0 && h > 0 && w < full_w && h < full_h => {
+            let x = x.min(full_w - 1);
+            let y = y.min(full_h - 1);
+            let w = w.min(full_w - x).max(1);
+            let h = h.min(full_h - y).max(1);
+            // Skip tiny edge case where packing a sub-copy is awkward; still upload region.
+            (x, y, w, h)
+        }
+        _ => (0, 0, full_w, full_h),
+    };
+
+    // Pack rows into a tight buffer for the subrect (avoids bytes_per_row alignment issues).
+    if x == 0 && y == 0 && w == full_w && h == full_h {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &tex.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * full_w),
+                rows_per_image: Some(full_h),
+            },
+            wgpu::Extent3d {
+                width: full_w,
+                height: full_h,
+                depth_or_array_layers: 1,
+            },
+        );
+        return;
+    }
+
+    let mut packed = Vec::with_capacity((w * h * 4) as usize);
+    for row in y..y + h {
+        let start = ((row * full_w + x) * 4) as usize;
+        let end = start + (w * 4) as usize;
+        packed.extend_from_slice(&tex.rgba[start..end]);
+    }
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x, y, z: 0 },
+            aspect: wgpu::TextureAspect::All,
+        },
+        &packed,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * w),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
 fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture) -> GpuTexture {
     let format = if tex.srgb {
         wgpu::TextureFormat::Rgba8UnormSrgb
     } else {
         wgpu::TextureFormat::Rgba8Unorm
     };
+    let w = tex.width.max(1);
+    let h = tex.height.max(1);
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("scene_tex"),
         size: wgpu::Extent3d {
-            width: tex.width.max(1),
-            height: tex.height.max(1),
+            width: w,
+            height: h,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -2287,28 +2371,13 @@ fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture) -> 
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &tex.rgba,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(4 * tex.width.max(1)),
-            rows_per_image: Some(tex.height.max(1)),
-        },
-        wgpu::Extent3d {
-            width: tex.width.max(1),
-            height: tex.height.max(1),
-            depth_or_array_layers: 1,
-        },
-    );
+    write_texture_pixels(queue, &texture, tex);
     GpuTexture {
         view: texture.create_view(&Default::default()),
-        _texture: texture,
+        texture,
+        width: w,
+        height: h,
+        srgb: tex.srgb,
         synced: tex.version,
     }
 }
