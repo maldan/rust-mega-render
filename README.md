@@ -117,6 +117,8 @@ Material::new(albedo_rgba, metallic, roughness)
 
 Карты: `albedo_map` (sRGB), `normal_map`, `metallic_roughness_map` (linear). После правки пикселей — `texture.mark_changed()` / `mesh.mark_changed()`.
 
+GPU-resident maps (`Texture::gpu_resident` / `Texture { gpu_resident: true, .. }`): после первого `sync` пиксели на GPU не перезаписываются из `rgba`. Хост пишет через compute/storage в `WgpuVisualizer::texture_gpu(handle)` (usage: `STORAGE | COPY_SRC | …`). Формат всегда `rgba8unorm` (sRGB view на STORAGE нельзя). Подходит для любой карты материала, не только albedo.
+
 ### Свет
 
 - `Light::Directional` — направление «куда светит», `cast_shadows`

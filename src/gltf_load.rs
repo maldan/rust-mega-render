@@ -611,5 +611,6 @@ fn image_to_texture(img: &gltf::image::Data) -> Result<Texture, String> {
         version: 1,
         srgb: true,
         dirty: None,
+        gpu_resident: false,
     })
 }

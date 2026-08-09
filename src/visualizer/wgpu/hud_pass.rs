@@ -3,7 +3,7 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::hud::{Hud, HudQuad};
+use crate::hud::{Hud, HudLine, HudQuad};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -22,6 +22,7 @@ struct HudVertex {
 
 pub struct HudPass {
     pipeline: wgpu::RenderPipeline,
+    line_pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     uniform_buf: wgpu::Buffer,
     atlas_tex: wgpu::Texture,
@@ -137,6 +138,22 @@ impl HudPass {
             immediate_size: 0,
         });
 
+        let vertex_buffers = [Some(wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<HudVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![
+                0 => Float32x2,
+                1 => Float32x2,
+                2 => Float32x4,
+            ],
+        })];
+
+        let color_target = [Some(wgpu::ColorTargetState {
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
+
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("hud"),
             layout: Some(&pipeline_layout),
@@ -144,28 +161,41 @@ impl HudPass {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<HudVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![
-                        0 => Float32x2,
-                        1 => Float32x2,
-                        2 => Float32x4,
-                    ],
-                })],
+                buffers: &vertex_buffers,
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &color_target,
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("hud_lines"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &vertex_buffers,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &color_target,
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
                 ..Default::default()
             },
             depth_stencil: None,
@@ -180,6 +210,7 @@ impl HudPass {
 
         Self {
             pipeline,
+            line_pipeline,
             bind_group,
             uniform_buf,
             atlas_tex,
@@ -267,7 +298,8 @@ impl HudPass {
         screen: (f32, f32),
     ) {
         let quads = hud.primitives();
-        if quads.is_empty() {
+        let lines = hud.lines();
+        if quads.is_empty() && lines.is_empty() {
             return;
         }
         self.ensure_atlas(device, queue, hud);
@@ -281,15 +313,34 @@ impl HudPass {
             }),
         );
 
-        let mut verts = Vec::with_capacity(quads.len() * 6);
+        let mut quad_verts = Vec::with_capacity(quads.len() * 6);
         for q in quads {
-            push_quad(&mut verts, q);
+            push_quad(&mut quad_verts, q);
         }
-        let vbo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("hud_vbo"),
-            contents: bytemuck::cast_slice(&verts),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        let white_uv = hud.white_uv();
+        let mut line_verts = Vec::with_capacity(lines.len() * 2);
+        for l in lines {
+            push_line(&mut line_verts, l, white_uv);
+        }
+
+        let quad_vbo = if !quad_verts.is_empty() {
+            Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("hud_vbo"),
+                contents: bytemuck::cast_slice(&quad_verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            }))
+        } else {
+            None
+        };
+        let line_vbo = if !line_verts.is_empty() {
+            Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("hud_line_vbo"),
+                contents: bytemuck::cast_slice(&line_verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            }))
+        } else {
+            None
+        };
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -308,10 +359,17 @@ impl HudPass {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_vertex_buffer(0, vbo.slice(..));
-            pass.draw(0..verts.len() as u32, 0..1);
+            if let Some(ref vbo) = quad_vbo {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_vertex_buffer(0, vbo.slice(..));
+                pass.draw(0..quad_verts.len() as u32, 0..1);
+            }
+            if let Some(ref vbo) = line_vbo {
+                pass.set_pipeline(&self.line_pipeline);
+                pass.set_vertex_buffer(0, vbo.slice(..));
+                pass.draw(0..line_verts.len() as u32, 0..1);
+            }
         }
     }
 }
@@ -342,4 +400,17 @@ fn push_quad(out: &mut Vec<HudVertex>, q: &HudQuad) {
         color: c,
     };
     out.extend_from_slice(&[tl, tr, br, tl, br, bl]);
+}
+
+fn push_line(out: &mut Vec<HudVertex>, l: &HudLine, white_uv: [f32; 2]) {
+    out.push(HudVertex {
+        pos: l.a.to_array(),
+        uv: white_uv,
+        color: l.color,
+    });
+    out.push(HudVertex {
+        pos: l.b.to_array(),
+        uv: white_uv,
+        color: l.color,
+    });
 }

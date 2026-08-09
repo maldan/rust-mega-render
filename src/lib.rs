@@ -27,7 +27,7 @@ pub use camera::Camera;
 pub use debug_draw::{DebugDraw, DebugLine, DebugPoint};
 pub use debug_view::DebugView;
 pub use gltf_load::load_gltf;
-pub use hud::{Hud, HudId, HudOutput, HudQuad, Rect as HudRect};
+pub use hud::{Hud, HudId, HudLine, HudOutput, HudQuad, Rect as HudRect};
 pub use input::InputFrame;
 pub use light::{DirectionalLight, Light, PointLight};
 pub use material::Material;

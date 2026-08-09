@@ -1,5 +1,7 @@
 use super::Visualizer;
-use crate::{DebugView, Mesh, PostProcessSettings, Scene, ShadowFilter, ShadowSettings, Texture};
+use crate::{
+    DebugView, Handle, Mesh, PostProcessSettings, Scene, ShadowFilter, ShadowSettings, Texture,
+};
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
 use std::path::Path;
@@ -145,6 +147,8 @@ struct GpuTexture {
     width: u32,
     height: u32,
     srgb: bool,
+    /// Matches [`Texture::gpu_resident`] — STORAGE + host-owned pixels.
+    resident: bool,
     synced: u64,
 }
 
@@ -981,6 +985,22 @@ impl WgpuVisualizer {
         self.render_inner(scene, aspect, Some(color));
     }
 
+    /// GPU texture for a scene [`Texture`] after [`Visualizer::sync`].
+    ///
+    /// When [`Texture::gpu_resident`] is set, this resource includes `STORAGE_BINDING`
+    /// and `COPY_SRC` so the host can paint with compute and read back for export.
+    pub fn texture_gpu(&self, handle: Handle<Texture>) -> Option<&wgpu::Texture> {
+        self.textures.get(&handle.key()).map(|g| &g.texture)
+    }
+
+    /// Sampling view used by the mesh pass.
+    ///
+    /// For [`Texture::gpu_resident`] this is always an `rgba8unorm` view (no sRGB
+    /// reinterpret — STORAGE textures cannot expose sRGB views).
+    pub fn texture_view(&self, handle: Handle<Texture>) -> Option<&wgpu::TextureView> {
+        self.textures.get(&handle.key()).map(|g| &g.view)
+    }
+
     fn render_inner(
         &mut self,
         scene: &Scene,
@@ -1661,9 +1681,16 @@ impl Visualizer for WgpuVisualizer {
             let w = tex.width.max(1);
             let h = tex.height.max(1);
             if let Some(gpu) = self.textures.get_mut(&key) {
-                if gpu.width == w && gpu.height == h && gpu.srgb == tex.srgb {
-                    // Same resource — rewrite pixels without recreating views/bind groups.
-                    write_texture_pixels(&self.queue, &gpu.texture, tex);
+                if gpu.width == w
+                    && gpu.height == h
+                    && gpu.srgb == tex.srgb
+                    && gpu.resident == tex.gpu_resident
+                {
+                    // Same GPU resource. CPU maps get pixel uploads; resident maps are
+                    // host-owned after the initial create (skip write_texture).
+                    if !tex.gpu_resident {
+                        write_texture_pixels(&self.queue, &gpu.texture, tex);
+                    }
                     gpu.synced = tex.version;
                     continue;
                 }
@@ -2350,15 +2377,34 @@ fn write_texture_pixels(queue: &wgpu::Queue, texture: &wgpu::Texture, tex: &Text
 }
 
 fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture) -> GpuTexture {
-    let format = if tex.srgb {
+    let w = tex.width.max(1);
+    let h = tex.height.max(1);
+
+    // STORAGE cannot use *-srgb formats *or* sRGB views on the same texture (WebGPU).
+    // Resident maps are always rgba8unorm + default Unorm view.
+    let format = if tex.gpu_resident {
+        wgpu::TextureFormat::Rgba8Unorm
+    } else if tex.srgb {
         wgpu::TextureFormat::Rgba8UnormSrgb
     } else {
         wgpu::TextureFormat::Rgba8Unorm
     };
-    let w = tex.width.max(1);
-    let h = tex.height.max(1);
+
+    let usage = if tex.gpu_resident {
+        wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC
+    } else {
+        wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST
+    };
+
     let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("scene_tex"),
+        label: Some(if tex.gpu_resident {
+            "scene_tex_gpu_resident"
+        } else {
+            "scene_tex"
+        }),
         size: wgpu::Extent3d {
             width: w,
             height: h,
@@ -2368,16 +2414,23 @@ fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture) -> 
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        usage,
         view_formats: &[],
     });
-    write_texture_pixels(queue, &texture, tex);
+
+    // Seed from CPU once (including first create of a resident map).
+    let need_pixels = (w * h * 4) as usize;
+    if tex.rgba.len() >= need_pixels {
+        write_texture_pixels(queue, &texture, tex);
+    }
+
     GpuTexture {
         view: texture.create_view(&Default::default()),
         texture,
         width: w,
         height: h,
         srgb: tex.srgb,
+        resident: tex.gpu_resident,
         synced: tex.version,
     }
 }

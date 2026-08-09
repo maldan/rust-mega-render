@@ -64,6 +64,14 @@ pub struct HudQuad {
     pub color: [f32; 4],
 }
 
+/// Screen-space line segment (pixel coords, top-left origin).
+#[derive(Clone, Copy, Debug)]
+pub struct HudLine {
+    pub a: Vec2,
+    pub b: Vec2,
+    pub color: [f32; 4],
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct HudOutput {
     pub want_capture_mouse: bool,
@@ -73,6 +81,7 @@ pub struct HudOutput {
 /// Immediate HUD built each frame and drawn as a 2D overlay.
 pub struct Hud {
     quads: Vec<HudQuad>,
+    lines: Vec<HudLine>,
     size: Vec2,
     input: InputFrame,
     active: Option<HudId>,
@@ -96,6 +105,7 @@ impl Hud {
         let white_uv = hud_font::white_uv(atlas_w, atlas_h);
         Self {
             quads: Vec::new(),
+            lines: Vec::new(),
             size: Vec2::ZERO,
             input: InputFrame::default(),
             active: None,
@@ -109,6 +119,7 @@ impl Hud {
 
     pub fn begin(&mut self, input: &InputFrame, size: Vec2) {
         self.quads.clear();
+        self.lines.clear();
         self.input = input.clone();
         self.size = size;
         self.want_capture_mouse = false;
@@ -137,13 +148,39 @@ impl Hud {
         &self.quads
     }
 
+    pub fn lines(&self) -> &[HudLine] {
+        &self.lines
+    }
+
     pub(crate) fn atlas_size(&self) -> (u32, u32) {
         (self.atlas_w, self.atlas_h)
+    }
+
+    pub(crate) fn white_uv(&self) -> [f32; 2] {
+        self.white_uv
     }
 
     /// Solid rectangle (decorative — does not capture mouse).
     pub fn fill(&mut self, rect: Rect, color: [f32; 4]) {
         self.push_solid(rect, color);
+    }
+
+    /// Single screen-space line segment (1 px wide, GPU line list).
+    pub fn line(&mut self, a: Vec2, b: Vec2, color: [f32; 4]) {
+        self.lines.push(HudLine { a, b, color });
+    }
+
+    /// Connected segments `p[0]→p[1]→…→p[n-1]`. If `closed`, also `p[n-1]→p[0]`.
+    pub fn polyline(&mut self, points: &[Vec2], color: [f32; 4], closed: bool) {
+        if points.len() < 2 {
+            return;
+        }
+        for w in points.windows(2) {
+            self.line(w[0], w[1], color);
+        }
+        if closed {
+            self.line(*points.last().unwrap(), points[0], color);
+        }
     }
 
     /// Background panel that captures mouse while hovered.
