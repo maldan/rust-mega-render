@@ -33,6 +33,8 @@ pub struct Scene {
     pub lights: Vec<Light>,
     /// Flat ambient (diffuse fill). Always applied; SSGI can dim it via ambient_dim.
     pub ambient: [f32; 3],
+    /// HDR clear color for the scene pass (RGBA).
+    pub clear_color: [f32; 4],
     pub debug: DebugDraw,
     /// Immediate screen-space HUD (built each frame, drawn on top).
     pub hud: Hud,
@@ -52,6 +54,7 @@ impl Scene {
             camera: Camera::orbit(0.8, 0.45, 8.0, Vec3::new(0.0, 0.5, 0.0)),
             lights: vec![Light::Directional(DirectionalLight::default())],
             ambient: [0.03, 0.03, 0.04],
+            clear_color: [0.08, 0.09, 0.12, 1.0],
             debug: DebugDraw::default(),
             hud: Hud::new(),
             pending_loads: Vec::new(),

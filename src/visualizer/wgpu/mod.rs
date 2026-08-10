@@ -1286,17 +1286,17 @@ impl WgpuVisualizer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene_pass"),
                 color_attachments: &[
-                    // color0: HDR scene color (dark background)
+                    // color0: HDR scene color
                     Some(wgpu::RenderPassColorAttachment {
                         view: &self.frames.color_view,
                         resolve_target: None,
                         depth_slice: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.08,
-                                g: 0.09,
-                                b: 0.12,
-                                a: 1.0,
+                                r: scene.clear_color[0] as f64,
+                                g: scene.clear_color[1] as f64,
+                                b: scene.clear_color[2] as f64,
+                                a: scene.clear_color[3] as f64,
                             }),
                             store: wgpu::StoreOp::Store,
                         },

@@ -75,6 +75,45 @@ impl DebugDraw {
         self.line(origin, origin + Vec3::Z * len, [0.3, 0.5, 1.0, 1.0]);
     }
 
+    /// XZ ground grid centered on `origin` (typically [`Vec3::ZERO`]).
+    ///
+    /// `half_extent` is half the grid width/depth; `step` is cell size.
+    /// Every `major_every` lines (including the center) use `major_color`.
+    pub fn grid(
+        &mut self,
+        origin: Vec3,
+        half_extent: f32,
+        step: f32,
+        color: [f32; 4],
+        major_every: u32,
+        major_color: [f32; 4],
+    ) {
+        let step = step.max(1e-4);
+        let half = half_extent.max(step);
+        let n = (half / step).round() as i32;
+        let major_every = major_every.max(1) as i32;
+        for i in -n..=n {
+            let t = i as f32 * step;
+            let col = if i % major_every == 0 {
+                major_color
+            } else {
+                color
+            };
+            // Lines parallel to X (vary Z).
+            self.line(
+                origin + Vec3::new(-half, 0.0, t),
+                origin + Vec3::new(half, 0.0, t),
+                col,
+            );
+            // Lines parallel to Z (vary X).
+            self.line(
+                origin + Vec3::new(t, 0.0, -half),
+                origin + Vec3::new(t, 0.0, half),
+                col,
+            );
+        }
+    }
+
     pub fn axes_overlay(&mut self, origin: Vec3, len: f32) {
         self.line_overlay(origin, origin + Vec3::X * len, [1.0, 0.2, 0.2, 1.0]);
         self.line_overlay(origin, origin + Vec3::Y * len, [0.2, 1.0, 0.2, 1.0]);
