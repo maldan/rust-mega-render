@@ -24,7 +24,10 @@ mod visualizer;
 
 pub use animation::{AnimChannel, AnimPath, AnimValues, AnimationClip, Animator};
 pub use camera::Camera;
-pub use debug_draw::{DebugDraw, DebugLine, DebugPoint};
+pub use debug_draw::{
+    gizmo_ring_basis, gizmo_screen_size, DebugDraw, DebugLine, DebugPoint, DebugTri, GizmoAxis,
+    GizmoMode, GizmoOpts, GizmoRotateArc, LineOpts, PolyOpts,
+};
 pub use debug_view::DebugView;
 pub use gltf_load::load_gltf;
 pub use hud::{Hud, HudId, HudLine, HudOutput, HudQuad, Rect as HudRect};

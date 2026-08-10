@@ -49,9 +49,13 @@ struct GpuVertex {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct DebugVertex {
-    pos: [f32; 3],
-    color: [f32; 4],
+struct DebugLineInstance {
+    start: [f32; 3],
+    width_from: f32,
+    end: [f32; 3],
+    width_to: f32,
+    color_from: [f32; 4],
+    color_to: [f32; 4],
 }
 
 #[repr(C)]
@@ -59,6 +63,13 @@ struct DebugVertex {
 struct DebugPointInstance {
     pos: [f32; 3],
     size: f32,
+    color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DebugTriVertex {
+    pos: [f32; 3],
     color: [f32; 4],
 }
 
@@ -162,6 +173,8 @@ pub struct WgpuVisualizer {
     line_overlay_pipeline: wgpu::RenderPipeline,
     point_pipeline: wgpu::RenderPipeline,
     point_overlay_pipeline: wgpu::RenderPipeline,
+    tri_pipeline: wgpu::RenderPipeline,
+    tri_overlay_pipeline: wgpu::RenderPipeline,
     frame_bind_group: wgpu::BindGroup,
     frame_bind_layout: wgpu::BindGroupLayout,
     debug_bind_group: wgpu::BindGroup,
@@ -611,10 +624,17 @@ impl WgpuVisualizer {
         // Single MRT HDR sky pipeline.
         let sky_pipeline = make_sky_pipeline(device, &sky_layout, &sky_shader, &sky_depth, "sky_mrt");
 
-        let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+        let line_attrs = wgpu::vertex_attr_array![
+            0 => Float32x3,
+            1 => Float32,
+            2 => Float32x3,
+            3 => Float32,
+            4 => Float32x4,
+            5 => Float32x4,
+        ];
         let line_buffers = [Some(wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<DebugVertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
+            array_stride: std::mem::size_of::<DebugLineInstance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
             attributes: &line_attrs,
         })];
         let point_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Float32x4];
@@ -623,15 +643,21 @@ impl WgpuVisualizer {
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &point_attrs,
         })];
+        let tri_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+        let tri_buffers = [Some(wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<DebugTriVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &tri_attrs,
+        })];
 
         // MRT HDR debug pipelines only.
         let line_pipeline = debug_pipeline(
             device,
             &debug_layout,
             &debug_shader,
-            "vs_main",
+            "vs_line",
             &line_buffers,
-            wgpu::PrimitiveTopology::LineList,
+            wgpu::PrimitiveTopology::TriangleList,
             wgpu::CompareFunction::Less,
             &depth_stencil,
         );
@@ -639,9 +665,9 @@ impl WgpuVisualizer {
             device,
             &debug_layout,
             &debug_shader,
-            "vs_main",
+            "vs_line",
             &line_buffers,
-            wgpu::PrimitiveTopology::LineList,
+            wgpu::PrimitiveTopology::TriangleList,
             wgpu::CompareFunction::Always,
             &depth_stencil,
         );
@@ -661,6 +687,26 @@ impl WgpuVisualizer {
             &debug_shader,
             "vs_point",
             &point_buffers,
+            wgpu::PrimitiveTopology::TriangleList,
+            wgpu::CompareFunction::Always,
+            &depth_stencil,
+        );
+        let tri_pipeline = debug_pipeline(
+            device,
+            &debug_layout,
+            &debug_shader,
+            "vs_tri",
+            &tri_buffers,
+            wgpu::PrimitiveTopology::TriangleList,
+            wgpu::CompareFunction::Less,
+            &depth_stencil,
+        );
+        let tri_overlay_pipeline = debug_pipeline(
+            device,
+            &debug_layout,
+            &debug_shader,
+            "vs_tri",
+            &tri_buffers,
             wgpu::PrimitiveTopology::TriangleList,
             wgpu::CompareFunction::Always,
             &depth_stencil,
@@ -713,6 +759,8 @@ impl WgpuVisualizer {
             line_overlay_pipeline,
             point_pipeline,
             point_overlay_pipeline,
+            tri_pipeline,
+            tri_overlay_pipeline,
             frame_bind_group,
             frame_bind_layout,
             debug_bind_group,
@@ -1202,10 +1250,12 @@ impl WgpuVisualizer {
         self.motion_has_history = true;
 
         let debug = build_debug_batches(scene);
-        let line_buf = upload_debug_verts(&self.device, &debug.lines);
-        let line_overlay_buf = upload_debug_verts(&self.device, &debug.lines_overlay);
+        let line_buf = upload_debug_lines(&self.device, &debug.lines);
+        let line_overlay_buf = upload_debug_lines(&self.device, &debug.lines_overlay);
         let point_buf = upload_debug_points(&self.device, &debug.points);
         let point_overlay_buf = upload_debug_points(&self.device, &debug.points_overlay);
+        let tri_buf = upload_debug_tris(&self.device, &debug.tris);
+        let tri_overlay_buf = upload_debug_tris(&self.device, &debug.tris_overlay);
 
         let default_maps = ((u32::MAX, 0), (u32::MAX, 1), (u32::MAX, 2));
         for (_, _, albedo_key, normal_key, mr_key, _, _, _, _, _) in &draws {
@@ -1384,6 +1434,13 @@ impl WgpuVisualizer {
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
             }
 
+            draw_debug_tris(
+                &mut pass,
+                &self.tri_pipeline,
+                &self.debug_bind_group,
+                &tri_buf,
+                debug.tris.len(),
+            );
             draw_debug_lines(&mut pass, &self.line_pipeline, &self.debug_bind_group, &line_buf, debug.lines.len());
             draw_debug_points(
                 &mut pass,
@@ -1391,6 +1448,13 @@ impl WgpuVisualizer {
                 &self.debug_bind_group,
                 &point_buf,
                 debug.points.len(),
+            );
+            draw_debug_tris(
+                &mut pass,
+                &self.tri_overlay_pipeline,
+                &self.debug_bind_group,
+                &tri_overlay_buf,
+                debug.tris_overlay.len(),
             );
             draw_debug_lines(
                 &mut pass,
@@ -1797,21 +1861,19 @@ fn sun_view_proj(dir: Vec3) -> Mat4 {
 fn build_debug_batches(scene: &Scene) -> DebugBatches {
     let mut batches = DebugBatches::default();
     for line in &scene.debug.lines {
-        let a = DebugVertex {
-            pos: line.start.to_array(),
-            color: line.color,
+        let inst = DebugLineInstance {
+            start: line.start.to_array(),
+            width_from: line.opts.width_from,
+            end: line.end.to_array(),
+            width_to: line.opts.width_to,
+            color_from: line.opts.color_from,
+            color_to: line.opts.color_to,
         };
-        let b = DebugVertex {
-            pos: line.end.to_array(),
-            color: line.color,
-        };
-        let dst = if line.depth_test {
-            &mut batches.lines
+        if line.opts.depth_test {
+            batches.lines.push(inst);
         } else {
-            &mut batches.lines_overlay
-        };
-        dst.push(a);
-        dst.push(b);
+            batches.lines_overlay.push(inst);
+        }
     }
     for p in &scene.debug.points {
         let inst = DebugPointInstance {
@@ -1825,25 +1887,43 @@ fn build_debug_batches(scene: &Scene) -> DebugBatches {
             batches.points_overlay.push(inst);
         }
     }
+    for t in &scene.debug.tris {
+        let push = |dst: &mut Vec<DebugTriVertex>, p: glam::Vec3| {
+            dst.push(DebugTriVertex {
+                pos: p.to_array(),
+                color: t.color,
+            });
+        };
+        let dst = if t.depth_test {
+            &mut batches.tris
+        } else {
+            &mut batches.tris_overlay
+        };
+        push(dst, t.a);
+        push(dst, t.b);
+        push(dst, t.c);
+    }
     batches
 }
 
 #[derive(Default)]
 struct DebugBatches {
-    lines: Vec<DebugVertex>,
-    lines_overlay: Vec<DebugVertex>,
+    lines: Vec<DebugLineInstance>,
+    lines_overlay: Vec<DebugLineInstance>,
     points: Vec<DebugPointInstance>,
     points_overlay: Vec<DebugPointInstance>,
+    tris: Vec<DebugTriVertex>,
+    tris_overlay: Vec<DebugTriVertex>,
 }
 
-fn upload_debug_verts(device: &wgpu::Device, verts: &[DebugVertex]) -> Option<wgpu::Buffer> {
-    if verts.is_empty() {
+fn upload_debug_lines(device: &wgpu::Device, lines: &[DebugLineInstance]) -> Option<wgpu::Buffer> {
+    if lines.is_empty() {
         return None;
     }
     Some(
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("debug_lines"),
-            contents: bytemuck::cast_slice(verts),
+            contents: bytemuck::cast_slice(lines),
             usage: wgpu::BufferUsages::VERTEX,
         }),
     )
@@ -1862,6 +1942,19 @@ fn upload_debug_points(device: &wgpu::Device, points: &[DebugPointInstance]) -> 
     )
 }
 
+fn upload_debug_tris(device: &wgpu::Device, tris: &[DebugTriVertex]) -> Option<wgpu::Buffer> {
+    if tris.is_empty() {
+        return None;
+    }
+    Some(
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("debug_tris"),
+            contents: bytemuck::cast_slice(tris),
+            usage: wgpu::BufferUsages::VERTEX,
+        }),
+    )
+}
+
 fn draw_debug_lines(
     pass: &mut wgpu::RenderPass<'_>,
     pipeline: &wgpu::RenderPipeline,
@@ -1873,7 +1966,7 @@ fn draw_debug_lines(
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[]);
     pass.set_vertex_buffer(0, buf.slice(..));
-    pass.draw(0..count as u32, 0..1);
+    pass.draw(0..6, 0..count as u32);
 }
 
 fn draw_debug_points(
@@ -1888,6 +1981,20 @@ fn draw_debug_points(
     pass.set_bind_group(0, bind_group, &[]);
     pass.set_vertex_buffer(0, buf.slice(..));
     pass.draw(0..6, 0..count as u32);
+}
+
+fn draw_debug_tris(
+    pass: &mut wgpu::RenderPass<'_>,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+    buf: &Option<wgpu::Buffer>,
+    vert_count: usize,
+) {
+    let Some(buf) = buf else { return };
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.set_vertex_buffer(0, buf.slice(..));
+    pass.draw(0..vert_count as u32, 0..1);
 }
 
 fn make_frame_bind_group(
