@@ -20,6 +20,7 @@ mod shadow;
 mod skin;
 mod store;
 mod texture;
+pub mod view_gizmo;
 mod visualizer;
 
 pub use animation::{AnimChannel, AnimPath, AnimValues, AnimationClip, Animator};
@@ -47,4 +48,5 @@ pub use shadow::{ShadowFilter, ShadowSettings};
 pub use skin::Skin;
 pub use store::{Handle, Store};
 pub use texture::Texture;
+pub use view_gizmo::ViewAxis;
 pub use visualizer::{Visualizer, WgpuVisualizer};

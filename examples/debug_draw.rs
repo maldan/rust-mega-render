@@ -2,6 +2,7 @@
 //!
 //! Showcase: lines / points / boxes / spheres / bones (library helpers).
 //! Three cubes: translate · rotate · scale gizmos (no mode switching).
+//! View gizmo (top-right): click an axis tip to snap the fly cam.
 //!
 //! `Space` local/world · LMB drag · RMB look · WASD move · Esc quit
 //!
@@ -14,6 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use glam::{Mat4, Quat, Vec2, Vec3};
+use mega_render::view_gizmo::{self, ViewAxis};
 use mega_render::{
     cube, gizmo_ring_basis, gizmo_screen_size, plane, Camera, GizmoAxis, GizmoMode, GizmoOpts,
     GizmoRotateArc, Handle, InputFrame, Light, LineOpts, Material, Node, Scene, Transform,
@@ -34,6 +36,14 @@ fn main() {
     event_loop.run_app(&mut app).expect("run");
 }
 
+struct ViewTween {
+    pivot: Vec3,
+    from_dir: Vec3,
+    to_dir: Vec3,
+    dist: f32,
+    t: f32,
+}
+
 struct FlyCam {
     eye: Vec3,
     yaw: f32,
@@ -42,6 +52,7 @@ struct FlyCam {
     keys: [bool; 6],
     sprint: bool,
     look_delta: Vec2,
+    tween: Option<ViewTween>,
 }
 
 impl FlyCam {
@@ -55,6 +66,7 @@ impl FlyCam {
             keys: [false; 6],
             sprint: false,
             look_delta: Vec2::ZERO,
+            tween: None,
         }
     }
 
@@ -77,17 +89,72 @@ impl FlyCam {
         }
     }
 
+    fn forward(&self) -> Vec3 {
+        Vec3::new(
+            self.yaw.sin() * self.pitch.cos(),
+            self.pitch.sin(),
+            self.yaw.cos() * self.pitch.cos(),
+        )
+    }
+
+    fn look_at(&mut self, eye: Vec3, target: Vec3) {
+        self.eye = eye;
+        let d = (target - eye).normalize_or_zero();
+        self.yaw = d.x.atan2(d.z);
+        self.pitch = d.y.clamp(-1.0, 1.0).asin();
+    }
+
+    /// Orbit toward `axis` around `pivot` (keeps distance).
+    fn snap_view(&mut self, axis: ViewAxis, pivot: Vec3) {
+        let from = (self.eye - pivot).normalize_or_zero();
+        let to = axis.dir();
+        if from.length_squared() < 1e-6 {
+            self.look_at(pivot + to, pivot);
+            self.tween = None;
+            return;
+        }
+        self.tween = Some(ViewTween {
+            pivot,
+            from_dir: from,
+            to_dir: to,
+            dist: (self.eye - pivot).length().max(1.0),
+            t: 0.0,
+        });
+    }
+
     fn apply(&mut self, dt: f32, scene: &mut Scene) {
         const SENS: f32 = 0.0025;
+        const TWEEN_SPEED: f32 = 3.2; // ~0.3s with smoothstep
+
+        // Manual look / move cancels the orbit tween.
+        let steering =
+            self.looking || self.look_delta.length_squared() > 0.0 || self.keys.iter().any(|&k| k);
+        if steering {
+            self.tween = None;
+        }
+
+        if let Some(tw) = self.tween.as_mut() {
+            tw.t = (tw.t + dt * TWEEN_SPEED).min(1.0);
+            let e = tw.t * tw.t * (3.0 - 2.0 * tw.t);
+            let rot = Quat::IDENTITY.slerp(Quat::from_rotation_arc(tw.from_dir, tw.to_dir), e);
+            let eye = tw.pivot + rot * tw.from_dir * tw.dist;
+            let pivot = tw.pivot;
+            let done = tw.t >= 1.0;
+            self.look_at(eye, pivot);
+            if done {
+                self.tween = None;
+            }
+            self.look_delta = Vec2::ZERO;
+            scene.camera.eye = self.eye;
+            scene.camera.target = pivot;
+            return;
+        }
+
         self.yaw += self.look_delta.x * SENS;
         self.pitch = (self.pitch - self.look_delta.y * SENS).clamp(-1.55, 1.55);
         self.look_delta = Vec2::ZERO;
 
-        let forward = Vec3::new(
-            self.yaw.sin() * self.pitch.cos(),
-            self.pitch.sin(),
-            self.yaw.cos() * self.pitch.cos(),
-        );
+        let forward = self.forward();
         let right = Vec3::Y.cross(forward).normalize_or_zero();
         let mut vel = Vec3::ZERO;
         if self.keys[0] {
@@ -608,14 +675,24 @@ impl App {
 
         self.fly.apply(dt, &mut self.scene);
 
-        let (ray_o, ray_d) =
-            cursor_ray(&self.scene.camera, aspect, self.cursor, Vec2::new(w as f32, h as f32));
+        let viewport = Vec2::new(w as f32, h as f32);
+        let over_view = view_gizmo::contains_cursor(viewport, self.cursor);
+        let (ray_o, ray_d) = cursor_ray(&self.scene.camera, aspect, self.cursor, viewport);
 
         if self.drag.is_some() {
             self.hover = self.drag.as_ref().map(|d| (d.target, d.axis));
             self.update_drag(ray_o, ray_d);
             if self.mouse_released {
                 self.drag = None;
+            }
+        } else if !self.fly.looking && over_view {
+            // View gizmo eats LMB — snap fly cam to the picked axis.
+            self.hover = None;
+            if self.mouse_pressed {
+                if let Some(axis) = view_gizmo::hit_test(&self.scene.camera, viewport, self.cursor)
+                {
+                    self.fly.snap_view(axis, Vec3::new(0.0, 0.8, 0.0));
+                }
             }
         } else if !self.fly.looking {
             self.hover = self.pick(ray_o, ray_d, h as f32);
@@ -639,7 +716,7 @@ impl App {
             scroll_delta: Vec2::ZERO,
             dt,
         };
-        self.scene.hud.begin(&input, Vec2::new(w as f32, h as f32));
+        self.scene.hud.begin(&input, viewport);
         let text = [0.92, 0.93, 0.96, 1.0];
         let space = if self.local_space { "Local" } else { "World" };
         self.scene
@@ -665,9 +742,15 @@ impl App {
         );
         self.scene.hud.text(
             Vec2::new(16.0, h as f32 - 28.0),
-            "WASD move · Esc quit",
+            "WASD move · view gizmo (top-right) · Esc quit",
             [0.7, 0.74, 0.8, 0.9],
             2.0,
+        );
+        view_gizmo::draw(
+            &mut self.scene.hud,
+            &self.scene.camera,
+            viewport,
+            self.cursor,
         );
         let _ = self.scene.hud.end();
 
