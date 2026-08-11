@@ -24,7 +24,7 @@ pub mod view_gizmo;
 mod visualizer;
 
 pub use animation::{AnimChannel, AnimPath, AnimValues, AnimationClip, Animator};
-pub use camera::Camera;
+pub use camera::{Camera, Projection};
 pub use debug_draw::{
     gizmo_ring_basis, gizmo_screen_size, DebugDraw, DebugLine, DebugPoint, DebugTri, GizmoAxis,
     GizmoMode, GizmoOpts, GizmoRotateArc, LineOpts, PolyOpts,

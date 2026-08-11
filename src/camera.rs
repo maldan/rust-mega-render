@@ -1,5 +1,12 @@
 use glam::{Mat4, Vec3};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Projection {
+    #[default]
+    Perspective,
+    Orthographic,
+}
+
 pub struct Camera {
     pub eye: Vec3,
     pub target: Vec3,
@@ -7,6 +14,9 @@ pub struct Camera {
     pub fov_y: f32,
     pub near: f32,
     pub far: f32,
+    pub projection: Projection,
+    /// Ortho half-height in world units (full height = 2 * ortho_size).
+    pub ortho_size: f32,
     /// Smoothed focus distance used by DOF (world units).
     pub focus_distance: f32,
     /// Desired focus distance; [`Self::tick_focus`] eases `focus_distance` toward this.
@@ -20,13 +30,17 @@ pub struct Camera {
 impl Camera {
     pub fn look_at(eye: Vec3, target: Vec3) -> Self {
         let focus_distance = (eye - target).length().max(0.01);
+        let fov_y = 45f32.to_radians();
+        let ortho_size = Self::ortho_size_from_distance(focus_distance, fov_y);
         Self {
             eye,
             target,
             up: Vec3::Y,
-            fov_y: 45f32.to_radians(),
+            fov_y,
             near: 0.1,
             far: 100.0,
+            projection: Projection::Perspective,
+            ortho_size,
             focus_distance,
             focus_target: focus_distance,
             focus_smooth: 6.0,
@@ -46,11 +60,45 @@ impl Camera {
         Self::look_at(eye, target)
     }
 
+    /// Ortho half-height that matches a perspective frustum at `distance`.
+    pub fn ortho_size_from_distance(distance: f32, fov_y: f32) -> f32 {
+        (distance.max(0.01) * (fov_y * 0.5).tan()).max(0.01)
+    }
+
+    /// Distance that matches `ortho_size` under perspective `fov_y`.
+    pub fn distance_from_ortho_size(ortho_size: f32, fov_y: f32) -> f32 {
+        let half = (fov_y * 0.5).tan().max(1e-4);
+        (ortho_size / half).max(0.05)
+    }
+
+    /// Keep `ortho_size` in sync with current eye↔target distance (for seamless toggles).
+    pub fn sync_ortho_from_distance(&mut self) {
+        let dist = (self.eye - self.target).length().max(0.05);
+        self.ortho_size = Self::ortho_size_from_distance(dist, self.fov_y);
+    }
+
+    pub fn proj(&self, aspect: f32) -> Mat4 {
+        let aspect = aspect.max(1e-4);
+        match self.projection {
+            Projection::Perspective => glam::camera::lh::proj::directx::perspective(
+                self.fov_y,
+                aspect,
+                self.near,
+                self.far,
+            ),
+            Projection::Orthographic => {
+                let h = self.ortho_size.max(0.01);
+                let w = h * aspect;
+                glam::camera::lh::proj::directx::orthographic(
+                    -w, w, -h, h, self.near, self.far,
+                )
+            }
+        }
+    }
+
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
-        let proj =
-            glam::camera::lh::proj::directx::perspective(self.fov_y, aspect, self.near, self.far);
         let view = glam::camera::lh::view::look_at_mat4(self.eye, self.target, self.up);
-        proj * view
+        self.proj(aspect) * view
     }
 
     /// Ease `focus_distance` toward `focus_target`.

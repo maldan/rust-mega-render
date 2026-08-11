@@ -1478,12 +1478,7 @@ impl WgpuVisualizer {
                     scene.camera.up,
                 );
                 let view_rot = Mat4::from_cols(view.x_axis, view.y_axis, view.z_axis, glam::Vec4::W);
-                let proj = glam::camera::lh::proj::directx::perspective(
-                    scene.camera.fov_y,
-                    aspect,
-                    scene.camera.near,
-                    scene.camera.far,
-                );
+                let proj = scene.camera.proj(aspect);
                 let inv_view_proj = (proj * view_rot).inverse();
                 self.queue.write_buffer(
                     &self.sky_uniform_buf,
@@ -1510,12 +1505,7 @@ impl WgpuVisualizer {
         let exposure = self.post.tonemap.exposure;
         let near = scene.camera.near;
         let far = scene.camera.far;
-        let proj = glam::camera::lh::proj::directx::perspective(
-            scene.camera.fov_y,
-            aspect,
-            near,
-            far,
-        );
+        let proj = scene.camera.proj(aspect);
 
         if self.debug_view == DebugView::Final && self.post.any_enabled() {
             let view = glam::camera::lh::view::look_at_mat4(

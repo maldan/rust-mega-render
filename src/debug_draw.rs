@@ -298,24 +298,26 @@ impl DebugDraw {
         let half = half_extent.max(step);
         let n = (half / step).round() as i32;
         let major_every = major_every.max(1) as i32;
+        // Ground is XZ (Y up): highlight world X (red) and Z (green) through origin.
+        let axis_x = [0.55, 0.18, 0.18, (major_color[3] * 0.85).clamp(0.2, 0.45)];
+        let axis_z = [0.18, 0.50, 0.22, (major_color[3] * 0.85).clamp(0.2, 0.45)];
         for i in -n..=n {
             let t = i as f32 * step;
-            let col = if i % major_every == 0 {
-                major_color
-            } else {
-                color
-            };
-            // Lines parallel to X (vary Z).
+            let is_major = i % major_every == 0;
+            let col = if is_major { major_color } else { color };
+            // Lines parallel to X (vary Z). z=0 → world X axis.
+            let col_x = if i == 0 { axis_x } else { col };
             self.line(
                 origin + Vec3::new(-half, 0.0, t),
                 origin + Vec3::new(half, 0.0, t),
-                LineOpts::color(col),
+                LineOpts::color(col_x),
             );
-            // Lines parallel to Z (vary X).
+            // Lines parallel to Z (vary X). x=0 → world Z axis.
+            let col_z = if i == 0 { axis_z } else { col };
             self.line(
                 origin + Vec3::new(t, 0.0, -half),
                 origin + Vec3::new(t, 0.0, half),
-                LineOpts::color(col),
+                LineOpts::color(col_z),
             );
         }
     }
