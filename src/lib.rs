@@ -35,7 +35,7 @@ pub use hud::{Hud, HudId, HudLine, HudOutput, HudQuad, Rect as HudRect};
 pub use input::InputFrame;
 pub use light::{DirectionalLight, Light, PointLight};
 pub use material::Material;
-pub use mesh::Mesh;
+pub use mesh::{Mesh, MorphTarget};
 pub use node::{Node, Transform};
 pub use post_process::{
     AoMethod, AoSettings, BloomSettings, ColorGradeSettings, ContactShadowSettings, DofSettings,

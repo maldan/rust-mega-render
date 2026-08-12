@@ -228,6 +228,8 @@ pub struct WgpuVisualizer {
     prev_view_proj: Mat4,
     motion_has_history: bool,
     last_frame: Instant,
+    /// Reused debug vertex buffers (avoid create/destroy every frame).
+    debug_scratch: DebugScratch,
 }
 
 impl WgpuVisualizer {
@@ -809,6 +811,7 @@ impl WgpuVisualizer {
             prev_view_proj: Mat4::IDENTITY,
             motion_has_history: false,
             last_frame: Instant::now(),
+            debug_scratch: DebugScratch::default(),
         }
     }
 
@@ -835,6 +838,18 @@ impl WgpuVisualizer {
                 }),
             }],
         });
+    }
+
+    /// Drop cached GPU meshes/textures/skins. Call when replacing the whole
+    /// [`Scene`] — handle keys restart at (0, gen) with `version == 1`, so the
+    /// normal sync path would incorrectly reuse the previous model's GPU data.
+    pub fn clear_scene_gpu_cache(&mut self) {
+        self.meshes.clear();
+        self.textures.clear();
+        self.skin_bones.clear();
+        self.prev_models.clear();
+        self.motion_has_history = false;
+        self.invalidate_object_bind_groups();
     }
 
     fn ensure_object_slots(&mut self, slots: u64) {
@@ -1250,12 +1265,42 @@ impl WgpuVisualizer {
         self.motion_has_history = true;
 
         let debug = build_debug_batches(scene);
-        let line_buf = upload_debug_lines(&self.device, &debug.lines);
-        let line_overlay_buf = upload_debug_lines(&self.device, &debug.lines_overlay);
-        let point_buf = upload_debug_points(&self.device, &debug.points);
-        let point_overlay_buf = upload_debug_points(&self.device, &debug.points_overlay);
-        let tri_buf = upload_debug_tris(&self.device, &debug.tris);
-        let tri_overlay_buf = upload_debug_tris(&self.device, &debug.tris_overlay);
+        let line_buf = self.debug_scratch.upload_lines(
+            &self.device,
+            &self.queue,
+            0,
+            &debug.lines,
+        );
+        let line_overlay_buf = self.debug_scratch.upload_lines(
+            &self.device,
+            &self.queue,
+            1,
+            &debug.lines_overlay,
+        );
+        let point_buf = self.debug_scratch.upload_points(
+            &self.device,
+            &self.queue,
+            0,
+            &debug.points,
+        );
+        let point_overlay_buf = self.debug_scratch.upload_points(
+            &self.device,
+            &self.queue,
+            1,
+            &debug.points_overlay,
+        );
+        let tri_buf = self.debug_scratch.upload_tris(
+            &self.device,
+            &self.queue,
+            0,
+            &debug.tris,
+        );
+        let tri_overlay_buf = self.debug_scratch.upload_tris(
+            &self.device,
+            &self.queue,
+            1,
+            &debug.tris_overlay,
+        );
 
         let default_maps = ((u32::MAX, 0), (u32::MAX, 1), (u32::MAX, 2));
         for (_, _, albedo_key, normal_key, mr_key, _, _, _, _, _) in &draws {
@@ -1906,43 +1951,71 @@ struct DebugBatches {
     tris_overlay: Vec<DebugTriVertex>,
 }
 
-fn upload_debug_lines(device: &wgpu::Device, lines: &[DebugLineInstance]) -> Option<wgpu::Buffer> {
-    if lines.is_empty() {
-        return None;
-    }
-    Some(
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("debug_lines"),
-            contents: bytemuck::cast_slice(lines),
-            usage: wgpu::BufferUsages::VERTEX,
-        }),
-    )
+#[derive(Default)]
+struct GrowVertBuf {
+    buf: Option<wgpu::Buffer>,
+    capacity: u64,
 }
 
-fn upload_debug_points(device: &wgpu::Device, points: &[DebugPointInstance]) -> Option<wgpu::Buffer> {
-    if points.is_empty() {
-        return None;
+impl GrowVertBuf {
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, bytes: &[u8]) -> Option<wgpu::Buffer> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let size = bytes.len() as u64;
+        if self.capacity < size {
+            let cap = size.next_power_of_two().max(4096);
+            self.buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("debug_scratch"),
+                size: cap,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.capacity = cap;
+        }
+        let buf = self.buf.as_ref()?;
+        queue.write_buffer(buf, 0, bytes);
+        Some(buf.clone())
     }
-    Some(
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("debug_points"),
-            contents: bytemuck::cast_slice(points),
-            usage: wgpu::BufferUsages::VERTEX,
-        }),
-    )
 }
 
-fn upload_debug_tris(device: &wgpu::Device, tris: &[DebugTriVertex]) -> Option<wgpu::Buffer> {
-    if tris.is_empty() {
-        return None;
+#[derive(Default)]
+struct DebugScratch {
+    lines: [GrowVertBuf; 2],
+    points: [GrowVertBuf; 2],
+    tris: [GrowVertBuf; 2],
+}
+
+impl DebugScratch {
+    fn upload_lines(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slot: usize,
+        lines: &[DebugLineInstance],
+    ) -> Option<wgpu::Buffer> {
+        self.lines[slot].upload(device, queue, bytemuck::cast_slice(lines))
     }
-    Some(
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("debug_tris"),
-            contents: bytemuck::cast_slice(tris),
-            usage: wgpu::BufferUsages::VERTEX,
-        }),
-    )
+
+    fn upload_points(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slot: usize,
+        points: &[DebugPointInstance],
+    ) -> Option<wgpu::Buffer> {
+        self.points[slot].upload(device, queue, bytemuck::cast_slice(points))
+    }
+
+    fn upload_tris(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slot: usize,
+        tris: &[DebugTriVertex],
+    ) -> Option<wgpu::Buffer> {
+        self.tris[slot].upload(device, queue, bytemuck::cast_slice(tris))
+    }
 }
 
 fn draw_debug_lines(
