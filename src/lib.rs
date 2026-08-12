@@ -45,7 +45,10 @@ pub use post_process::{
 pub use primitives::{cube, plane, sphere};
 pub use scene::Scene;
 pub use shadow::{ShadowFilter, ShadowSettings};
-pub use skin::Skin;
+pub use skin::{
+    blend_skin_matrix, blend_skin_point, blend_skin_vector, skin_mesh_matrix, skin_mesh_point,
+    DualQuat, Skin, SkinningMode,
+};
 pub use store::{Handle, Store};
 pub use texture::Texture;
 pub use view_gizmo::ViewAxis;

@@ -45,7 +45,9 @@ struct ObjectUniforms {
 @group(1) @binding(2) var normal_tex: texture_2d<f32>;
 @group(1) @binding(3) var mr_tex: texture_2d<f32>;
 @group(1) @binding(4) var samp: sampler;
-// Per-skin bone palette: width = joints*4 (mat columns), row0 = current, row1 = prev.
+// Per-skin bone palette: row0 = current, row1 = prev.
+// LBS (params.z≈1): 4 texels/joint = mat4 columns.
+// DQS (params.z≈2): 2 texels/joint = dual-quat real + dual.
 @group(2) @binding(0) var bone_tex: texture_2d<f32>;
 
 struct VertexInput {
@@ -77,7 +79,7 @@ fn identity4() -> mat4x4<f32> {
     );
 }
 
-fn load_bone(index: u32, row: i32) -> mat4x4<f32> {
+fn load_bone_mat(index: u32, row: i32) -> mat4x4<f32> {
     let i = i32(index) * 4;
     return mat4x4<f32>(
         textureLoad(bone_tex, vec2(i, row), 0),
@@ -87,24 +89,117 @@ fn load_bone(index: u32, row: i32) -> mat4x4<f32> {
     );
 }
 
-fn skin_matrix(in: VertexInput) -> mat4x4<f32> {
-    if object.params.z < 0.5 {
+fn load_bone_dq(index: u32, row: i32) -> mat2x4<f32> {
+    let i = i32(index) * 2;
+    return mat2x4<f32>(
+        textureLoad(bone_tex, vec2(i, row), 0),
+        textureLoad(bone_tex, vec2(i + 1, row), 0),
+    );
+}
+
+fn dq_to_mat(real: vec4<f32>, dual: vec4<f32>) -> mat4x4<f32> {
+    // Rotation from unit quaternion (xyzw).
+    let x = real.x;
+    let y = real.y;
+    let z = real.z;
+    let w = real.w;
+    let x2 = x + x;
+    let y2 = y + y;
+    let z2 = z + z;
+    let xx = x * x2;
+    let xy = x * y2;
+    let xz = x * z2;
+    let yy = y * y2;
+    let yz = y * z2;
+    let zz = z * z2;
+    let wx = w * x2;
+    let wy = w * y2;
+    let wz = w * z2;
+    // t = 2 * dual * conjugate(real)
+    let tx = 2.0 * (-dual.w * x + dual.x * w - dual.y * z + dual.z * y);
+    let ty = 2.0 * (-dual.w * y + dual.y * w + dual.x * z - dual.z * x);
+    let tz = 2.0 * (-dual.w * z + dual.z * w - dual.x * y + dual.y * x);
+    return mat4x4<f32>(
+        vec4<f32>(1.0 - (yy + zz), xy + wz, xz - wy, 0.0),
+        vec4<f32>(xy - wz, 1.0 - (xx + zz), yz + wx, 0.0),
+        vec4<f32>(xz + wy, yz - wx, 1.0 - (xx + yy), 0.0),
+        vec4<f32>(tx, ty, tz, 1.0),
+    );
+}
+
+fn blend_lbs(in: VertexInput, row: i32) -> mat4x4<f32> {
+    return load_bone_mat(in.joints.x, row) * in.weights.x
+        + load_bone_mat(in.joints.y, row) * in.weights.y
+        + load_bone_mat(in.joints.z, row) * in.weights.z
+        + load_bone_mat(in.joints.w, row) * in.weights.w;
+}
+
+fn blend_dqs(in: VertexInput, row: i32) -> mat4x4<f32> {
+    var real = vec4<f32>(0.0);
+    var dual = vec4<f32>(0.0);
+    var w_sum = 0.0;
+    var has_ref = false;
+    var ref_real = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+
+    let indices = array<u32, 4>(in.joints.x, in.joints.y, in.joints.z, in.joints.w);
+    let weights = array<f32, 4>(in.weights.x, in.weights.y, in.weights.z, in.weights.w);
+
+    for (var k = 0; k < 4; k++) {
+        let w = weights[k];
+        if w <= 0.0 {
+            continue;
+        }
+        let dq = load_bone_dq(indices[k], row);
+        var r = dq[0];
+        var d = dq[1];
+        if !has_ref {
+            ref_real = r;
+            has_ref = true;
+        } else if dot(ref_real, r) < 0.0 {
+            r = -r;
+            d = -d;
+        }
+        real += r * w;
+        dual += d * w;
+        w_sum += w;
+    }
+
+    if w_sum < 1e-6 {
         return identity4();
     }
-    return load_bone(in.joints.x, 0) * in.weights.x
-        + load_bone(in.joints.y, 0) * in.weights.y
-        + load_bone(in.joints.z, 0) * in.weights.z
-        + load_bone(in.joints.w, 0) * in.weights.w;
+    if abs(w_sum - 1.0) > 1e-3 {
+        real /= w_sum;
+        dual /= w_sum;
+    }
+    let len = length(real);
+    if len < 1e-8 {
+        return identity4();
+    }
+    real /= len;
+    dual /= len;
+    return dq_to_mat(real, dual);
+}
+
+fn skin_matrix(in: VertexInput) -> mat4x4<f32> {
+    let mode = object.params.z;
+    if mode < 0.5 {
+        return identity4();
+    }
+    if mode < 1.5 {
+        return blend_lbs(in, 0);
+    }
+    return blend_dqs(in, 0);
 }
 
 fn prev_skin_matrix(in: VertexInput) -> mat4x4<f32> {
-    if object.params.z < 0.5 {
+    let mode = object.params.z;
+    if mode < 0.5 {
         return identity4();
     }
-    return load_bone(in.joints.x, 1) * in.weights.x
-        + load_bone(in.joints.y, 1) * in.weights.y
-        + load_bone(in.joints.z, 1) * in.weights.z
-        + load_bone(in.joints.w, 1) * in.weights.w;
+    if mode < 1.5 {
+        return blend_lbs(in, 1);
+    }
+    return blend_dqs(in, 1);
 }
 
 fn clip_to_uv(clip: vec4<f32>) -> vec2<f32> {

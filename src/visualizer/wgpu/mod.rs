@@ -1,6 +1,7 @@
 use super::Visualizer;
 use crate::{
-    DebugView, Handle, Mesh, PostProcessSettings, Scene, ShadowFilter, ShadowSettings, Texture,
+    DebugView, DualQuat, Handle, Mesh, PostProcessSettings, Scene, ShadowFilter, ShadowSettings,
+    SkinningMode, Texture,
 };
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
@@ -25,14 +26,22 @@ use sss_lut::GpuSssLut;
 
 const DEFAULT_SHADOW_SIZE: u32 = 2048;
 const MAX_LIGHTS: usize = 8;
-const MAX_BONES: usize = 128;
+const MAX_BONES: usize = 255;
 const OBJECT_UBO_SIZE: u64 = (std::mem::size_of::<ObjectUniforms>() as u64 + 255) & !255;
 const OBJECT_STRIDE: u64 = OBJECT_UBO_SIZE;
 const SHADOW_EXTENT: f32 = 14.0;
 
+/// Texels per joint: mat4 columns (LBS) or dual-quat real+dual (DQS).
+fn bone_stride(mode: SkinningMode) -> u32 {
+    match mode {
+        SkinningMode::LinearBlend => 4,
+        SkinningMode::DualQuat => 2,
+    }
+}
+
 /// `write_texture` requires bytes_per_row % 256 == 0 → width % 16 == 0 for RGBA32Float.
-fn bone_tex_width(joint_count: usize) -> u32 {
-    let w = joint_count.max(1).min(MAX_BONES) as u32 * 4;
+fn bone_tex_width(joint_count: usize, mode: SkinningMode) -> u32 {
+    let w = joint_count.max(1).min(MAX_BONES) as u32 * bone_stride(mode);
     w.div_ceil(16) * 16
 }
 
@@ -128,7 +137,7 @@ struct ShadowFrame {
 struct ObjectUniforms {
     model: [[f32; 4]; 4],
     albedo: [f32; 4],
-    /// metallic, roughness, skinned, sss_strength
+    /// metallic, roughness, skin mode (0=off, 1=LBS, 2=DQS), sss_strength
     params: [f32; 4],
     /// rgb scatter tint, w = curvature
     sss: [f32; 4],
@@ -136,11 +145,13 @@ struct ObjectUniforms {
 }
 
 /// Per-skin bone palette texture (RGBA32F, row0=current, row1=prev).
+/// LBS: 4 texels/joint (mat columns). DQS: 2 texels/joint (real, dual).
 struct GpuSkinBones {
     texture: wgpu::Texture,
     _view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
     width: u32,
+    mode: SkinningMode,
     prev: Vec<Mat4>,
     has_history: bool,
 }
@@ -221,6 +232,8 @@ pub struct WgpuVisualizer {
     object_material_bgs: HashMap<[(u32, u32); 3], wgpu::BindGroup>,
     /// One small bone texture per skin.
     skin_bones: HashMap<(u32, u32), GpuSkinBones>,
+    /// Last uploaded skinning layout — recreate palettes when mode flips.
+    skin_upload_mode: SkinningMode,
     _identity_bone_tex: wgpu::Texture,
     identity_bone_bg: wgpu::BindGroup,
     /// Previous model matrix per mesh node (for velocity).
@@ -805,6 +818,7 @@ impl WgpuVisualizer {
             default_object_bg,
             object_material_bgs: HashMap::new(),
             skin_bones: HashMap::new(),
+            skin_upload_mode: SkinningMode::LinearBlend,
             _identity_bone_tex: identity_bone_tex,
             identity_bone_bg,
             prev_models: HashMap::new(),
@@ -868,10 +882,10 @@ impl WgpuVisualizer {
         self.invalidate_object_bind_groups();
     }
 
-    fn ensure_skin_bones(&mut self, skin_key: (u32, u32), joint_count: usize) {
-        let width = bone_tex_width(joint_count);
+    fn ensure_skin_bones(&mut self, skin_key: (u32, u32), joint_count: usize, mode: SkinningMode) {
+        let width = bone_tex_width(joint_count, mode);
         let needs_new = match self.skin_bones.get(&skin_key) {
-            Some(s) => s.width < width,
+            Some(s) => s.width < width || s.mode != mode,
             None => true,
         };
         if !needs_new {
@@ -886,31 +900,52 @@ impl WgpuVisualizer {
             &self.device,
             &self.bone_bind_layout,
             width,
+            mode,
             prev.0,
             prev.1,
         );
         self.skin_bones.insert(skin_key, gpu);
     }
 
-    fn upload_skin_bones(&mut self, skin_key: (u32, u32), mats: &[Mat4]) {
-        self.ensure_skin_bones(skin_key, mats.len());
+    fn upload_skin_bones(&mut self, skin_key: (u32, u32), mats: &[Mat4], mode: SkinningMode) {
+        self.ensure_skin_bones(skin_key, mats.len(), mode);
         let Some(gpu) = self.skin_bones.get_mut(&skin_key) else {
             return;
         };
         let width = gpu.width as usize;
         let mut pixels = vec![[0.0f32; 4]; width * 2];
         let n = mats.len().min(MAX_BONES);
-        for i in 0..n {
-            let cur = mats[i].to_cols_array_2d();
-            let prev = if gpu.has_history {
-                gpu.prev.get(i).copied().unwrap_or(mats[i])
-            } else {
-                mats[i]
+        let stride = bone_stride(mode) as usize;
+        match mode {
+            SkinningMode::LinearBlend => {
+                for i in 0..n {
+                    let cur = mats[i].to_cols_array_2d();
+                    let prev = if gpu.has_history {
+                        gpu.prev.get(i).copied().unwrap_or(mats[i])
+                    } else {
+                        mats[i]
+                    }
+                    .to_cols_array_2d();
+                    for c in 0..4 {
+                        pixels[i * stride + c] = cur[c];
+                        pixels[width + i * stride + c] = prev[c];
+                    }
+                }
             }
-            .to_cols_array_2d();
-            for c in 0..4 {
-                pixels[i * 4 + c] = cur[c];
-                pixels[width + i * 4 + c] = prev[c];
+            SkinningMode::DualQuat => {
+                for i in 0..n {
+                    let cur = DualQuat::from_mat4(mats[i]).to_texels();
+                    let prev_m = if gpu.has_history {
+                        gpu.prev.get(i).copied().unwrap_or(mats[i])
+                    } else {
+                        mats[i]
+                    };
+                    let prev = DualQuat::from_mat4(prev_m).to_texels();
+                    pixels[i * stride] = cur[0];
+                    pixels[i * stride + 1] = cur[1];
+                    pixels[width + i * stride] = prev[0];
+                    pixels[width + i * stride + 1] = prev[1];
+                }
             }
         }
         self.queue.write_texture(
@@ -1212,7 +1247,7 @@ impl WgpuVisualizer {
             let mut skin_key = None;
             if let Some(skin_h) = node.skin {
                 if scene.meshes.get(mesh_h).is_some_and(|m| m.joints.is_some()) {
-                    params[2] = 1.0;
+                    params[2] = scene.skinning_mode.shader_flag();
                     let key = skin_h.key();
                     skins_to_upload.entry(key).or_insert((skin_h, h));
                     skin_key = Some(key);
@@ -1233,12 +1268,18 @@ impl WgpuVisualizer {
             ));
         }
 
+        let skin_mode = scene.skinning_mode;
+        if self.skin_upload_mode != skin_mode {
+            self.skin_bones.clear();
+            self.skin_upload_mode = skin_mode;
+        }
+
         for (skin_key, (skin_h, mesh_node)) in &skins_to_upload {
             let mats = scene.joint_matrices_with_cache(*skin_h, *mesh_node, &world);
             if mats.is_empty() {
                 continue;
             }
-            self.upload_skin_bones(*skin_key, &mats);
+            self.upload_skin_bones(*skin_key, &mats, skin_mode);
         }
 
         self.ensure_object_slots(draws.len() as u64);
@@ -2348,6 +2389,7 @@ fn create_skin_bone_tex(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     width: u32,
+    mode: SkinningMode,
     prev: Vec<Mat4>,
     has_history: bool,
 ) -> GpuSkinBones {
@@ -2379,6 +2421,7 @@ fn create_skin_bone_tex(
         _view: view,
         bind_group,
         width,
+        mode,
         prev,
         has_history,
     }
@@ -2389,7 +2432,7 @@ fn identity_bone_palette(
     queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
 ) -> (wgpu::Texture, wgpu::BindGroup) {
-    let width = bone_tex_width(1);
+    let width = bone_tex_width(1, SkinningMode::LinearBlend);
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("identity_bones"),
         size: wgpu::Extent3d {

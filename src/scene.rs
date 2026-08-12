@@ -6,7 +6,7 @@ use super::light::{DirectionalLight, Light};
 use super::material::Material;
 use super::mesh::Mesh;
 use super::node::Node;
-use super::skin::Skin;
+use super::skin::{Skin, SkinningMode};
 use super::store::{Handle, Store};
 use super::texture::Texture;
 use glam::{Mat4, Vec3};
@@ -38,6 +38,8 @@ pub struct Scene {
     pub debug: DebugDraw,
     /// Immediate screen-space HUD (built each frame, drawn on top).
     pub hud: Hud,
+    /// LBS vs dual-quaternion skinning (GPU bone palette + CPU helpers).
+    pub skinning_mode: SkinningMode,
     pub(crate) pending_loads: Vec<PendingLoad>,
 }
 
@@ -57,6 +59,7 @@ impl Scene {
             clear_color: [0.08, 0.09, 0.12, 1.0],
             debug: DebugDraw::default(),
             hud: Hud::new(),
+            skinning_mode: SkinningMode::default(),
             pending_loads: Vec::new(),
         }
     }
