@@ -22,6 +22,8 @@ mod store;
 mod texture;
 pub mod view_gizmo;
 mod visualizer;
+#[cfg(feature = "xr")]
+pub mod xr;
 
 pub use animation::{AnimChannel, AnimPath, AnimValues, AnimationClip, Animator};
 pub use camera::{Camera, Projection};

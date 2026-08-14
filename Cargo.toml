@@ -11,8 +11,20 @@ image = { version = "0.25.10", default-features = false, features = ["webp", "pn
 half = "2"
 gltf = { version = "1.4", features = ["import", "utils"] }
 
+# Optional VR support (see src/xr). Off by default — pulls in no extra deps
+# unless the `xr` feature is enabled.
+openxr = { version = "0.21", default-features = false, features = ["loaded"], optional = true }
+ash = { version = "0.38", default-features = false, features = ["loaded", "std"], optional = true }
+
+[features]
+default = []
+# OpenXR/VR support. Forces a dedicated Vulkan instance+device for the XR
+# session (interop requirement); the desktop wgpu path is unaffected.
+xr = ["dep:openxr", "dep:ash"]
+
 [dev-dependencies]
 arboard = "3"
+ctrlc = "3"
 env_logger = "0.11"
 log = "0.4"
 # Demo-only UI. Path dep keeps mega-render ↔ mega-ui free of cycles
@@ -32,3 +44,13 @@ path = "examples/hud_demo.rs"
 [[example]]
 name = "debug_draw"
 path = "examples/debug_draw.rs"
+
+[[example]]
+name = "xr_hello"
+path = "examples/xr_hello.rs"
+required-features = ["xr"]
+
+[[example]]
+name = "xr_scene"
+path = "examples/xr_scene.rs"
+required-features = ["xr"]

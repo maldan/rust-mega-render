@@ -1558,11 +1558,7 @@ impl WgpuVisualizer {
             );
 
             if env_on {
-                let view = glam::camera::lh::view::look_at_mat4(
-                    scene.camera.eye,
-                    scene.camera.target,
-                    scene.camera.up,
-                );
+                let view = scene.camera.view();
                 let view_rot = Mat4::from_cols(view.x_axis, view.y_axis, view.z_axis, glam::Vec4::W);
                 let proj = scene.camera.proj(aspect);
                 let inv_view_proj = (proj * view_rot).inverse();
@@ -1594,11 +1590,7 @@ impl WgpuVisualizer {
         let proj = scene.camera.proj(aspect);
 
         if self.debug_view == DebugView::Final && self.post.any_enabled() {
-            let view = glam::camera::lh::view::look_at_mat4(
-                scene.camera.eye,
-                scene.camera.target,
-                scene.camera.up,
-            );
+            let view = scene.camera.view();
             let light_dir = scene.lights.iter().find_map(|l| match l {
                 crate::Light::Directional(d) if d.enabled => Some(d.direction),
                 _ => None,
@@ -1636,11 +1628,7 @@ impl WgpuVisualizer {
                 frame_dt,
             );
         } else {
-            let view = glam::camera::lh::view::look_at_mat4(
-                scene.camera.eye,
-                scene.camera.target,
-                scene.camera.up,
-            );
+            let view = scene.camera.view();
             let ao = if self.debug_view == DebugView::Ao {
                 self.post_fx.generate_ao(
                     &self.device,
