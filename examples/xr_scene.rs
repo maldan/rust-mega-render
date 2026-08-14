@@ -1,6 +1,9 @@
 //! Stage 2: a real scene (ground plane + cubes + spheres) rendered in VR via
-//! `WgpuVisualizer`, with flight locomotion on the controller thumbstick —
-//! push forward to fly wherever the headset is looking, pull back to reverse.
+//! `WgpuVisualizer`, with two-stick flight controls: the left thumbstick
+//! flies wherever the headset is looking (push forward to go, pull back to
+//! reverse, strafe left/right), and the right thumbstick smooth-turns the
+//! view (yaw left/right, pitch up/down) beyond what the physical headset
+//! alone can look.
 //!
 //! Architecture: [`mega_render::xr::XrWgpu`] bridges the OpenXR-owned Vulkan
 //! device into a real `wgpu::Device`/`Queue` (via `wgpu-hal`), so the exact
@@ -18,13 +21,19 @@
 
 use glam::{Quat, Vec2, Vec3};
 use mega_render::xr::{wrap_swapchain_images, Hand, XrActions, XrContext, XrPollResult, XrWgpu, XR_COLOR_FORMAT_VK};
-use mega_render::{cube, plane, sphere, Camera, Light, Material, Node, Scene, Transform, Visualizer, WgpuVisualizer};
+use mega_render::{
+    cube, plane, sphere, Camera, DirectionalLight, Handle, Light, Material, Node, Scene,
+    Transform, Visualizer, WgpuVisualizer,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 /// Flight speed in meters/second at full stick deflection.
 const FLY_SPEED: f32 = 3.0;
+
+/// Smooth-turn speed in radians/second at full stick deflection (right hand).
+const TURN_SPEED: f32 = 1.8;
 
 fn build_scene() -> Scene {
     let mut scene = Scene::new();
@@ -33,6 +42,18 @@ fn build_scene() -> Scene {
         d.intensity = 3.0;
         d.direction = Vec3::new(0.3, -0.6, 0.5);
     }
+    // Shadowless fill light from behind and above (physical "forward" maps
+    // to engine `+Z` here, so "behind" is `-Z`; the direction below is where
+    // the light *travels*, i.e. positive Z/negative Y = from behind-above
+    // toward the scene) — softens the backs of objects the main shadow-caster
+    // leaves dark, without a second shadow map.
+    scene.lights.push(Light::Directional(DirectionalLight {
+        direction: Vec3::new(-0.15, 0.55, -0.8).normalize(),
+        color: [0.65, 0.72, 0.85],
+        intensity: 1.4,
+        enabled: true,
+        cast_shadows: false,
+    }));
 
     let mesh_plane = scene.meshes.insert(plane(30.0, 30.0));
     let mesh_cube = scene.meshes.insert(cube(0.6));
@@ -119,7 +140,73 @@ fn build_scene() -> Scene {
         visible: true,
     });
 
+    // A row of glTF models beyond the cube/sphere ring, so they're right in
+    // front of you when you first put the headset on — physical "forward"
+    // maps to engine `+Z` here (see `to_engine`'s doc comment below), so
+    // these sit at positive Z, not negative.
+    let models = [
+        (r"F:\3d\tripo_ai\boa.glb", Vec3::new(-4.5, 0.0, 8.0)),
+        (r"F:\3d\tripo_ai\bulma_full.glb", Vec3::new(-3.0, 0.0, 8.0)),
+        (r"F:\3d\tripo_ai\cammy_full.glb", Vec3::new(-1.5, 0.0, 8.0)),
+        (r"F:\3d\tripo_ai\chunli_full.glb", Vec3::new(0.0, 0.0, 8.0)),
+        (r"F:\3d\tripo_ai\zangya_full.glb", Vec3::new(1.5, 0.0, 8.0)),
+        (r"F:\3d\tripo_ai\rangiku_full.glb", Vec3::new(3.0, 0.0, 8.0)),
+        (r"F:\3d\tripo_ai\2b.glb", Vec3::new(4.5, 0.0, 8.0)),
+    ];
+    for &(path, offset) in &models {
+        // `load_gltf_async` spawns a worker thread and only ever reports
+        // failure through `Scene::poll_loads`'s `eprintln` (never panics),
+        // but checking up front avoids spawning a thread and logging an
+        // error for models that simply aren't present on this machine
+        // (these are local test assets, not shipped with the repo).
+        if !std::path::Path::new(path).is_file() {
+            eprintln!("xr_scene: skipping missing model {path}");
+            continue;
+        }
+        scene.load_gltf_async(path, Some(root), move |scene, h| {
+            if let Some(n) = scene.nodes.get_mut(h) {
+                // These positions are in the desktop/glTF `-Z`-away
+                // convention already shared by the rest of this scene, so no
+                // `to_engine` conversion is needed here (that only applies
+                // to live OpenXR poses, not authored scene content).
+                n.local.translation += offset;
+            }
+            enable_sss_on_subtree(scene, h);
+        });
+    }
+
     scene
+}
+
+/// Enable pre-integrated SSS on every material under a loaded model (test hack).
+fn enable_sss_on_subtree(scene: &mut Scene, root: Handle<Node>) {
+    let mut stack = vec![root];
+    let mut mats = Vec::new();
+    while let Some(h) = stack.pop() {
+        if let Some(n) = scene.nodes.get(h) {
+            if let Some(m) = n.material {
+                mats.push(m);
+            }
+        }
+        for (child, node) in scene.nodes.iter() {
+            if node.parent.map(|p| p.key()) == Some(h.key()) {
+                stack.push(child);
+            }
+        }
+    }
+    mats.sort_by_key(|m| m.key());
+    mats.dedup_by_key(|m| m.key());
+    for m in mats {
+        if let Some(mat) = scene.materials.get_mut(m) {
+            // Skip obvious metals so chrome bits don't go waxy.
+            if mat.metallic > 0.85 {
+                continue;
+            }
+            mat.sss_strength = 1.0;
+            mat.sss_color = [1.0, 0.32, 0.18];
+            mat.sss_curvature = 0.7;
+        }
+    }
 }
 
 /// Converts a vector (position or direction) from OpenXR's right-handed,
@@ -172,8 +259,15 @@ fn main() {
 
     let mut swapchain: Option<(mega_render::xr::XrSwapchain, Vec<mega_render::xr::XrSwapchainImage>)> = None;
 
-    // Player position offset in stage space — this is what "flying" moves.
-    let mut player_pos = Vec3::ZERO;
+    // The "rig" transform: everything the right-hand stick (look) and
+    // left-hand stick (fly) control, applied on top of the raw headset
+    // tracking. `rig_rot` composes with the headset's own orientation so you
+    // can look further left/right/up/down than the physical headset alone
+    // allows; `rig_pos` is the flight offset, expressed in the *rig's*
+    // rotated frame so "forward" always means "wherever the headset is
+    // currently looking, including the rig's own turn".
+    let mut rig_rot = Quat::IDENTITY;
+    let mut rig_pos = Vec3::ZERO;
     let mut last_frame = Instant::now();
 
     println!("xr_scene: waiting for session to become ready (put the headset on)...");
@@ -198,6 +292,13 @@ fn main() {
             eprintln!("xr_scene: action sync failed: {e}");
         }
 
+        // Apply any glTF loads kicked off by `build_scene`'s
+        // `load_gltf_async` calls once they finish on their background
+        // thread, then re-sync the GPU-side scene so the visualizer picks up
+        // the newly-added nodes/meshes/materials.
+        scene.poll_loads();
+        visualizer.sync(&scene);
+
         let Some(frame) = xr.wait_frame().expect("wait_frame") else {
             continue;
         };
@@ -219,7 +320,9 @@ fn main() {
 
         let views = xr.locate_views(&frame).expect("locate_views");
 
-        // --- Locomotion: fly wherever the headset is looking. ---
+        // --- Right stick: smooth-turn (yaw + pitch), pivoting around the
+        // head so turning in place doesn't fling you around the room. ---
+        // --- Left stick: fly wherever the (rig-turned) headset is looking. ---
         let now = Instant::now();
         let dt = (now - last_frame).as_secs_f32().clamp(0.0, 0.1);
         last_frame = now;
@@ -230,14 +333,41 @@ fn main() {
                 head.pose.orientation.z,
                 head.pose.orientation.w,
             );
-            let forward = to_engine(head_rot * Vec3::NEG_Z);
-            let right = to_engine(head_rot * Vec3::X);
+            let head_pos = to_engine(Vec3::new(
+                head.pose.position.x,
+                head.pose.position.y,
+                head.pose.position.z,
+            ));
 
-            let stick = actions.stick(xr.session(), Hand::Left) + actions.stick(xr.session(), Hand::Right);
-            let stick: Vec2 = Vec2::new(stick.x.clamp(-1.0, 1.0), stick.y.clamp(-1.0, 1.0));
-            if stick.length_squared() > 1e-4 {
-                let dir = (forward * stick.y + right * stick.x).normalize_or_zero();
-                player_pos += dir * FLY_SPEED * stick.length().min(1.0) * dt;
+            let turn = actions.stick(xr.session(), Hand::Right);
+            let d_yaw = turn.x.clamp(-1.0, 1.0) * TURN_SPEED * dt;
+            let d_pitch = -turn.y.clamp(-1.0, 1.0) * TURN_SPEED * dt;
+            if d_yaw.abs() > 1e-6 || d_pitch.abs() > 1e-6 {
+                // World-space rotation delta this frame: yaw around the
+                // global up axis, then pitch around the rig's (post-yaw)
+                // right axis, so "look up/down" always tilts relative to
+                // where you're currently facing.
+                let yaw_delta = Quat::from_axis_angle(Vec3::Y, d_yaw);
+                let right_axis = (yaw_delta * rig_rot) * Vec3::X;
+                let pitch_delta = Quat::from_axis_angle(right_axis, d_pitch);
+                let turn_delta = pitch_delta * yaw_delta;
+
+                // Rotate in place around the head's current world position,
+                // not the room's tracking origin — otherwise turning would
+                // swing your position around the play space center.
+                let head_world_before = rig_rot * head_pos + rig_pos;
+                rig_pos = head_world_before - turn_delta * (head_world_before - rig_pos);
+                rig_rot = (turn_delta * rig_rot).normalize();
+            }
+
+            let forward = rig_rot * to_engine(head_rot * Vec3::NEG_Z);
+            let right = rig_rot * to_engine(head_rot * Vec3::X);
+
+            let fly = actions.stick(xr.session(), Hand::Left);
+            let fly: Vec2 = Vec2::new(fly.x.clamp(-1.0, 1.0), fly.y.clamp(-1.0, 1.0));
+            if fly.length_squared() > 1e-4 {
+                let dir = (forward * fly.y + right * fly.x).normalize_or_zero();
+                rig_pos += dir * FLY_SPEED * fly.length().min(1.0) * dt;
             }
         }
 
@@ -246,19 +376,22 @@ fn main() {
 
         for eye in 0..mega_render::xr::VIEW_COUNT as usize {
             let Some(view) = views.get(eye) else { continue };
-            let eye_pos = to_engine(Vec3::new(
+            let raw_eye_pos = to_engine(Vec3::new(
                 view.pose.position.x,
                 view.pose.position.y,
                 view.pose.position.z,
-            )) + player_pos;
+            ));
             let eye_rot = Quat::from_xyzw(
                 view.pose.orientation.x,
                 view.pose.orientation.y,
                 view.pose.orientation.z,
                 view.pose.orientation.w,
             );
-            let forward = to_engine(eye_rot * Vec3::NEG_Z).normalize_or_zero();
-            let up = to_engine(eye_rot * Vec3::Y).normalize_or_zero();
+            // Apply the rig's turn/fly transform on top of the raw headset
+            // pose, same as the locomotion step above.
+            let eye_pos = rig_rot * raw_eye_pos + rig_pos;
+            let forward = (rig_rot * to_engine(eye_rot * Vec3::NEG_Z)).normalize_or_zero();
+            let up = (rig_rot * to_engine(eye_rot * Vec3::Y)).normalize_or_zero();
 
             let near = 0.05;
             let far = 100.0;
