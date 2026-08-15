@@ -26,12 +26,18 @@ pub struct XrActions {
     /// action's parent set); not read directly elsewhere.
     #[allow(dead_code)]
     grip_pose: xr::Action<xr::Posef>,
+    /// Kept alive for `left_aim_space`/`right_aim_space`, same reason as
+    /// `grip_pose` above.
+    #[allow(dead_code)]
+    aim_pose: xr::Action<xr::Posef>,
     stick: xr::Action<xr::Vector2f>,
     select: xr::Action<f32>,
     left_path: xr::Path,
     right_path: xr::Path,
     left_space: xr::Space,
     right_space: xr::Space,
+    left_aim_space: xr::Space,
+    right_aim_space: xr::Space,
 }
 
 impl XrActions {
@@ -43,6 +49,11 @@ impl XrActions {
 
         let grip_pose =
             set.create_action::<xr::Posef>("grip_pose", "Grip Pose", &hand_paths)?;
+        // Distinct from `grip_pose`: the spec defines `aim` specifically so
+        // its `-Z` axis points wherever the controller is "aimed" (laser
+        // pointer convention), unlike `grip` which is oriented for rendering
+        // a hand/controller model and whose `-Z` points out of the palm.
+        let aim_pose = set.create_action::<xr::Posef>("aim_pose", "Aim Pose", &hand_paths)?;
         let stick = set.create_action::<xr::Vector2f>("stick", "Thumbstick", &hand_paths)?;
         let select = set.create_action::<f32>("select", "Select", &hand_paths)?;
 
@@ -52,6 +63,7 @@ impl XrActions {
             xr_instance,
             "/interaction_profiles/oculus/touch_controller",
             &grip_pose,
+            &aim_pose,
             &stick,
             &select,
             "thumbstick",
@@ -63,6 +75,7 @@ impl XrActions {
             xr_instance,
             "/interaction_profiles/valve/index_controller",
             &grip_pose,
+            &aim_pose,
             &stick,
             &select,
             "thumbstick",
@@ -74,6 +87,7 @@ impl XrActions {
             xr_instance,
             "/interaction_profiles/microsoft/motion_controller",
             &grip_pose,
+            &aim_pose,
             &stick,
             &select,
             "thumbstick",
@@ -85,6 +99,7 @@ impl XrActions {
             xr_instance,
             "/interaction_profiles/htc/vive_controller",
             &grip_pose,
+            &aim_pose,
             &stick,
             &select,
             "trackpad",
@@ -97,16 +112,21 @@ impl XrActions {
 
         let left_space = grip_pose.create_space(session, left_path, xr::Posef::IDENTITY)?;
         let right_space = grip_pose.create_space(session, right_path, xr::Posef::IDENTITY)?;
+        let left_aim_space = aim_pose.create_space(session, left_path, xr::Posef::IDENTITY)?;
+        let right_aim_space = aim_pose.create_space(session, right_path, xr::Posef::IDENTITY)?;
 
         Ok(Self {
             set,
             grip_pose,
+            aim_pose,
             stick,
             select,
             left_path,
             right_path,
             left_space,
             right_space,
+            left_aim_space,
+            right_aim_space,
         })
     }
 
@@ -130,6 +150,13 @@ impl XrActions {
         }
     }
 
+    fn aim_space(&self, hand: Hand) -> &xr::Space {
+        match hand {
+            Hand::Left => &self.left_aim_space,
+            Hand::Right => &self.right_aim_space,
+        }
+    }
+
     /// Thumbstick/trackpad axes in `[-1, 1]` (x = left/right, y = forward/back push).
     pub fn stick(&self, session: &xr::Session<xr::Vulkan>, hand: Hand) -> Vec2 {
         match self.stick.state(session, self.hand_path(hand)) {
@@ -146,30 +173,40 @@ impl XrActions {
         }
     }
 
-    /// Controller pose relative to `base` (normally [`super::session::XrContext::stage`]).
-    pub fn hand_pose(
-        &self,
-        base: &xr::Space,
-        hand: Hand,
-        time: xr::Time,
-    ) -> Option<HandPose> {
-        let loc = self.hand_space(hand).locate(base, time).ok()?;
-        if !loc
-            .location_flags
-            .contains(xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID)
-        {
-            return None;
-        }
-        Some(HandPose {
-            position: Vec3::new(loc.pose.position.x, loc.pose.position.y, loc.pose.position.z),
-            orientation: Quat::from_xyzw(
-                loc.pose.orientation.x,
-                loc.pose.orientation.y,
-                loc.pose.orientation.z,
-                loc.pose.orientation.w,
-            ),
-        })
+    /// Controller grip pose relative to `base` (normally
+    /// [`super::session::XrContext::stage`]) — oriented for rendering a
+    /// hand/controller model in-hand, *not* for pointing. Use [`Self::aim_pose`]
+    /// for ray-casting/laser-pointer direction.
+    pub fn hand_pose(&self, base: &xr::Space, hand: Hand, time: xr::Time) -> Option<HandPose> {
+        locate(self.hand_space(hand), base, time)
     }
+
+    /// Controller aim pose relative to `base` (normally
+    /// [`super::session::XrContext::stage`]) — its local `-Z` axis points
+    /// wherever the controller is aimed, per the OpenXR spec's laser-pointer
+    /// convention. Use this (not [`Self::hand_pose`]) for pointing rays.
+    pub fn aim_pose(&self, base: &xr::Space, hand: Hand, time: xr::Time) -> Option<HandPose> {
+        locate(self.aim_space(hand), base, time)
+    }
+}
+
+fn locate(space: &xr::Space, base: &xr::Space, time: xr::Time) -> Option<HandPose> {
+    let loc = space.locate(base, time).ok()?;
+    if !loc
+        .location_flags
+        .contains(xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID)
+    {
+        return None;
+    }
+    Some(HandPose {
+        position: Vec3::new(loc.pose.position.x, loc.pose.position.y, loc.pose.position.z),
+        orientation: Quat::from_xyzw(
+            loc.pose.orientation.x,
+            loc.pose.orientation.y,
+            loc.pose.orientation.z,
+            loc.pose.orientation.w,
+        ),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -177,6 +214,7 @@ fn suggest(
     xr_instance: &xr::Instance,
     profile: &str,
     grip_pose: &xr::Action<xr::Posef>,
+    aim_pose: &xr::Action<xr::Posef>,
     stick: &xr::Action<xr::Vector2f>,
     select: &xr::Action<f32>,
     stick_component: &str,
@@ -188,12 +226,14 @@ fn suggest(
     let mut bindings = Vec::new();
     for (hand, hand_path) in [("left", left_path), ("right", right_path)] {
         let grip = xr_instance.string_to_path(&format!("/user/hand/{hand}/input/grip/pose"))?;
+        let aim = xr_instance.string_to_path(&format!("/user/hand/{hand}/input/aim/pose"))?;
         let stick_p =
             xr_instance.string_to_path(&format!("/user/hand/{hand}/input/{stick_component}"))?;
         let select_p =
             xr_instance.string_to_path(&format!("/user/hand/{hand}/input/{select_component}"))?;
         let _ = hand_path;
         bindings.push(xr::Binding::new(grip_pose, grip));
+        bindings.push(xr::Binding::new(aim_pose, aim));
         bindings.push(xr::Binding::new(stick, stick_p));
         bindings.push(xr::Binding::new(select, select_p));
     }

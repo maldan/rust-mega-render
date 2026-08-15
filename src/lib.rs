@@ -8,6 +8,7 @@ mod gltf_load;
 mod hud;
 mod hud_font;
 mod ibl;
+pub mod ik;
 mod input;
 mod light;
 mod material;
@@ -34,6 +35,7 @@ pub use debug_draw::{
 pub use debug_view::DebugView;
 pub use gltf_load::load_gltf;
 pub use hud::{Hud, HudId, HudLine, HudOutput, HudQuad, Rect as HudRect};
+pub use ik::{ccd_rotate_joint, quat_from_matrix, translate_bone_world, solve_ik, IkChainDef};
 pub use input::InputFrame;
 pub use light::{DirectionalLight, Light, PointLight};
 pub use material::Material;

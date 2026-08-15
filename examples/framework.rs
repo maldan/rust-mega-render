@@ -319,6 +319,11 @@ impl FrameInput {
             key_cut: self.key_cut,
             key_select_all: self.key_select_all,
             clipboard: self.clipboard_paste.clone(),
+            mouse_middle_down: false,
+            mouse_middle_pressed: false,
+            mouse_middle_released: false,
+            key_delete: false,
+            key_duplicate: false,
         }
     }
 }
