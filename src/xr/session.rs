@@ -89,18 +89,10 @@ pub struct XrContext {
 
 impl XrContext {
     pub fn new(app_name: &str) -> Result<Self, XrError> {
-        // SAFETY: `openxr_loader.dll` (or platform equivalent) must be present
-        // next to the executable / on the dynamic loader search path and must
-        // conform to the OpenXR spec. On Windows, copy it from your VR
-        // runtime's install dir (e.g. SteamVR's `bin/win64/openxr_loader.dll`)
-        // or the official `OpenXR.Loader` NuGet package.
-        let entry = unsafe {
-            xr::Entry::load().map_err(|e| {
-                XrError(format!(
-                    "failed to load OpenXR loader (openxr_loader.dll not found next to the exe?): {e}"
-                ))
-            })?
-        };
+        // SAFETY: the probed library (default name, OPENXR_LOADER, or a
+        // runtime install such as SteamVR) must be a spec-compliant OpenXR
+        // loader. We load it in-place — no copy next to the exe.
+        let entry = unsafe { super::loader::load_entry()? };
 
         let available = entry.enumerate_extensions()?;
         if !available.khr_vulkan_enable2 {
