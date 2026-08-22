@@ -193,7 +193,7 @@ pub fn blend_skin_vector(
 
 /// Skin a mesh vertex position (bind-space) with optional joints/weights.
 pub fn skin_mesh_point(mesh: &Mesh, mats: &[Mat4], i: usize, p: Vec3, mode: SkinningMode) -> Vec3 {
-    let (Some(joints), Some(weights)) = (&mesh.joints, &mesh.weights) else {
+    let (Some(joints), Some(weights)) = (mesh.joints.first(), mesh.weights.first()) else {
         return p;
     };
     if i >= joints.len() || i >= weights.len() {
@@ -203,7 +203,7 @@ pub fn skin_mesh_point(mesh: &Mesh, mats: &[Mat4], i: usize, p: Vec3, mode: Skin
 }
 
 pub fn skin_mesh_matrix(mesh: &Mesh, mats: &[Mat4], i: usize, mode: SkinningMode) -> Mat4 {
-    let (Some(joints), Some(weights)) = (&mesh.joints, &mesh.weights) else {
+    let (Some(joints), Some(weights)) = (mesh.joints.first(), mesh.weights.first()) else {
         return Mat4::IDENTITY;
     };
     if i >= joints.len() || i >= weights.len() {

@@ -13,11 +13,16 @@ pub struct MorphTarget {
 pub struct Mesh {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
-    pub uvs: Vec<[f32; 2]>,
+    /// UV columns (`[0]` is TEXCOORD_0). GPU currently uploads column 0 only.
+    pub uvs: Vec<Vec<[f32; 2]>>,
     /// xyz = tangent, w = bitangent sign
     pub tangents: Vec<[f32; 4]>,
-    pub joints: Option<Vec<[u16; 4]>>,
-    pub weights: Option<Vec<[f32; 4]>>,
+    /// Vertex color columns (`[0]` is COLOR_0). GPU currently uploads column 0 only.
+    pub colors: Vec<Vec<[f32; 4]>>,
+    /// Joint index columns, 4 influences each (`[0]` is JOINTS_0). GPU: column 0.
+    pub joints: Vec<Vec<[u16; 4]>>,
+    /// Joint weight columns (`[0]` is WEIGHTS_0). GPU: column 0.
+    pub weights: Vec<Vec<[f32; 4]>>,
     pub indices: Vec<u32>,
     pub version: u64,
     /// Rest positions. Empty until morphs are used (then captured from `positions`).
@@ -40,10 +45,11 @@ impl Mesh {
         Self {
             positions,
             normals,
-            uvs,
+            uvs: vec![uvs],
             tangents,
-            joints: None,
-            weights: None,
+            colors: Vec::new(),
+            joints: Vec::new(),
+            weights: Vec::new(),
             indices,
             version: 1,
             basis_positions: Vec::new(),
@@ -54,7 +60,13 @@ impl Mesh {
     }
 
     pub fn mark_changed(&mut self) {
-        self.tangents = compute_tangents(&self.positions, &self.normals, &self.uvs, &self.indices);
+        let uv0: &[[f32; 2]] = self.uvs.first().map(|c| c.as_slice()).unwrap_or(&[]);
+        self.tangents = compute_tangents(&self.positions, &self.normals, uv0, &self.indices);
+        self.version += 1;
+    }
+
+    /// Positions/normals/tangents moved in place (CPU skinning). Skips Mikktspace.
+    pub fn mark_vertices_moved(&mut self) {
         self.version += 1;
     }
 

@@ -5,6 +5,7 @@ mod camera;
 mod debug_draw;
 mod debug_view;
 mod gltf_load;
+pub mod hair;
 mod hud;
 mod hud_font;
 mod ibl;

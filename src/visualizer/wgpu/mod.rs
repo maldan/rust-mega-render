@@ -54,6 +54,7 @@ struct GpuVertex {
     tangent: [f32; 4],
     joints: [u16; 4],
     weights: [f32; 4],
+    color: [f32; 4],
 }
 
 #[repr(C)]
@@ -184,6 +185,7 @@ struct GpuSkinBones {
 struct GpuMesh {
     vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
+    vertex_count: u32,
     index_count: u32,
     synced: u64,
 }
@@ -604,6 +606,7 @@ impl WgpuVisualizer {
                 3 => Float32x4,
                 4 => Uint16x4,
                 5 => Float32x4,
+                6 => Float32x4,
             ],
         })];
 
@@ -1507,17 +1510,12 @@ impl WgpuVisualizer {
                 };
             let mut skin_key = None;
             if let Some(skin_h) = node.skin {
-                if scene.meshes.get(mesh_h).is_some_and(|m| m.joints.is_some()) {
+                if scene.meshes.get(mesh_h).is_some_and(|m| !m.joints.is_empty()) {
                     params[2] = scene.skinning_mode.shader_flag();
                     let key = skin_h.key();
                     skins_to_upload.entry(key).or_insert((skin_h, h));
                     skin_key = Some(key);
                 }
-            }
-            // Hair: params.z carries soft_blend (1) vs cutout/opaque cover (0).
-            // Must not collide with skinning flag — hair meshes are unskinned.
-            if is_hair {
-                params[2] = if soft_blend { 1.0 } else { 0.0 };
             }
             let model = world.get(&h.key()).copied().unwrap_or(Mat4::IDENTITY);
             draws.push(DrawItem {
@@ -1805,6 +1803,7 @@ impl WgpuVisualizer {
                     &self.default_object_bg,
                     &self.object_material_bgs,
                     &self.identity_bone_bg,
+                    &self.skin_bones,
                     default_maps,
                     &draws,
                 );
@@ -1826,6 +1825,7 @@ impl WgpuVisualizer {
                     &self.default_object_bg,
                     &self.object_material_bgs,
                     &self.identity_bone_bg,
+                    &self.skin_bones,
                     default_maps,
                     &draws,
                 );
@@ -1887,6 +1887,7 @@ impl WgpuVisualizer {
                             &self.default_object_bg,
                             &self.object_material_bgs,
                             &self.identity_bone_bg,
+                            &self.skin_bones,
                             default_maps,
                             i,
                             d,
@@ -1903,6 +1904,7 @@ impl WgpuVisualizer {
                             &self.default_object_bg,
                             &self.object_material_bgs,
                             &self.identity_bone_bg,
+                            &self.skin_bones,
                             default_maps,
                             i,
                             d,
@@ -1919,6 +1921,7 @@ impl WgpuVisualizer {
                             &self.default_object_bg,
                             &self.object_material_bgs,
                             &self.identity_bone_bg,
+                            &self.skin_bones,
                             default_maps,
                             i,
                             d,
@@ -1938,6 +1941,7 @@ impl WgpuVisualizer {
                             &self.default_object_bg,
                             &self.object_material_bgs,
                             &self.identity_bone_bg,
+                            &self.skin_bones,
                             default_maps,
                             i,
                             d,
@@ -2200,12 +2204,29 @@ impl WgpuVisualizer {
 impl Visualizer for WgpuVisualizer {
     fn sync(&mut self, scene: &Scene) {
         let mut live = HashMap::new();
+        let mut vert_scratch = Vec::new();
         for (h, mesh) in scene.meshes.iter() {
             let key = h.key();
             live.insert(key, ());
-            if self.meshes.get(&key).map(|g| g.synced) != Some(mesh.version) {
-                self.meshes.insert(key, upload_mesh(&self.device, mesh));
+            if self.meshes.get(&key).map(|g| g.synced) == Some(mesh.version) {
+                continue;
             }
+            pack_gpu_verts(mesh, &mut vert_scratch);
+            let vcount = vert_scratch.len() as u32;
+            let icount = mesh.indices.len() as u32;
+            if let Some(gpu) = self.meshes.get_mut(&key) {
+                if gpu.vertex_count == vcount && gpu.index_count == icount {
+                    self.queue.write_buffer(
+                        &gpu.vertex_buf,
+                        0,
+                        bytemuck::cast_slice(&vert_scratch),
+                    );
+                    gpu.synced = mesh.version;
+                    continue;
+                }
+            }
+            self.meshes
+                .insert(key, upload_mesh(&self.device, mesh, &vert_scratch));
         }
         self.meshes.retain(|k, _| live.contains_key(k));
 
@@ -2756,6 +2777,7 @@ fn draw_hair_items(
     default_object_bg: &wgpu::BindGroup,
     object_material_bgs: &HashMap<[(u32, u32); 3], wgpu::BindGroup>,
     identity_bone_bg: &wgpu::BindGroup,
+    skin_bones: &HashMap<(u32, u32), GpuSkinBones>,
     default_maps: ((u32, u32), (u32, u32), (u32, u32)),
     draws: &[DrawItem],
 ) {
@@ -2769,6 +2791,7 @@ fn draw_hair_items(
             default_object_bg,
             object_material_bgs,
             identity_bone_bg,
+            skin_bones,
             default_maps,
             i,
             d,
@@ -2782,6 +2805,7 @@ fn draw_hair_item(
     default_object_bg: &wgpu::BindGroup,
     object_material_bgs: &HashMap<[(u32, u32); 3], wgpu::BindGroup>,
     identity_bone_bg: &wgpu::BindGroup,
+    skin_bones: &HashMap<(u32, u32), GpuSkinBones>,
     default_maps: ((u32, u32), (u32, u32), (u32, u32)),
     i: usize,
     d: &DrawItem,
@@ -2800,7 +2824,11 @@ fn draw_hair_item(
         &object_material_bgs[&cache_key]
     };
     pass.set_bind_group(1, bg, &[(i as u32) * OBJECT_STRIDE as u32]);
-    pass.set_bind_group(2, identity_bone_bg, &[]);
+    if let Some(s) = d.skin_key.as_ref().and_then(|k| skin_bones.get(k)) {
+        pass.set_bind_group(2, &s.bind_group, &[]);
+    } else {
+        pass.set_bind_group(2, identity_bone_bg, &[]);
+    }
     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -3001,39 +3029,48 @@ fn identity_bone_palette(
     (texture, bind_group)
 }
 
-fn upload_mesh(device: &wgpu::Device, mesh: &Mesh) -> GpuMesh {
-    let verts: Vec<GpuVertex> = mesh
-        .positions
-        .iter()
-        .enumerate()
-        .map(|(i, p)| GpuVertex {
-            pos: *p,
-            normal: mesh.normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]),
-            uv: mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
-            tangent: mesh.tangents.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 1.0]),
-            joints: mesh
-                .joints
-                .as_ref()
-                .and_then(|j| j.get(i).copied())
-                .unwrap_or([0; 4]),
-            weights: mesh
-                .weights
-                .as_ref()
-                .and_then(|w| w.get(i).copied())
-                .unwrap_or([1.0, 0.0, 0.0, 0.0]),
-        })
-        .collect();
+fn pack_gpu_verts(mesh: &Mesh, out: &mut Vec<GpuVertex>) {
+    out.clear();
+    out.extend(mesh.positions.iter().enumerate().map(|(i, p)| GpuVertex {
+        pos: *p,
+        normal: mesh.normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]),
+        uv: mesh
+            .uvs
+            .first()
+            .and_then(|c| c.get(i).copied())
+            .unwrap_or([0.0, 0.0]),
+        tangent: mesh.tangents.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 1.0]),
+        joints: mesh
+            .joints
+            .first()
+            .and_then(|c| c.get(i).copied())
+            .unwrap_or([0; 4]),
+        weights: mesh
+            .weights
+            .first()
+            .and_then(|c| c.get(i).copied())
+            .unwrap_or([1.0, 0.0, 0.0, 0.0]),
+        color: mesh
+            .colors
+            .first()
+            .and_then(|c| c.get(i).copied())
+            .unwrap_or([1.0, 1.0, 1.0, 1.0]),
+    }));
+}
+
+fn upload_mesh(device: &wgpu::Device, mesh: &Mesh, verts: &[GpuVertex]) -> GpuMesh {
     GpuMesh {
         vertex_buf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh_vb"),
-            contents: bytemuck::cast_slice(&verts),
-            usage: wgpu::BufferUsages::VERTEX,
+            contents: bytemuck::cast_slice(verts),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         }),
         index_buf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh_ib"),
             contents: bytemuck::cast_slice(&mesh.indices),
-            usage: wgpu::BufferUsages::INDEX,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         }),
+        vertex_count: verts.len() as u32,
         index_count: mesh.indices.len() as u32,
         synced: mesh.version,
     }

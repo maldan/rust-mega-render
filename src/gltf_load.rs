@@ -529,8 +529,16 @@ fn load_primitive(
         .unwrap_or(default_mat);
 
     let mut mesh = Mesh::new(positions, normals, uvs, indices);
-    mesh.joints = joints;
-    mesh.weights = weights;
+    if let Some(j) = joints {
+        mesh.joints.push(j);
+    }
+    if let Some(w) = weights {
+        mesh.weights.push(w);
+    }
+    if let Some(iter) = reader.read_colors(0) {
+        mesh.colors
+            .push(iter.into_rgba_f32().map(|c| [c[0], c[1], c[2], c[3]]).collect());
+    }
 
     Ok((scene.meshes.insert(mesh), mat))
 }
