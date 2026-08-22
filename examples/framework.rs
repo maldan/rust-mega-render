@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use glam::{Vec2, Vec3};
 use mega_render::{
     Camera, DebugView, PostProcessSettings, Scene, ShadowSettings, Visualizer, WgpuVisualizer,
+    WGPU_FEATURES,
 };
 use mega_ui::wgpu::{DrawStats, UiRenderer};
 use mega_ui::{CursorIcon, DockState, Ui, UiInput};
@@ -449,7 +450,7 @@ impl<D: Demo> Host<D> {
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("mega-render demo"),
-            required_features: wgpu::Features::empty(),
+            required_features: adapter.features() & mega_render::WGPU_FEATURES,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             required_limits: limits,
             memory_hints: wgpu::MemoryHints::Performance,

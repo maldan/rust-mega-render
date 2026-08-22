@@ -4,6 +4,10 @@ pub use wgpu::WgpuVisualizer;
 
 use super::{DebugView, PostProcessSettings, Scene, ShadowSettings};
 
+/// Optional GPU features the wgpu visualizer uses (wireframe debug view).
+/// Intersect with `adapter.features()` when requesting a device.
+pub const WGPU_FEATURES: ::wgpu::Features = ::wgpu::Features::POLYGON_MODE_LINE;
+
 pub trait Visualizer {
     fn sync(&mut self, scene: &Scene);
     fn render(&mut self, scene: &Scene, aspect: f32);

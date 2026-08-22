@@ -13,6 +13,10 @@ struct ObjectUniforms {
 
 @group(0) @binding(0) var<uniform> frame: ShadowFrame;
 @group(1) @binding(0) var<uniform> object: ObjectUniforms;
+@group(1) @binding(1) var albedo_tex: texture_2d<f32>;
+@group(1) @binding(2) var normal_tex: texture_2d<f32>;
+@group(1) @binding(3) var mr_tex: texture_2d<f32>;
+@group(1) @binding(4) var samp: sampler;
 @group(2) @binding(0) var bone_tex: texture_2d<f32>;
 
 struct VertexInput {
@@ -143,9 +147,28 @@ fn skin_matrix(in: VertexInput) -> mat4x4<f32> {
     return blend_dqs(in);
 }
 
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
 @vertex
-fn vs_main(in: VertexInput) -> @builtin(position) vec4<f32> {
+fn vs_main(in: VertexInput) -> VertexOutput {
     let model = object.model * skin_matrix(in);
     let world = model * vec4<f32>(in.position, 1.0);
-    return frame.light_view_proj * world;
+    var out: VertexOutput;
+    out.clip_position = frame.light_view_proj * world;
+    out.uv = in.uv;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) {
+    let cutoff = object.albedo.a;
+    if cutoff > 0.001 {
+        let a = textureSample(albedo_tex, samp, in.uv).a;
+        if a < cutoff {
+            discard;
+        }
+    }
 }

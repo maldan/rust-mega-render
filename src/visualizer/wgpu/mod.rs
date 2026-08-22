@@ -136,12 +136,37 @@ struct ShadowFrame {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ObjectUniforms {
     model: [[f32; 4]; 4],
-    albedo: [f32; 4],
+    albedo: [f32; 4], // rgb tint, a = alpha cutoff
     /// metallic, roughness, skin mode (0=off, 1=LBS, 2=DQS), sss_strength
     params: [f32; 4],
     /// rgb scatter tint, w = curvature
     sss: [f32; 4],
     prev_model: [[f32; 4]; 4],
+    /// Hair-only: x = primary shift, y = secondary shift, z/w = primary/secondary exponent.
+    hair0: [f32; 4],
+    /// Hair-only: rgb = secondary tint, w = secondary strength.
+    hair1: [f32; 4],
+}
+
+/// A single draw call's worth of per-object data, collected once per frame and
+/// shared by the shadow pass, opaque G-buffer pass, and (for hair materials)
+/// the hair depth-prepass + blend passes.
+struct DrawItem {
+    node_key: (u32, u32),
+    mesh_key: (u32, u32),
+    albedo_key: Option<(u32, u32)>,
+    normal_key: Option<(u32, u32)>,
+    mr_key: Option<(u32, u32)>,
+    model: Mat4,
+    albedo: [f32; 4],
+    params: [f32; 4],
+    sss: [f32; 4],
+    hair0: [f32; 4],
+    hair1: [f32; 4],
+    is_hair: bool,
+    /// Hair: skip depth prepass → soft alpha composite between cards.
+    soft_blend: bool,
+    skin_key: Option<(u32, u32)>,
 }
 
 /// Per-skin bone palette texture (RGBA32F, row0=current, row1=prev).
@@ -168,6 +193,7 @@ struct GpuTexture {
     texture: wgpu::Texture,
     width: u32,
     height: u32,
+    mips: u32,
     srgb: bool,
     /// Matches [`Texture::gpu_resident`] — STORAGE + host-owned pixels.
     resident: bool,
@@ -179,6 +205,24 @@ pub struct WgpuVisualizer {
     queue: wgpu::Queue,
     /// MRT HDR mesh pipeline — 5 color targets (color / normal / orm / albedo / velocity).
     pipeline: wgpu::RenderPipeline,
+    /// Depth-only prepass for hair (hard alpha-test) — seeds hidden-surface
+    /// removal before the blended hair pass, avoiding the need for full
+    /// per-triangle back-to-front sorting.
+    hair_depth_pipeline: wgpu::RenderPipeline,
+    /// Soft-blend hair (full live alpha). Also used as the soft-fringe pass.
+    hair_pipeline: wgpu::RenderPipeline,
+    /// Cutout solid cores (opaque color where coverage ≥ cutout).
+    hair_solid_pipeline: wgpu::RenderPipeline,
+    /// Cutout soft fringe (below-cutout texels only), drawn after solid.
+    hair_fringe_pipeline: wgpu::RenderPipeline,
+    /// Unlit GPU wireframe (meshes). `PolygonMode::Line` when the device has it.
+    wire_mesh_pipeline: wgpu::RenderPipeline,
+    /// Unlit GPU wireframe (hair cards).
+    wire_hair_pipeline: wgpu::RenderPipeline,
+    /// Gray fill under wireframe lines (meshes).
+    wire_mesh_fill_pipeline: wgpu::RenderPipeline,
+    /// Gray fill under wireframe lines (hair).
+    wire_hair_fill_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     line_overlay_pipeline: wgpu::RenderPipeline,
@@ -195,7 +239,6 @@ pub struct WgpuVisualizer {
     shadow_frame_buf: wgpu::Buffer,
     sky_uniform_buf: wgpu::Buffer,
     object_bind_layout: wgpu::BindGroupLayout,
-    shadow_object_layout: wgpu::BindGroupLayout,
     bone_bind_layout: wgpu::BindGroupLayout,
     sky_bind_layout: wgpu::BindGroupLayout,
     sky_pipeline: wgpu::RenderPipeline,
@@ -226,7 +269,6 @@ pub struct WgpuVisualizer {
     /// Persistent dynamic object UBO (grown as needed; not recreated every frame).
     object_buf: wgpu::Buffer,
     object_slots: u64,
-    shadow_object_bg: wgpu::BindGroup,
     default_object_bg: wgpu::BindGroup,
     /// Material bind groups keyed by albedo/normal/MR texture keys.
     object_material_bgs: HashMap<[(u32, u32); 3], wgpu::BindGroup>,
@@ -248,6 +290,7 @@ pub struct WgpuVisualizer {
 impl WgpuVisualizer {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
         let shader = device.create_shader_module(wgpu::include_wgsl!("mesh.wgsl"));
+        let hair_shader = device.create_shader_module(wgpu::include_wgsl!("hair.wgsl"));
         let shadow_shader = device.create_shader_module(wgpu::include_wgsl!("shadow.wgsl"));
         let debug_shader = device.create_shader_module(wgpu::include_wgsl!("debug.wgsl"));
 
@@ -279,6 +322,7 @@ impl WgpuVisualizer {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
         let shadow_samp = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -484,19 +528,6 @@ impl WgpuVisualizer {
                 },
             ],
         });
-        let shadow_object_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: wgpu::BufferSize::new(OBJECT_UBO_SIZE),
-                },
-                count: None,
-            }],
-        });
         let bone_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("bone_palette"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -552,7 +583,7 @@ impl WgpuVisualizer {
             label: None,
             bind_group_layouts: &[
                 Some(&shadow_frame_layout),
-                Some(&shadow_object_layout),
+                Some(&object_bind_layout),
                 Some(&bone_bind_layout),
             ],
             immediate_size: 0,
@@ -592,7 +623,212 @@ impl WgpuVisualizer {
             &mesh_buffers,
             &depth_stencil,
             "mesh_mrt",
+            "fs_main",
+            wgpu::PolygonMode::Fill,
+            Some(wgpu::Face::Back),
         );
+        let wire_poly = if device
+            .features()
+            .contains(wgpu::Features::POLYGON_MODE_LINE)
+        {
+            wgpu::PolygonMode::Line
+        } else {
+            wgpu::PolygonMode::Fill
+        };
+        let wire_line_depth = wgpu::DepthStencilState {
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            bias: wgpu::DepthBiasState {
+                constant: -2,
+                slope_scale: -1.5,
+                clamp: 0.0,
+            },
+            ..depth_stencil.clone()
+        };
+        let wire_mesh_fill_pipeline = mesh_pipeline(
+            device,
+            &pipeline_layout,
+            &shader,
+            &mesh_buffers,
+            &depth_stencil,
+            "mesh_wire_fill",
+            "fs_wire_fill",
+            wgpu::PolygonMode::Fill,
+            Some(wgpu::Face::Back),
+        );
+        let wire_mesh_pipeline = mesh_pipeline(
+            device,
+            &pipeline_layout,
+            &shader,
+            &mesh_buffers,
+            &wire_line_depth,
+            "mesh_wire",
+            "fs_wire",
+            wire_poly,
+            None,
+        );
+        // Hair depth prepass: alpha-tested depth, plus a G-buffer wipe (normals /
+        // albedo / ORM / velocity) so post (GTAO, SSGI, …) cannot keep sampling
+        // the head that now sits behind the hair.
+        let color_formats = FrameTargets::color_formats();
+        let hair_prepass_targets = hair_prepass_targets(&color_formats);
+        let hair_solid_targets = gbuffer_targets(&color_formats, false);
+        let hair_blend_targets = gbuffer_targets(&color_formats, true);
+        let hair_depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("hair_depth_mrt"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &hair_shader,
+                entry_point: Some("vs_main"),
+                buffers: &mesh_buffers,
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &hair_shader,
+                entry_point: Some("fs_depth"),
+                targets: &hair_prepass_targets,
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Cw,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(depth_stencil.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        // Hair color: depth-tested against the prepass, not written (translucent
+        // edges must not self-occlude). Solid cores also fill the G-buffer;
+        // fringe / soft-blend only composite lighting.
+        let hair_blend_depth = wgpu::DepthStencilState {
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            ..depth_stencil.clone()
+        };
+        let hair_blend_primitive = wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Cw,
+            cull_mode: Some(wgpu::Face::Back),
+            ..Default::default()
+        };
+        let hair_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("hair_blend_mrt"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &hair_shader,
+                entry_point: Some("vs_main"),
+                buffers: &mesh_buffers,
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &hair_shader,
+                entry_point: Some("fs_main"),
+                targets: &hair_blend_targets,
+                compilation_options: Default::default(),
+            }),
+            primitive: hair_blend_primitive.clone(),
+            depth_stencil: Some(hair_blend_depth.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let hair_solid_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("hair_solid_mrt"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &hair_shader,
+                entry_point: Some("vs_main"),
+                buffers: &mesh_buffers,
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &hair_shader,
+                entry_point: Some("fs_solid"),
+                targets: &hair_solid_targets,
+                compilation_options: Default::default(),
+            }),
+            primitive: hair_blend_primitive.clone(),
+            depth_stencil: Some(hair_blend_depth.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let hair_fringe_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("hair_fringe_mrt"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &hair_shader,
+                entry_point: Some("vs_main"),
+                buffers: &mesh_buffers,
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &hair_shader,
+                entry_point: Some("fs_fringe"),
+                targets: &hair_blend_targets,
+                compilation_options: Default::default(),
+            }),
+            primitive: hair_blend_primitive.clone(),
+            depth_stencil: Some(hair_blend_depth),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let wire_hair_fill_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("hair_wire_fill"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &hair_shader,
+                entry_point: Some("vs_main"),
+                buffers: &mesh_buffers,
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &hair_shader,
+                entry_point: Some("fs_wire_fill"),
+                targets: &hair_solid_targets,
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Cw,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(depth_stencil.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let wire_hair_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("hair_wire"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &hair_shader,
+                entry_point: Some("vs_main"),
+                buffers: &mesh_buffers,
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &hair_shader,
+                entry_point: Some("fs_wire"),
+                targets: &hair_solid_targets,
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Cw,
+                cull_mode: None,
+                polygon_mode: wire_poly,
+                ..Default::default()
+            },
+            depth_stencil: Some(wire_line_depth),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
 
         let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("shadow"),
@@ -603,7 +839,12 @@ impl WgpuVisualizer {
                 buffers: &mesh_buffers,
                 compilation_options: Default::default(),
             },
-            fragment: None,
+            fragment: Some(wgpu::FragmentState {
+                module: &shadow_shader,
+                entry_point: Some("fs_main"),
+                targets: &[],
+                compilation_options: Default::default(),
+            }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 front_face: wgpu::FrontFace::Cw,
@@ -741,18 +982,6 @@ impl WgpuVisualizer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let shadow_object_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("shadow_object"),
-            layout: &shadow_object_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &object_buf,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(OBJECT_UBO_SIZE),
-                }),
-            }],
-        });
         let default_object_bg = object_bind_group(
             device,
             &object_bind_layout,
@@ -769,6 +998,14 @@ impl WgpuVisualizer {
             device: device.clone(),
             queue: queue.clone(),
             pipeline,
+            hair_depth_pipeline,
+            hair_pipeline,
+            hair_solid_pipeline,
+            hair_fringe_pipeline,
+            wire_mesh_pipeline,
+            wire_hair_pipeline,
+            wire_mesh_fill_pipeline,
+            wire_hair_fill_pipeline,
             shadow_pipeline,
             line_pipeline,
             line_overlay_pipeline,
@@ -785,7 +1022,6 @@ impl WgpuVisualizer {
             shadow_frame_buf,
             sky_uniform_buf,
             object_bind_layout,
-            shadow_object_layout,
             bone_bind_layout,
             sky_bind_layout,
             sky_pipeline,
@@ -814,7 +1050,6 @@ impl WgpuVisualizer {
             size: (1, 1),
             object_buf,
             object_slots: 1,
-            shadow_object_bg,
             default_object_bg,
             object_material_bgs: HashMap::new(),
             skin_bones: HashMap::new(),
@@ -840,18 +1075,6 @@ impl WgpuVisualizer {
             &self.default_mr.view,
             &self.sampler,
         );
-        self.shadow_object_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("shadow_object"),
-            layout: &self.shadow_object_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &self.object_buf,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(OBJECT_UBO_SIZE),
-                }),
-            }],
-        });
     }
 
     /// Drop cached GPU meshes/textures/skins. Call when replacing the whole
@@ -1196,18 +1419,7 @@ impl WgpuVisualizer {
         );
 
         let world = scene.world_matrices();
-        let mut draws: Vec<(
-            (u32, u32),
-            (u32, u32),
-            Option<(u32, u32)>,
-            Option<(u32, u32)>,
-            Option<(u32, u32)>,
-            Mat4,
-            [f32; 4],
-            [f32; 4],
-            [f32; 4],
-            Option<(u32, u32)>,
-        )> = Vec::new();
+        let mut draws: Vec<DrawItem> = Vec::new();
         // One palette upload per skin (shared by all mesh prims).
         let mut skins_to_upload: HashMap<(u32, u32), (crate::Handle<crate::Skin>, crate::Handle<crate::Node>)> =
             HashMap::new();
@@ -1220,28 +1432,77 @@ impl WgpuVisualizer {
             if !self.meshes.contains_key(&mesh_key) {
                 continue;
             }
-            let (albedo, mut params, sss, albedo_key, normal_key, mr_key) =
+            let (albedo, mut params, sss, albedo_key, normal_key, mr_key, hair0, hair1, is_hair, soft_blend) =
                 match node.material.and_then(|m| scene.materials.get(m)) {
-                    Some(mat) => (
-                        mat.albedo,
-                        [mat.metallic, mat.roughness, 0.0, mat.sss_strength],
-                        [
-                            mat.sss_color[0],
-                            mat.sss_color[1],
-                            mat.sss_color[2],
-                            mat.sss_curvature,
-                        ],
-                        mat.albedo_map.map(|t| t.key()),
-                        mat.normal_map.map(|t| t.key()),
-                        mat.metallic_roughness_map.map(|t| t.key()),
-                    ),
+                    Some(mat) => {
+                        let (hair0, hair1, tip_fade, is_hair, soft_blend, cutout_fringe) =
+                            match mat.shading_model {
+                            crate::ShadingModel::Standard => {
+                                ([0.0; 4], [0.0; 4], 0.0, false, false, 0.0)
+                            }
+                            crate::ShadingModel::Hair(h) => (
+                                [
+                                    h.primary_shift,
+                                    h.secondary_shift,
+                                    h.primary_exponent,
+                                    h.secondary_exponent,
+                                ],
+                                [
+                                    h.secondary_tint[0],
+                                    h.secondary_tint[1],
+                                    h.secondary_tint[2],
+                                    h.secondary_strength,
+                                ],
+                                h.tip_fade.clamp(0.0, 1.0),
+                                true,
+                                h.soft_blend,
+                                h.cutout_fringe.clamp(0.0, 1.0),
+                            ),
+                        };
+                        let mut params = [mat.metallic, mat.roughness, 0.0, mat.sss_strength];
+                        if is_hair {
+                            // Hair: params.w carries cutout soft-fringe width.
+                            params[3] = cutout_fringe;
+                        }
+                        (
+                            [
+                                mat.albedo[0],
+                                mat.albedo[1],
+                                mat.albedo[2],
+                                mat.alpha_cutoff,
+                            ],
+                            params,
+                            [
+                                mat.sss_color[0],
+                                mat.sss_color[1],
+                                mat.sss_color[2],
+                                // Hair: unused SSS curvature slot carries tip_fade.
+                                if is_hair {
+                                    tip_fade
+                                } else {
+                                    mat.sss_curvature
+                                },
+                            ],
+                            mat.albedo_map.map(|t| t.key()),
+                            mat.normal_map.map(|t| t.key()),
+                            mat.metallic_roughness_map.map(|t| t.key()),
+                            hair0,
+                            hair1,
+                            is_hair,
+                            soft_blend,
+                        )
+                    }
                     None => (
-                        [1.0, 1.0, 1.0, 1.0],
+                        [1.0, 1.0, 1.0, 0.0],
                         [0.0, 0.5, 0.0, 0.0],
                         [1.0, 0.35, 0.2, 0.3],
                         None,
                         None,
                         None,
+                        [0.0; 4],
+                        [0.0; 4],
+                        false,
+                        false,
                     ),
                 };
             let mut skin_key = None;
@@ -1253,9 +1514,14 @@ impl WgpuVisualizer {
                     skin_key = Some(key);
                 }
             }
+            // Hair: params.z carries soft_blend (1) vs cutout/opaque cover (0).
+            // Must not collide with skinning flag — hair meshes are unskinned.
+            if is_hair {
+                params[2] = if soft_blend { 1.0 } else { 0.0 };
+            }
             let model = world.get(&h.key()).copied().unwrap_or(Mat4::IDENTITY);
-            draws.push((
-                h.key(),
+            draws.push(DrawItem {
+                node_key: h.key(),
                 mesh_key,
                 albedo_key,
                 normal_key,
@@ -1264,8 +1530,12 @@ impl WgpuVisualizer {
                 albedo,
                 params,
                 sss,
+                hair0,
+                hair1,
+                is_hair,
+                soft_blend,
                 skin_key,
-            ));
+            });
         }
 
         let skin_mode = scene.skinning_mode;
@@ -1284,22 +1554,24 @@ impl WgpuVisualizer {
 
         self.ensure_object_slots(draws.len() as u64);
         let mut next_models: HashMap<(u32, u32), Mat4> = HashMap::with_capacity(draws.len());
-        for (i, (node_key, _, _, _, _, model, albedo, params, sss, _)) in draws.iter().enumerate() {
-            let prev_model = match self.prev_models.get(node_key) {
+        for (i, d) in draws.iter().enumerate() {
+            let prev_model = match self.prev_models.get(&d.node_key) {
                 Some(m) if self.motion_has_history => *m,
-                _ => *model,
+                _ => d.model,
             };
             let base = i as u64 * OBJECT_STRIDE;
             let uniforms = ObjectUniforms {
-                model: model.to_cols_array_2d(),
-                albedo: *albedo,
-                params: *params,
-                sss: *sss,
+                model: d.model.to_cols_array_2d(),
+                albedo: d.albedo,
+                params: d.params,
+                sss: d.sss,
                 prev_model: prev_model.to_cols_array_2d(),
+                hair0: d.hair0,
+                hair1: d.hair1,
             };
             self.queue
                 .write_buffer(&self.object_buf, base, bytemuck::bytes_of(&uniforms));
-            next_models.insert(*node_key, *model);
+            next_models.insert(d.node_key, d.model);
         }
         self.prev_models = next_models;
         self.prev_view_proj = view_proj;
@@ -1344,11 +1616,11 @@ impl WgpuVisualizer {
         );
 
         let default_maps = ((u32::MAX, 0), (u32::MAX, 1), (u32::MAX, 2));
-        for (_, _, albedo_key, normal_key, mr_key, _, _, _, _, _) in &draws {
+        for d in &draws {
             let cache_key = [
-                albedo_key.unwrap_or(default_maps.0),
-                normal_key.unwrap_or(default_maps.1),
-                mr_key.unwrap_or(default_maps.2),
+                d.albedo_key.unwrap_or(default_maps.0),
+                d.normal_key.unwrap_or(default_maps.1),
+                d.mr_key.unwrap_or(default_maps.2),
             ];
             if cache_key == [default_maps.0, default_maps.1, default_maps.2] {
                 continue;
@@ -1356,15 +1628,18 @@ impl WgpuVisualizer {
             if self.object_material_bgs.contains_key(&cache_key) {
                 continue;
             }
-            let albedo_view = albedo_key
+            let albedo_view = d
+                .albedo_key
                 .and_then(|k| self.textures.get(&k))
                 .map(|t| &t.view)
                 .unwrap_or(&self.white.view);
-            let normal_view = normal_key
+            let normal_view = d
+                .normal_key
                 .and_then(|k| self.textures.get(&k))
                 .map(|t| &t.view)
                 .unwrap_or(&self.flat_normal.view);
-            let mr_view = mr_key
+            let mr_view = d
+                .mr_key
                 .and_then(|k| self.textures.get(&k))
                 .map(|t| &t.view)
                 .unwrap_or(&self.default_mr.view);
@@ -1381,9 +1656,10 @@ impl WgpuVisualizer {
         }
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        let wireframe = self.debug_view == DebugView::Wireframe;
 
         // Shadow pass (unchanged).
-        if scene.shadow_directional().is_some() {
+        if !wireframe && scene.shadow_directional().is_some() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow_pass"),
                 color_attachments: &[],
@@ -1401,12 +1677,22 @@ impl WgpuVisualizer {
             });
             pass.set_pipeline(&self.shadow_pipeline);
             pass.set_bind_group(0, &self.shadow_frame_bind_group, &[]);
-            for (i, (_, mesh_key, _, _, _, _, _, _, _, skin_key)) in draws.iter().enumerate() {
-                let Some(mesh) = self.meshes.get(mesh_key) else {
+            for (i, d) in draws.iter().enumerate() {
+                let Some(mesh) = self.meshes.get(&d.mesh_key) else {
                     continue;
                 };
-                pass.set_bind_group(1, &self.shadow_object_bg, &[(i as u32) * OBJECT_STRIDE as u32]);
-                if let Some(s) = skin_key.as_ref().and_then(|k| self.skin_bones.get(k)) {
+                let cache_key = [
+                    d.albedo_key.unwrap_or(default_maps.0),
+                    d.normal_key.unwrap_or(default_maps.1),
+                    d.mr_key.unwrap_or(default_maps.2),
+                ];
+                let bg = if cache_key == [default_maps.0, default_maps.1, default_maps.2] {
+                    &self.default_object_bg
+                } else {
+                    &self.object_material_bgs[&cache_key]
+                };
+                pass.set_bind_group(1, bg, &[(i as u32) * OBJECT_STRIDE as u32]);
+                if let Some(s) = d.skin_key.as_ref().and_then(|k| self.skin_bones.get(k)) {
                     pass.set_bind_group(2, &s.bind_group, &[]);
                 } else {
                     pass.set_bind_group(2, &self.identity_bone_bg, &[]);
@@ -1428,11 +1714,20 @@ impl WgpuVisualizer {
                         resolve_target: None,
                         depth_slice: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: scene.clear_color[0] as f64,
-                                g: scene.clear_color[1] as f64,
-                                b: scene.clear_color[2] as f64,
-                                a: scene.clear_color[3] as f64,
+                            load: wgpu::LoadOp::Clear(if wireframe {
+                                wgpu::Color {
+                                    r: 0.03,
+                                    g: 0.033,
+                                    b: 0.04,
+                                    a: 1.0,
+                                }
+                            } else {
+                                wgpu::Color {
+                                    r: scene.clear_color[0] as f64,
+                                    g: scene.clear_color[1] as f64,
+                                    b: scene.clear_color[2] as f64,
+                                    a: scene.clear_color[3] as f64,
+                                }
                             }),
                             store: wgpu::StoreOp::Store,
                         },
@@ -1490,36 +1785,67 @@ impl WgpuVisualizer {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.frame_bind_group, &[]);
-
-            for (i, (_, mesh_key, albedo_key, normal_key, mr_key, _, _, _, _, skin_key)) in
-                draws.iter().enumerate()
-            {
-                let Some(mesh) = self.meshes.get(mesh_key) else {
-                    continue;
-                };
-                let cache_key = [
-                    albedo_key.unwrap_or(default_maps.0),
-                    normal_key.unwrap_or(default_maps.1),
-                    mr_key.unwrap_or(default_maps.2),
-                ];
-                let bg = if cache_key == [default_maps.0, default_maps.1, default_maps.2] {
-                    &self.default_object_bg
-                } else {
-                    &self.object_material_bgs[&cache_key]
-                };
-                pass.set_bind_group(1, bg, &[(i as u32) * OBJECT_STRIDE as u32]);
-                if let Some(s) = skin_key.as_ref().and_then(|k| self.skin_bones.get(k)) {
-                    pass.set_bind_group(2, &s.bind_group, &[]);
-                } else {
-                    pass.set_bind_group(2, &self.identity_bone_bg, &[]);
-                }
-                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            if wireframe {
+                pass.set_pipeline(&self.wire_mesh_fill_pipeline);
+                draw_mesh_items(
+                    &mut pass,
+                    &self.meshes,
+                    &self.default_object_bg,
+                    &self.object_material_bgs,
+                    &self.identity_bone_bg,
+                    &self.skin_bones,
+                    default_maps,
+                    &draws,
+                );
+                pass.set_pipeline(&self.wire_hair_fill_pipeline);
+                draw_hair_items(
+                    &mut pass,
+                    &self.meshes,
+                    &self.default_object_bg,
+                    &self.object_material_bgs,
+                    &self.identity_bone_bg,
+                    default_maps,
+                    &draws,
+                );
+                pass.set_pipeline(&self.wire_mesh_pipeline);
+                draw_mesh_items(
+                    &mut pass,
+                    &self.meshes,
+                    &self.default_object_bg,
+                    &self.object_material_bgs,
+                    &self.identity_bone_bg,
+                    &self.skin_bones,
+                    default_maps,
+                    &draws,
+                );
+                pass.set_pipeline(&self.wire_hair_pipeline);
+                draw_hair_items(
+                    &mut pass,
+                    &self.meshes,
+                    &self.default_object_bg,
+                    &self.object_material_bgs,
+                    &self.identity_bone_bg,
+                    default_maps,
+                    &draws,
+                );
+            } else {
+                pass.set_pipeline(&self.pipeline);
+                draw_mesh_items(
+                    &mut pass,
+                    &self.meshes,
+                    &self.default_object_bg,
+                    &self.object_material_bgs,
+                    &self.identity_bone_bg,
+                    &self.skin_bones,
+                    default_maps,
+                    &draws,
+                );
             }
 
+            // Depth-tested debug (floor grid, etc.) BEFORE hair so soft-blend
+            // cards can composite over it. Drawing grid after hair punched
+            // through soft cards that don't write depth.
             draw_debug_tris(
                 &mut pass,
                 &self.tri_pipeline,
@@ -1527,7 +1853,13 @@ impl WgpuVisualizer {
                 &tri_buf,
                 debug.tris.len(),
             );
-            draw_debug_lines(&mut pass, &self.line_pipeline, &self.debug_bind_group, &line_buf, debug.lines.len());
+            draw_debug_lines(
+                &mut pass,
+                &self.line_pipeline,
+                &self.debug_bind_group,
+                &line_buf,
+                debug.lines.len(),
+            );
             draw_debug_points(
                 &mut pass,
                 &self.point_pipeline,
@@ -1535,6 +1867,86 @@ impl WgpuVisualizer {
                 &point_buf,
                 debug.points.len(),
             );
+
+            // Hair:
+            // - soft_blend: one soft color pass (no depth prepass / G-buffer)
+            // - cutout: depth+G-buffer wipe → opaque solid cores (G-buffer) → fringe
+            if !wireframe && draws.iter().any(|d| d.is_hair) {
+                // Debug draws above rebind group 0 — restore the frame set.
+                pass.set_bind_group(0, &self.frame_bind_group, &[]);
+                let cutout = draws.iter().any(|d| d.is_hair && !d.soft_blend);
+                if cutout {
+                    pass.set_pipeline(&self.hair_depth_pipeline);
+                    for (i, d) in draws.iter().enumerate() {
+                        if !d.is_hair || d.soft_blend {
+                            continue;
+                        }
+                        draw_hair_item(
+                            &mut pass,
+                            &self.meshes,
+                            &self.default_object_bg,
+                            &self.object_material_bgs,
+                            &self.identity_bone_bg,
+                            default_maps,
+                            i,
+                            d,
+                        );
+                    }
+                    pass.set_pipeline(&self.hair_solid_pipeline);
+                    for (i, d) in draws.iter().enumerate() {
+                        if !d.is_hair || d.soft_blend {
+                            continue;
+                        }
+                        draw_hair_item(
+                            &mut pass,
+                            &self.meshes,
+                            &self.default_object_bg,
+                            &self.object_material_bgs,
+                            &self.identity_bone_bg,
+                            default_maps,
+                            i,
+                            d,
+                        );
+                    }
+                    pass.set_pipeline(&self.hair_fringe_pipeline);
+                    for (i, d) in draws.iter().enumerate() {
+                        if !d.is_hair || d.soft_blend {
+                            continue;
+                        }
+                        draw_hair_item(
+                            &mut pass,
+                            &self.meshes,
+                            &self.default_object_bg,
+                            &self.object_material_bgs,
+                            &self.identity_bone_bg,
+                            default_maps,
+                            i,
+                            d,
+                        );
+                    }
+                }
+                // Soft-blend cards (and any mixed soft items).
+                if draws.iter().any(|d| d.is_hair && d.soft_blend) {
+                    pass.set_pipeline(&self.hair_pipeline);
+                    for (i, d) in draws.iter().enumerate() {
+                        if !d.is_hair || !d.soft_blend {
+                            continue;
+                        }
+                        draw_hair_item(
+                            &mut pass,
+                            &self.meshes,
+                            &self.default_object_bg,
+                            &self.object_material_bgs,
+                            &self.identity_bone_bg,
+                            default_maps,
+                            i,
+                            d,
+                        );
+                    }
+                }
+            }
+
+            // Overlay debug (no depth) on top of everything.
             draw_debug_tris(
                 &mut pass,
                 &self.tri_overlay_pipeline,
@@ -1557,7 +1969,7 @@ impl WgpuVisualizer {
                 debug.points_overlay.len(),
             );
 
-            if env_on {
+            if env_on && !wireframe {
                 let view = scene.camera.view();
                 let view_rot = Mat4::from_cols(view.x_axis, view.y_axis, view.z_axis, glam::Vec4::W);
                 let proj = scene.camera.proj(aspect);
@@ -1808,9 +2220,15 @@ impl Visualizer for WgpuVisualizer {
             }
             let w = tex.width.max(1);
             let h = tex.height.max(1);
+            let want_mips = if tex.gpu_resident {
+                1
+            } else {
+                mip_level_count(w, h)
+            };
             if let Some(gpu) = self.textures.get_mut(&key) {
                 if gpu.width == w
                     && gpu.height == h
+                    && gpu.mips == want_mips
                     && gpu.srgb == tex.srgb
                     && gpu.resident == tex.gpu_resident
                 {
@@ -2214,6 +2632,9 @@ fn mesh_pipeline(
     buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
     depth_stencil: &wgpu::DepthStencilState,
     label: &str,
+    fs: &str,
+    polygon_mode: wgpu::PolygonMode,
+    cull_mode: Option<wgpu::Face>,
 ) -> wgpu::RenderPipeline {
     let formats = FrameTargets::color_formats();
     let targets = gbuffer_targets(&formats, false);
@@ -2228,14 +2649,15 @@ fn mesh_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(fs),
             targets: &targets,
             compilation_options: Default::default(),
         }),
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
             front_face: wgpu::FrontFace::Cw,
-            cull_mode: Some(wgpu::Face::Back),
+            cull_mode,
+            polygon_mode,
             ..Default::default()
         },
         depth_stencil: Some(depth_stencil.clone()),
@@ -2287,6 +2709,113 @@ fn debug_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+fn draw_mesh_items(
+    pass: &mut wgpu::RenderPass<'_>,
+    meshes: &HashMap<(u32, u32), GpuMesh>,
+    default_object_bg: &wgpu::BindGroup,
+    object_material_bgs: &HashMap<[(u32, u32); 3], wgpu::BindGroup>,
+    identity_bone_bg: &wgpu::BindGroup,
+    skin_bones: &HashMap<(u32, u32), GpuSkinBones>,
+    default_maps: ((u32, u32), (u32, u32), (u32, u32)),
+    draws: &[DrawItem],
+) {
+    for (i, d) in draws.iter().enumerate() {
+        if d.is_hair {
+            continue;
+        }
+        let Some(mesh) = meshes.get(&d.mesh_key) else {
+            continue;
+        };
+        let cache_key = [
+            d.albedo_key.unwrap_or(default_maps.0),
+            d.normal_key.unwrap_or(default_maps.1),
+            d.mr_key.unwrap_or(default_maps.2),
+        ];
+        let bg = if cache_key == [default_maps.0, default_maps.1, default_maps.2] {
+            default_object_bg
+        } else {
+            &object_material_bgs[&cache_key]
+        };
+        pass.set_bind_group(1, bg, &[(i as u32) * OBJECT_STRIDE as u32]);
+        if let Some(s) = d.skin_key.as_ref().and_then(|k| skin_bones.get(k)) {
+            pass.set_bind_group(2, &s.bind_group, &[]);
+        } else {
+            pass.set_bind_group(2, identity_bone_bg, &[]);
+        }
+        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+    }
+}
+
+fn draw_hair_items(
+    pass: &mut wgpu::RenderPass<'_>,
+    meshes: &HashMap<(u32, u32), GpuMesh>,
+    default_object_bg: &wgpu::BindGroup,
+    object_material_bgs: &HashMap<[(u32, u32); 3], wgpu::BindGroup>,
+    identity_bone_bg: &wgpu::BindGroup,
+    default_maps: ((u32, u32), (u32, u32), (u32, u32)),
+    draws: &[DrawItem],
+) {
+    for (i, d) in draws.iter().enumerate() {
+        if !d.is_hair {
+            continue;
+        }
+        draw_hair_item(
+            pass,
+            meshes,
+            default_object_bg,
+            object_material_bgs,
+            identity_bone_bg,
+            default_maps,
+            i,
+            d,
+        );
+    }
+}
+
+fn draw_hair_item(
+    pass: &mut wgpu::RenderPass<'_>,
+    meshes: &HashMap<(u32, u32), GpuMesh>,
+    default_object_bg: &wgpu::BindGroup,
+    object_material_bgs: &HashMap<[(u32, u32); 3], wgpu::BindGroup>,
+    identity_bone_bg: &wgpu::BindGroup,
+    default_maps: ((u32, u32), (u32, u32), (u32, u32)),
+    i: usize,
+    d: &DrawItem,
+) {
+    let Some(mesh) = meshes.get(&d.mesh_key) else {
+        return;
+    };
+    let cache_key = [
+        d.albedo_key.unwrap_or(default_maps.0),
+        d.normal_key.unwrap_or(default_maps.1),
+        d.mr_key.unwrap_or(default_maps.2),
+    ];
+    let bg = if cache_key == [default_maps.0, default_maps.1, default_maps.2] {
+        default_object_bg
+    } else {
+        &object_material_bgs[&cache_key]
+    };
+    pass.set_bind_group(1, bg, &[(i as u32) * OBJECT_STRIDE as u32]);
+    pass.set_bind_group(2, identity_bone_bg, &[]);
+    pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+    pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+}
+
+/// Depth prepass: no lighting write, but zero the aux G-buffer so leftover
+/// head normals/albedo cannot leak into screen-space post on hair pixels.
+fn hair_prepass_targets(
+    formats: &[wgpu::TextureFormat; 5],
+) -> [Option<wgpu::ColorTargetState>; 5] {
+    let mut t = gbuffer_targets(formats, false);
+    if let Some(c0) = t[0].as_mut() {
+        c0.write_mask = wgpu::ColorWrites::empty();
+    }
+    t
 }
 
 fn gbuffer_targets(
@@ -2513,68 +3042,92 @@ fn upload_mesh(device: &wgpu::Device, mesh: &Mesh) -> GpuMesh {
 fn write_texture_pixels(queue: &wgpu::Queue, texture: &wgpu::Texture, tex: &Texture) {
     let full_w = tex.width.max(1);
     let full_h = tex.height.max(1);
-
-    let (x, y, w, h) = match tex.dirty {
-        Some((x, y, w, h)) if w > 0 && h > 0 && w < full_w && h < full_h => {
-            let x = x.min(full_w - 1);
-            let y = y.min(full_h - 1);
-            let w = w.min(full_w - x).max(1);
-            let h = h.min(full_h - y).max(1);
-            // Skip tiny edge case where packing a sub-copy is awkward; still upload region.
-            (x, y, w, h)
-        }
-        _ => (0, 0, full_w, full_h),
-    };
-
-    // Pack rows into a tight buffer for the subrect (avoids bytes_per_row alignment issues).
-    if x == 0 && y == 0 && w == full_w && h == full_h {
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &tex.rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * full_w),
-                rows_per_image: Some(full_h),
-            },
-            wgpu::Extent3d {
-                width: full_w,
-                height: full_h,
-                depth_or_array_layers: 1,
-            },
-        );
+    let need = (full_w * full_h * 4) as usize;
+    if tex.rgba.len() < need {
         return;
     }
 
-    let mut packed = Vec::with_capacity((w * h * 4) as usize);
-    for row in y..y + h {
-        let start = ((row * full_w + x) * 4) as usize;
-        let end = start + (w * 4) as usize;
-        packed.extend_from_slice(&tex.rgba[start..end]);
+    // Always upload a full mip chain for sampled maps. Partial dirty rects still
+    // rebuild mips from the full CPU image — hair (and most materials) mark the
+    // whole texture dirty anyway, and minification without mips shimmers badly
+    // on thin alpha cutouts.
+    let levels = build_rgba_mip_chain(&tex.rgba, full_w, full_h);
+    for (level, (w, h, pixels)) in levels.into_iter().enumerate() {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * w),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
     }
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d { x, y, z: 0 },
-            aspect: wgpu::TextureAspect::All,
-        },
-        &packed,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(4 * w),
-            rows_per_image: Some(h),
-        },
-        wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-    );
+}
+
+fn mip_level_count(w: u32, h: u32) -> u32 {
+    let mut levels = 1u32;
+    let mut mw = w.max(1);
+    let mut mh = h.max(1);
+    while mw > 1 || mh > 1 {
+        mw = (mw / 2).max(1);
+        mh = (mh / 2).max(1);
+        levels += 1;
+    }
+    levels
+}
+
+fn build_rgba_mip_chain(rgba: &[u8], w: u32, h: u32) -> Vec<(u32, u32, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut cw = w.max(1);
+    let mut ch = h.max(1);
+    let mut cur = rgba[..(cw * ch * 4) as usize].to_vec();
+    out.push((cw, ch, cur.clone()));
+    while cw > 1 || ch > 1 {
+        let nw = (cw / 2).max(1);
+        let nh = (ch / 2).max(1);
+        let next = downsample_rgba_box(&cur, cw, ch, nw, nh);
+        out.push((nw, nh, next.clone()));
+        cur = next;
+        cw = nw;
+        ch = nh;
+    }
+    out
+}
+
+fn downsample_rgba_box(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let mut dst = vec![0u8; (dw * dh * 4) as usize];
+    for y in 0..dh {
+        let y0 = y * 2;
+        let y1 = (y0 + 1).min(sh - 1);
+        for x in 0..dw {
+            let x0 = x * 2;
+            let x1 = (x0 + 1).min(sw - 1);
+            for c in 0..4 {
+                let mut sum = 0u32;
+                let mut n = 0u32;
+                for yy in [y0, y1] {
+                    for xx in [x0, x1] {
+                        let i = ((yy * sw + xx) * 4 + c) as usize;
+                        sum += src[i] as u32;
+                        n += 1;
+                    }
+                }
+                dst[((y * dw + x) * 4 + c) as usize] = ((sum + n / 2) / n) as u8;
+            }
+        }
+    }
+    dst
 }
 
 fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture) -> GpuTexture {
@@ -2589,6 +3142,12 @@ fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture) -> 
         wgpu::TextureFormat::Rgba8UnormSrgb
     } else {
         wgpu::TextureFormat::Rgba8Unorm
+    };
+
+    let mips = if tex.gpu_resident {
+        1
+    } else {
+        mip_level_count(w, h)
     };
 
     let usage = if tex.gpu_resident {
@@ -2611,7 +3170,7 @@ fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture) -> 
             height: h,
             depth_or_array_layers: 1,
         },
-        mip_level_count: 1,
+        mip_level_count: mips,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
@@ -2622,7 +3181,30 @@ fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture) -> 
     // Seed from CPU once (including first create of a resident map).
     let need_pixels = (w * h * 4) as usize;
     if tex.rgba.len() >= need_pixels {
-        write_texture_pixels(queue, &texture, tex);
+        if tex.gpu_resident {
+            // Residents stay single-mip; write level 0 only.
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &tex.rgba[..need_pixels],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * w),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        } else {
+            write_texture_pixels(queue, &texture, tex);
+        }
     }
 
     GpuTexture {
@@ -2630,6 +3212,7 @@ fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &Texture) -> 
         texture,
         width: w,
         height: h,
+        mips,
         srgb: tex.srgb,
         resident: tex.gpu_resident,
         synced: tex.version,

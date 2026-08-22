@@ -49,6 +49,10 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
         c = tonemap_reinhard(c);
         return vec4(c, 1.0);
     }
+    if mode == 14u {
+        // Wireframe: already display-referred gray + edges, no tonemap.
+        return vec4(textureSampleLevel(color_tex, samp, i.uv, 0.0).rgb, 1.0);
+    }
     if mode == 2u {
         let n = textureSampleLevel(normal_tex, samp, i.uv, 0.0).xyz;
         return vec4(n * 0.5 + 0.5, 1.0);

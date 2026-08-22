@@ -23,7 +23,7 @@ struct GpuLight {
 
 struct ObjectUniforms {
     model: mat4x4<f32>,
-    albedo: vec4<f32>,
+    albedo: vec4<f32>, // rgb tint, a = alpha cutoff (0 = opaque)
     // x = metallic, y = roughness, z = skinned, w = sss strength
     params: vec4<f32>,
     // rgb = scatter tint, w = curvature (0..1)
@@ -505,8 +505,33 @@ struct GBufferOut {
 }
 
 @fragment
+fn fs_wire_fill(_in: VertexOutput) -> GBufferOut {
+    return wire_gbuf(vec3<f32>(0.36, 0.37, 0.39));
+}
+
+@fragment
+fn fs_wire(_in: VertexOutput) -> GBufferOut {
+    return wire_gbuf(vec3<f32>(0.92, 0.93, 0.95));
+}
+
+fn wire_gbuf(rgb: vec3<f32>) -> GBufferOut {
+    var out: GBufferOut;
+    out.color = vec4<f32>(rgb, 1.0);
+    out.normal = vec4<f32>(0.0);
+    out.velocity = vec2<f32>(0.0);
+    out.orm = vec4<f32>(0.0);
+    out.albedo = vec4<f32>(rgb, 1.0);
+    return out;
+}
+
+@fragment
 fn fs_main(in: VertexOutput) -> GBufferOut {
-    let base = textureSample(albedo_tex, samp, in.uv) * object.albedo;
+    let sampled = textureSample(albedo_tex, samp, in.uv);
+    let cutoff = object.albedo.a;
+    if cutoff > 0.001 && sampled.a < cutoff {
+        discard;
+    }
+    let base = vec4<f32>(sampled.rgb * object.albedo.rgb, sampled.a);
     let albedo = base.rgb;
     let mr = textureSample(mr_tex, samp, in.uv);
     let metallic = object.params.x * mr.b;

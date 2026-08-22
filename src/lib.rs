@@ -38,7 +38,7 @@ pub use hud::{Hud, HudId, HudLine, HudOutput, HudQuad, Rect as HudRect};
 pub use ik::{ccd_rotate_joint, quat_from_matrix, translate_bone_world, solve_ik, IkChainDef};
 pub use input::InputFrame;
 pub use light::{DirectionalLight, Light, PointLight};
-pub use material::Material;
+pub use material::{HairShading, Material, ShadingModel};
 pub use mesh::{Mesh, MorphTarget};
 pub use node::{Node, Transform};
 pub use post_process::{
@@ -56,4 +56,4 @@ pub use skin::{
 pub use store::{Handle, Store};
 pub use texture::Texture;
 pub use view_gizmo::ViewAxis;
-pub use visualizer::{Visualizer, WgpuVisualizer};
+pub use visualizer::{Visualizer, WgpuVisualizer, WGPU_FEATURES};

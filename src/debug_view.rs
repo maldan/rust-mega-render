@@ -35,6 +35,8 @@ pub enum DebugView {
     Dof,
     /// Screen-space velocity (R=vx, G=vy magnitude preview).
     Velocity,
+    /// GPU mesh wireframe (all scene meshes, including hair). Unlit edges.
+    Wireframe,
 }
 
 impl DebugView {
@@ -53,6 +55,7 @@ impl DebugView {
         DebugView::DofCoc,
         DebugView::Dof,
         DebugView::Velocity,
+        DebugView::Wireframe,
     ];
 
     pub fn label(self) -> &'static str {
@@ -71,6 +74,7 @@ impl DebugView {
             DebugView::DofCoc => "DOF CoC",
             DebugView::Dof => "DOF",
             DebugView::Velocity => "Velocity",
+            DebugView::Wireframe => "Wireframe",
         }
     }
 
@@ -90,6 +94,7 @@ impl DebugView {
             DebugView::DofCoc => 11,
             DebugView::Dof => 12,
             DebugView::Velocity => 13,
+            DebugView::Wireframe => 14,
         }
     }
 }

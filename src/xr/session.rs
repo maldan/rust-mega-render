@@ -66,6 +66,10 @@ pub struct XrSwapchain {
 /// callers (and, later, the wgpu-hal interop layer) can record their own
 /// command buffers against the same device.
 pub struct XrContext {
+    /// Must be declared before `session`: struct fields drop in declaration
+    /// order, and `xrDestroyHandTracker` requires a live session.
+    hand_left: Option<xr::HandTracker>,
+    hand_right: Option<xr::HandTracker>,
     pub xr_instance: xr::Instance,
     pub system: xr::SystemId,
     pub vk_entry: ash::Entry,
@@ -102,6 +106,10 @@ impl XrContext {
         }
         let mut enabled = xr::ExtensionSet::default();
         enabled.khr_vulkan_enable2 = true;
+        let hand_ext = available.ext_hand_tracking;
+        if hand_ext {
+            enabled.ext_hand_tracking = true;
+        }
 
         let xr_instance = entry.create_instance(
             &xr::ApplicationInfo {
@@ -238,7 +246,12 @@ impl XrContext {
         let stage =
             session.create_reference_space(xr::ReferenceSpaceType::STAGE, xr::Posef::IDENTITY)?;
 
+        let (hand_left, hand_right) =
+            super::hand_tracking::create_trackers(&xr_instance, system, &session, hand_ext);
+
         Ok(Self {
+            hand_left,
+            hand_right,
             xr_instance,
             system,
             vk_entry,
@@ -269,6 +282,23 @@ impl XrContext {
 
     pub fn session(&self) -> &xr::Session<xr::Vulkan> {
         &self.session
+    }
+
+    /// True if at least one `XR_EXT_hand_tracking` tracker was created.
+    pub fn hand_tracking_enabled(&self) -> bool {
+        self.hand_left.is_some() || self.hand_right.is_some()
+    }
+
+    /// Left/right tracked-hand skeletons in stage space for this frame.
+    /// `None` for a side means the tracker is missing or the runtime has no
+    /// valid sample (hand occluded, out of view, …).
+    pub fn locate_tracked_hands(&self, frame: &XrFrame) -> [Option<super::hand_tracking::TrackedHand>; 2] {
+        super::hand_tracking::locate_both(
+            &self.stage,
+            self.hand_left.as_ref(),
+            self.hand_right.as_ref(),
+            frame,
+        )
     }
 
     pub fn attach_action_sets(&self, sets: &[&xr::ActionSet]) -> Result<(), XrError> {
@@ -428,6 +458,14 @@ impl XrContext {
         self.frame_stream
             .end(frame.state.predicted_display_time, self.blend_mode, &[&layer])?;
         Ok(())
+    }
+}
+
+impl Drop for XrContext {
+    fn drop(&mut self) {
+        // Hand trackers must die while the session is still alive.
+        self.hand_left.take();
+        self.hand_right.take();
     }
 }
 

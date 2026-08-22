@@ -417,6 +417,83 @@ impl DebugDraw {
         );
     }
 
+    /// Wireframe capsule: cylinder between `a`/`b` plus hemispherical caps.
+    pub fn capsule(&mut self, a: Vec3, b: Vec3, radius: f32, color: [f32; 4], depth_test: bool) {
+        let r = radius.max(1e-5);
+        let ab = b - a;
+        let len = ab.length();
+        if len < 1e-5 {
+            self.sphere(a, r, color, depth_test);
+            return;
+        }
+        let axis = ab / len;
+        let u = axis.any_orthonormal_vector();
+        let v = axis.cross(u);
+        let lon = 16u32;
+        let hemi = 6u32;
+        let mut opts = LineOpts::color(color);
+        opts.depth_test = depth_test;
+        if !depth_test {
+            opts = opts.overlay();
+        }
+
+        let ring = |center: Vec3, ru: f32| {
+            (0..lon).map(move |i| {
+                let ang = TAU * i as f32 / lon as f32;
+                center + (u * ang.cos() + v * ang.sin()) * ru
+            })
+        };
+
+        let draw_ring = |s: &mut Self, center: Vec3, ru: f32| {
+            let mut prev = center + u * ru;
+            for i in 1..=lon {
+                let ang = TAU * i as f32 / lon as f32;
+                let p = center + (u * ang.cos() + v * ang.sin()) * ru;
+                s.line(prev, p, opts);
+                prev = p;
+            }
+        };
+
+        // Cylinder wall: equator rings at both ends + longitudes.
+        draw_ring(self, a, r);
+        draw_ring(self, b, r);
+        for i in 0..lon {
+            let ang = TAU * i as f32 / lon as f32;
+            let off = (u * ang.cos() + v * ang.sin()) * r;
+            self.line(a + off, b + off, opts);
+        }
+
+        // Hemispheres: a points opposite `axis`, b along `axis`.
+        for cap_sign in [-1.0f32, 1.0] {
+            let origin = if cap_sign < 0.0 { a } else { b };
+            let mut prev_pts: Vec<Vec3> = ring(origin, r).collect();
+            for j in 1..=hemi {
+                let t = j as f32 / hemi as f32;
+                let lat = t * std::f32::consts::FRAC_PI_2;
+                let ring_r = r * lat.cos();
+                let center = origin + axis * cap_sign * (r * lat.sin());
+                let mut pts = Vec::with_capacity(lon as usize);
+                for i in 0..lon {
+                    let ang = TAU * i as f32 / lon as f32;
+                    pts.push(center + (u * ang.cos() + v * ang.sin()) * ring_r);
+                }
+                if j < hemi {
+                    draw_ring(self, center, ring_r);
+                } else {
+                    let pole = origin + axis * cap_sign * r;
+                    for &p in &prev_pts {
+                        self.line(p, pole, opts);
+                    }
+                    break;
+                }
+                for i in 0..lon as usize {
+                    self.line(prev_pts[i], pts[i], opts);
+                }
+                prev_pts = pts;
+            }
+        }
+    }
+
     /// Classic diamond bone: parent tip → mid cross → child tip.
     pub fn bone(&mut self, from: Vec3, to: Vec3, color: [f32; 4], depth_test: bool) {
         let dir = to - from;

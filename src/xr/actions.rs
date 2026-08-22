@@ -23,12 +23,10 @@ pub struct HandPose {
 pub struct XrActions {
     set: xr::ActionSet,
     /// Kept alive for `left_space`/`right_space` (each holds a ref to the
-    /// action's parent set); not read directly elsewhere.
-    #[allow(dead_code)]
+    /// action's parent set); also queried for [`Self::controller_active`].
     grip_pose: xr::Action<xr::Posef>,
     /// Kept alive for `left_aim_space`/`right_aim_space`, same reason as
     /// `grip_pose` above.
-    #[allow(dead_code)]
     aim_pose: xr::Action<xr::Posef>,
     stick: xr::Action<xr::Vector2f>,
     select: xr::Action<f32>,
@@ -171,6 +169,25 @@ impl XrActions {
             Ok(s) if s.is_active => s.current_state,
             _ => 0.0,
         }
+    }
+
+    /// True while a *controller* interaction profile is driving this hand
+    /// (Index/Touch/Vive/…). Finger-tracked joints can still be valid at the
+    /// same time — callers should treat this as "use the laser, not the
+    /// skeleton". Bare-hand tracking leaves the pose actions inactive and
+    /// typically has a null interaction profile.
+    pub fn controller_active(&self, session: &xr::Session<xr::Vulkan>, hand: Hand) -> bool {
+        let path = self.hand_path(hand);
+        let profile = session
+            .current_interaction_profile(path)
+            .ok()
+            .is_some_and(|p| p != xr::Path::NULL);
+        if !profile {
+            return false;
+        }
+        let grip = self.grip_pose.is_active(session, path).ok().unwrap_or(false);
+        let aim = self.aim_pose.is_active(session, path).ok().unwrap_or(false);
+        grip || aim
     }
 
     /// Controller grip pose relative to `base` (normally

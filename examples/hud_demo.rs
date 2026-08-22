@@ -248,7 +248,7 @@ impl App {
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("hud_demo"),
-            required_features: wgpu::Features::empty(),
+            required_features: adapter.features() & mega_render::WGPU_FEATURES,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             required_limits: limits,
             memory_hints: wgpu::MemoryHints::Performance,

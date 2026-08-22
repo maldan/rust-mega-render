@@ -11,11 +11,13 @@
 //! keeps using whatever wgpu backend it already uses.
 
 mod actions;
+mod hand_tracking;
 mod loader;
 mod session;
 mod wgpu_interop;
 
 pub use actions::{Hand, HandPose, XrActions};
+pub use hand_tracking::{TrackedHand, TrackedJoint, HAND_BONES, HAND_JOINT_COUNT};
 pub use session::{XrContext, XrError, XrEyeViews, XrFrame, XrPollResult, XrSwapchain, VIEW_COUNT};
 pub use wgpu_interop::{
     wrap_swapchain_images, XrSwapchainImage, XrWgpu, XR_COLOR_FORMAT_VK, XR_COLOR_FORMAT_WGPU,
