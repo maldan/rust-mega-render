@@ -1,6 +1,21 @@
 use glam::{Mat4, Quat, Vec3};
 use std::f32::consts::TAU;
 
+/// Stick skeleton line / joint sizes (screen-space px).
+pub const SKELETON_LINE_W: f32 = 3.5;
+pub const SKELETON_OUTLINE_W: f32 = 7.5;
+pub const SKELETON_JOINT: f32 = 8.0;
+pub const SKELETON_JOINT_OUTLINE: f32 = 12.0;
+
+pub const SKELETON_FILL: [f32; 4] = [0.86, 0.86, 0.90, 1.0];
+pub const SKELETON_OUTLINE: [f32; 4] = [0.02, 0.02, 0.04, 1.0];
+pub const SKELETON_SEL_FILL: [f32; 4] = [0.35, 0.72, 1.0, 1.0];
+pub const SKELETON_SEL_OUTLINE: [f32; 4] = [0.06, 0.22, 0.55, 1.0];
+pub const SKELETON_IK_TARGET_FILL: [f32; 4] = [1.0, 0.55, 0.12, 1.0];
+pub const SKELETON_IK_TARGET_OUTLINE: [f32; 4] = [0.45, 0.18, 0.02, 1.0];
+pub const SKELETON_IK_POLE_FILL: [f32; 4] = [0.85, 0.35, 0.95, 1.0];
+pub const SKELETON_IK_POLE_OUTLINE: [f32; 4] = [0.35, 0.08, 0.45, 1.0];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GizmoMode {
     Translate,
@@ -494,38 +509,38 @@ impl DebugDraw {
         }
     }
 
-    /// Classic diamond bone: parent tip → mid cross → child tip.
-    pub fn bone(&mut self, from: Vec3, to: Vec3, color: [f32; 4], depth_test: bool) {
-        let dir = to - from;
-        let len = dir.length();
-        if len < 1e-6 {
-            return;
+    /// Stick bone: thick outline under thinner fill (screen-space px widths).
+    pub fn bone(
+        &mut self,
+        from: Vec3,
+        to: Vec3,
+        fill: [f32; 4],
+        outline: [f32; 4],
+        overlay: bool,
+    ) {
+        let mut outline_opts = LineOpts::color(outline).width(SKELETON_OUTLINE_W);
+        let mut fill_opts = LineOpts::color(fill).width(SKELETON_LINE_W);
+        if overlay {
+            outline_opts = outline_opts.overlay();
+            fill_opts = fill_opts.overlay();
         }
-        let axis = dir / len;
-        let up = if axis.cross(Vec3::Y).length_squared() < 1e-4 {
-            Vec3::Z
-        } else {
-            Vec3::Y
-        };
-        let side = axis.cross(up).normalize();
-        let up = side.cross(axis).normalize();
-        let mid = from + axis * (len * 0.2);
-        let r = len * 0.1;
-        let c = [
-            mid + side * r,
-            mid + up * r,
-            mid - side * r,
-            mid - up * r,
-        ];
-        let opts = LineOpts {
-            depth_test,
-            ..LineOpts::color(color)
-        };
-        for i in 0..4 {
-            self.line(from, c[i], opts);
-            self.line(c[i], to, opts);
-            self.line(c[i], c[(i + 1) % 4], opts);
-        }
+        self.line(from, to, outline_opts);
+        self.line(from, to, fill_opts);
+    }
+
+    /// Joint dot: outline then fill (points draw after lines → sit on top).
+    pub fn bone_joint(
+        &mut self,
+        pos: Vec3,
+        fill: [f32; 4],
+        outline: [f32; 4],
+        fill_px: f32,
+        outline_px: f32,
+        overlay: bool,
+    ) {
+        let depth_test = !overlay;
+        self.point_ex(pos, outline, outline_px, depth_test);
+        self.point_ex(pos, fill, fill_px, depth_test);
     }
 
     /// Transform gizmo at `pos` with local `rotation` (object scale ignored).

@@ -1,6 +1,6 @@
 //! Debug draw showcase + interactive transform gizmos.
 //!
-//! Showcase: lines / points / boxes / spheres / bones (library helpers).
+//! Showcase: lines / points / boxes / spheres / stick bones (library helpers).
 //! Three cubes: translate · rotate · scale gizmos (no mode switching).
 //! View gizmo (top-right): click an axis tip to snap the fly cam.
 //!
@@ -858,18 +858,51 @@ impl App {
         dbg.sphere(orbit, 0.55, [0.4, 0.85, 1.0, 1.0], true);
         dbg.point_sized(orbit, [1.0, 1.0, 1.0, 1.0], 10.0);
 
-        // Animated bone chain
+        // Animated stick bone chain
         let base = Vec3::new(-4.0, 0.15, 2.5);
         let mid = base
             + Quat::from_axis_angle(Vec3::Y, t * 1.2)
                 * Vec3::new(0.0, 1.1 + 0.2 * (t * 2.0).sin(), 0.8);
         let tip = mid
             + Quat::from_axis_angle(Vec3::Z, (t * 1.7).sin() * 0.7) * Vec3::new(0.0, 0.9, 0.2);
-        dbg.bone(base, mid, [1.0, 0.55, 0.2, 1.0], true);
-        dbg.bone(mid, tip, [0.95, 0.35, 0.55, 1.0], true);
-        dbg.point_sized(base, [1.0, 0.55, 0.2, 1.0], 8.0);
-        dbg.point_sized(mid, [1.0, 0.8, 0.3, 1.0], 7.0);
-        dbg.point_sized(tip, [0.95, 0.35, 0.55, 1.0], 7.0);
+        dbg.bone(
+            base,
+            mid,
+            [1.0, 0.55, 0.2, 1.0],
+            [0.45, 0.18, 0.02, 1.0],
+            true,
+        );
+        dbg.bone(
+            mid,
+            tip,
+            [0.95, 0.35, 0.55, 1.0],
+            [0.4, 0.08, 0.2, 1.0],
+            true,
+        );
+        dbg.bone_joint(
+            base,
+            [1.0, 0.55, 0.2, 1.0],
+            [0.45, 0.18, 0.02, 1.0],
+            8.0,
+            12.0,
+            true,
+        );
+        dbg.bone_joint(
+            mid,
+            [1.0, 0.8, 0.3, 1.0],
+            [0.45, 0.3, 0.05, 1.0],
+            7.0,
+            11.0,
+            true,
+        );
+        dbg.bone_joint(
+            tip,
+            [0.95, 0.35, 0.55, 1.0],
+            [0.4, 0.08, 0.2, 1.0],
+            7.0,
+            11.0,
+            true,
+        );
 
         // Rainbow helix
         let helix_origin = Vec3::new(4.0, 0.2, 2.5);

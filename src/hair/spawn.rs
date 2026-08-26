@@ -302,6 +302,7 @@ fn spawn_maps(
         vec![40, 16, 8, 255].repeat((w * h) as usize)
     };
     let grad = scene.textures.insert(Texture {
+        id: Texture::new_id(),
         width: w,
         height: h,
         rgba: albedo,
@@ -311,6 +312,7 @@ fn spawn_maps(
         gpu_resident: false,
     });
     let rough = scene.textures.insert(Texture {
+        id: Texture::new_id(),
         width: w,
         height: h,
         rgba: roughness,
@@ -320,6 +322,7 @@ fn spawn_maps(
         gpu_resident: false,
     });
     let nrm = scene.textures.insert(Texture {
+        id: Texture::new_id(),
         width: w,
         height: h,
         rgba: normal,

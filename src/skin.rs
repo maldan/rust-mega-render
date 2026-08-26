@@ -1,7 +1,9 @@
 use super::mesh::Mesh;
 use super::node::Node;
-use super::store::Handle;
+use super::store::{Handle, Store};
 use glam::{Mat3, Mat4, Quat, Vec3};
+
+pub use crate::io::skin::{SkinBytesError, SkinFile};
 
 /// How skinned vertices blend joint transforms.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -40,6 +42,19 @@ impl SkinningMode {
 pub struct Skin {
     pub joints: Vec<Handle<Node>>,
     pub inverse_bind: Vec<Mat4>,
+}
+
+impl Skin {
+    /// Look up each joint node and write bind matrices + names + parents + rest pose.
+    /// Handles are not stored; `nodes` is only the lookup table.
+    pub fn to_bytes(&self, nodes: &Store<Node>) -> Vec<u8> {
+        SkinFile::from_skin(self, nodes).to_bytes()
+    }
+
+    /// Spawn joint nodes into `nodes` and return a skin whose `joints` point at them.
+    pub fn from_bytes(bytes: &[u8], nodes: &mut Store<Node>) -> Result<Self, SkinBytesError> {
+        Ok(SkinFile::from_bytes(bytes)?.into_skin(nodes))
+    }
 }
 
 /// Unit dual quaternion: real = rotation, dual encodes translation.

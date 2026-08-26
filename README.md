@@ -289,11 +289,20 @@ scene.load_gltf_async("model.glb", Some(parent), |scene, root| {
 
 Импорт: иерархия, PBR-материалы/текстуры, skins, animation clips → `Animator`.
 
-Отладка скелета:
+Отладка скелета (стики; выделение / IK — через `SkeletonDebugOpts`):
 
 ```rust
+use mega_render::SkeletonDebugOpts;
+
 scene.debug.clear();
-scene.debug_skeletons([1.0, 0.9, 0.2, 1.0], true);
+scene.debug_skeletons(&SkeletonDebugOpts {
+    selected: &selected_joints, // &[Handle<Node>]
+    ik_targets: &[],
+    ik_poles: &[],
+    overlay: true,
+});
+// или дефолт без подсветки:
+scene.debug_skeletons(&SkeletonDebugOpts::DEFAULT);
 ```
 
 ---

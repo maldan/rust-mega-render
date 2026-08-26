@@ -1,6 +1,11 @@
 use super::animation::{sample_quat, sample_vec3, AnimPath, AnimValues, AnimationClip, Animator};
 use super::camera::Camera;
-use super::debug_draw::DebugDraw;
+use super::debug_draw::{
+    DebugDraw, LineOpts, SKELETON_FILL, SKELETON_IK_POLE_FILL, SKELETON_IK_POLE_OUTLINE,
+    SKELETON_IK_TARGET_FILL, SKELETON_IK_TARGET_OUTLINE, SKELETON_JOINT, SKELETON_JOINT_OUTLINE,
+    SKELETON_LINE_W, SKELETON_OUTLINE, SKELETON_OUTLINE_W, SKELETON_SEL_FILL,
+    SKELETON_SEL_OUTLINE,
+};
 use super::hud::Hud;
 use super::light::{DirectionalLight, Light};
 use super::material::Material;
@@ -8,10 +13,91 @@ use super::mesh::Mesh;
 use super::node::Node;
 use super::skin::{Skin, SkinningMode};
 use super::store::{Handle, Store};
-use super::texture::Texture;
+use super::texture::TextureStore;
 use glam::{Mat4, Vec3};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, TryRecvError};
+
+/// Highlight / overlay options for stick skeleton debug draw.
+#[derive(Clone, Copy)]
+pub struct SkeletonDebugOpts<'a> {
+    pub selected: &'a [Handle<Node>],
+    pub ik_targets: &'a [Handle<Node>],
+    pub ik_poles: &'a [Handle<Node>],
+    /// Draw without depth test so the mesh never hides the stick figure.
+    pub overlay: bool,
+}
+
+impl Default for SkeletonDebugOpts<'static> {
+    fn default() -> Self {
+        Self {
+            selected: &[],
+            ik_targets: &[],
+            ik_poles: &[],
+            overlay: true,
+        }
+    }
+}
+
+impl SkeletonDebugOpts<'static> {
+    pub const DEFAULT: Self = Self {
+        selected: &[],
+        ik_targets: &[],
+        ik_poles: &[],
+        overlay: true,
+    };
+}
+
+fn key_in(list: &[Handle<Node>], joint: Handle<Node>) -> bool {
+    let k = joint.key();
+    list.iter().any(|h| h.key() == k)
+}
+
+fn is_ik_control(joint: Handle<Node>, opts: &SkeletonDebugOpts<'_>) -> bool {
+    key_in(opts.ik_targets, joint) || key_in(opts.ik_poles, joint)
+}
+
+/// `(outline, fill, joint_px, joint_outline_px)` for a joint under `opts`.
+fn skeleton_joint_style(
+    joint: Handle<Node>,
+    opts: &SkeletonDebugOpts<'_>,
+) -> ([f32; 4], [f32; 4], f32, f32) {
+    let selected = key_in(opts.selected, joint);
+    let is_target = key_in(opts.ik_targets, joint);
+    let is_pole = key_in(opts.ik_poles, joint);
+    match (is_target, is_pole, selected) {
+        (true, _, false) => (
+            SKELETON_IK_TARGET_OUTLINE,
+            SKELETON_IK_TARGET_FILL,
+            SKELETON_JOINT * 1.35,
+            SKELETON_JOINT_OUTLINE * 1.35,
+        ),
+        (_, true, false) => (
+            SKELETON_IK_POLE_OUTLINE,
+            SKELETON_IK_POLE_FILL,
+            SKELETON_JOINT * 1.2,
+            SKELETON_JOINT_OUTLINE * 1.2,
+        ),
+        (true, _, true) | (_, true, true) => (
+            SKELETON_SEL_OUTLINE,
+            SKELETON_SEL_FILL,
+            SKELETON_JOINT * 1.4,
+            SKELETON_JOINT_OUTLINE * 1.4,
+        ),
+        (false, false, true) => (
+            SKELETON_SEL_OUTLINE,
+            SKELETON_SEL_FILL,
+            SKELETON_JOINT,
+            SKELETON_JOINT_OUTLINE,
+        ),
+        (false, false, false) => (
+            SKELETON_OUTLINE,
+            SKELETON_FILL,
+            SKELETON_JOINT,
+            SKELETON_JOINT_OUTLINE,
+        ),
+    }
+}
 
 pub(crate) enum PendingLoad {
     Gltf {
@@ -23,7 +109,7 @@ pub(crate) enum PendingLoad {
 
 pub struct Scene {
     pub meshes: Store<Mesh>,
-    pub textures: Store<Texture>,
+    pub textures: TextureStore,
     pub materials: Store<Material>,
     pub skins: Store<Skin>,
     pub animations: Store<AnimationClip>,
@@ -47,7 +133,7 @@ impl Scene {
     pub fn new() -> Self {
         Self {
             meshes: Store::default(),
-            textures: Store::default(),
+            textures: TextureStore::default(),
             materials: Store::default(),
             skins: Store::default(),
             animations: Store::default(),
@@ -228,15 +314,18 @@ impl Scene {
             .collect()
     }
 
-    /// Diamond bones for a skin.
+    /// Stick bones for a skin.
     /// Hierarchy parent→child when present; ARP-style flat deform bones
     /// (siblings under a non-joint rig) are linked along local +Y.
-    pub fn debug_skeleton(&mut self, skin: Handle<Skin>, color: [f32; 4], depth_test: bool) {
+    ///
+    /// Pass `selected` / `ik_targets` / `ik_poles` joint handles in `opts` for
+    /// highlight colors. IK control joints get markers only (no stick).
+    pub fn debug_skeleton(&mut self, skin: Handle<Skin>, opts: &SkeletonDebugOpts<'_>) {
         let Some(skin) = self.skins.get(skin) else {
             return;
         };
         let joints = skin.joints.clone();
-        let joint_set: std::collections::HashSet<_> = joints.iter().map(|j| j.key()).collect();
+        let joint_set: HashSet<_> = joints.iter().map(|j| j.key()).collect();
 
         let parent_joint = |scene: &Self, j: Handle<Node>| -> Option<Handle<Node>> {
             let mut parent = scene.nodes.get(j).and_then(|n| n.parent);
@@ -258,26 +347,36 @@ impl Scene {
             }
             false
         };
-        let pos_of = |scene: &Self, j: Handle<Node>| scene.world_matrix(j).transform_point3(Vec3::ZERO);
+        let pos_of =
+            |scene: &Self, j: Handle<Node>| scene.world_matrix(j).transform_point3(Vec3::ZERO);
 
-        let mut bones = Vec::new();
-        let mut has_joint_child = std::collections::HashSet::new();
+        let mut segments: Vec<(Vec3, Vec3, Handle<Node>)> = Vec::new();
+        let mut has_joint_child = HashSet::new();
 
-        // 1) Real hierarchy bones.
+        // 1) Real hierarchy bones (colored by parent / outgoing joint).
         for &j in &joints {
+            if is_ik_control(j, opts) {
+                continue;
+            }
             let Some(p) = parent_joint(self, j) else {
                 continue;
             };
+            if is_ik_control(p, opts) {
+                continue;
+            }
             has_joint_child.insert(p.key());
             let from = pos_of(self, p);
             let to = pos_of(self, j);
             if (to - from).length_squared() > 1e-12 {
-                bones.push((from, to));
+                segments.push((from, to, p));
             }
         }
 
         // 2) Flat deform bones (Auto-Rig Pro etc.): no joint parent → next along +Y.
         for &j in &joints {
+            if is_ik_control(j, opts) {
+                continue;
+            }
             if parent_joint(self, j).is_some() {
                 continue;
             }
@@ -298,7 +397,7 @@ impl Scene {
 
             let mut best: Option<(f32, Vec3)> = None;
             for &k in &joints {
-                if k.key() == j.key() || is_descendant(self, j, k) {
+                if k.key() == j.key() || is_descendant(self, j, k) || is_ik_control(k, opts) {
                     continue;
                 }
                 let to = pos_of(self, k);
@@ -317,27 +416,64 @@ impl Scene {
                 }
             }
             if let Some((_, to)) = best {
-                bones.push((from, to));
+                segments.push((from, to, j));
             } else if !has_joint_child.contains(&j.key()) {
-                let len = bones
+                let len = segments
                     .iter()
-                    .map(|(a, b)| (*b - *a).length())
+                    .map(|(a, b, _)| (*b - *a).length())
                     .sum::<f32>()
-                    / bones.len().max(1) as f32;
+                    / segments.len().max(1) as f32;
                 let len = if len > 1e-4 { len } else { 0.1 };
-                bones.push((from, from + axis * len));
+                segments.push((from, from + axis * len, j));
             }
         }
 
-        for (from, to) in bones {
-            self.debug.bone(from, to, color, depth_test);
+        let joint_pts: Vec<(Vec3, Handle<Node>)> =
+            joints.iter().map(|&j| (pos_of(self, j), j)).collect();
+        self.debug_skeleton_sticks(&segments, &joint_pts, opts);
+    }
+
+    /// Stick skeleton from explicit segments + joint markers.
+    ///
+    /// `segments`: `(from, to, owner)` — `owner` picks fill/outline via `opts`.
+    /// `joints`: `(world_pos, joint)` for dots (including IK controls).
+    pub fn debug_skeleton_sticks(
+        &mut self,
+        segments: &[(Vec3, Vec3, Handle<Node>)],
+        joints: &[(Vec3, Handle<Node>)],
+        opts: &SkeletonDebugOpts<'_>,
+    ) {
+        let overlay = opts.overlay;
+
+        // Outlines first so fills of every bone sit above all outlines.
+        for &(from, to, owner) in segments {
+            let (outline, _, _, _) = skeleton_joint_style(owner, opts);
+            let mut lo = LineOpts::color(outline).width(SKELETON_OUTLINE_W);
+            if overlay {
+                lo = lo.overlay();
+            }
+            self.debug.line(from, to, lo);
+        }
+        for &(from, to, owner) in segments {
+            let (_, fill, _, _) = skeleton_joint_style(owner, opts);
+            let mut lf = LineOpts::color(fill).width(SKELETON_LINE_W);
+            if overlay {
+                lf = lf.overlay();
+            }
+            self.debug.line(from, to, lf);
+        }
+
+        for &(pos, joint) in joints {
+            let (outline, fill, joint_px, joint_out_px) = skeleton_joint_style(joint, opts);
+            self.debug
+                .bone_joint(pos, fill, outline, joint_px, joint_out_px, overlay);
         }
     }
 
-    pub fn debug_skeletons(&mut self, color: [f32; 4], depth_test: bool) {
+    pub fn debug_skeletons(&mut self, opts: &SkeletonDebugOpts<'_>) {
         let skins: Vec<_> = self.skins.iter().map(|(h, _)| h).collect();
         for h in skins {
-            self.debug_skeleton(h, color, depth_test);
+            self.debug_skeleton(h, opts);
         }
     }
 }

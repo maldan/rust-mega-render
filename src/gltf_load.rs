@@ -59,7 +59,7 @@ pub fn load_gltf(
 
     let mut tex_handles = Vec::with_capacity(images.len());
     for (i, img) in images.iter().enumerate() {
-        let mut tex = image_to_texture(img)?;
+        let mut tex = image_to_texture(img, gltf_image_id(path.as_ref(), &doc, i))?;
         tex.srgb = !linear.get(i).copied().unwrap_or(false);
         tex_handles.push(scene.textures.insert(tex));
     }
@@ -227,7 +227,7 @@ pub(crate) fn absorb_gltf(
     parent: Option<Handle<Node>>,
 ) -> Handle<Node> {
     let mut tex_map = HashMap::new();
-    for (h, tex) in take_all(&mut src.textures) {
+    for (h, tex) in take_textures(&mut src.textures) {
         tex_map.insert(h.key(), dst.textures.insert(tex));
     }
 
@@ -329,6 +329,14 @@ pub(crate) fn absorb_gltf(
     }
 
     *node_map.get(&src_root.key()).expect("gltf root")
+}
+
+fn take_textures(store: &mut crate::TextureStore) -> Vec<(Handle<Texture>, Texture)> {
+    let handles: Vec<_> = store.iter().map(|(h, _)| h).collect();
+    handles
+        .into_iter()
+        .filter_map(|h| store.remove(h).map(|v| (h, v)))
+        .collect()
 }
 
 fn take_all<T>(store: &mut Store<T>) -> Vec<(Handle<T>, T)> {
@@ -605,7 +613,16 @@ fn convert_rotation(r: [f32; 4]) -> Quat {
     convert_trs([0.0, 0.0, 0.0], r, [1.0, 1.0, 1.0]).1
 }
 
-fn image_to_texture(img: &gltf::image::Data) -> Result<Texture, String> {
+fn gltf_image_id(path: &Path, doc: &gltf::Document, index: usize) -> String {
+    let base = path.to_string_lossy().replace('\\', "/");
+    let name = doc.images().nth(index).and_then(|im| im.name());
+    match name {
+        Some(n) if !n.is_empty() => format!("{base}/images/{index}:{n}"),
+        _ => format!("{base}/images/{index}"),
+    }
+}
+
+fn image_to_texture(img: &gltf::image::Data, id: String) -> Result<Texture, String> {
     use gltf::image::Format;
     let rgba = match img.format {
         Format::R8 => img.pixels.iter().flat_map(|&r| [r, r, r, 255]).collect(),
@@ -623,6 +640,7 @@ fn image_to_texture(img: &gltf::image::Data) -> Result<Texture, String> {
         other => return Err(format!("unsupported glTF image format: {other:?}")),
     };
     Ok(Texture {
+        id,
         width: img.width,
         height: img.height,
         rgba,
