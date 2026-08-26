@@ -45,6 +45,17 @@ struct ObjectUniforms {
 @group(1) @binding(2) var normal_tex: texture_2d<f32>;
 @group(1) @binding(3) var mr_tex: texture_2d<f32>;
 @group(1) @binding(4) var samp: sampler;
+@group(1) @binding(5) var albedo_arr: texture_2d_array<f32>;
+@group(1) @binding(6) var normal_arr: texture_2d_array<f32>;
+@group(1) @binding(7) var mr_arr: texture_2d_array<f32>;
+@group(1) @binding(8) var udim_samp: sampler;
+@group(1) @binding(9) var<uniform> udim_lut: UdimLut;
+
+struct UdimLut {
+    albedo: array<vec4<u32>, 25>,
+    normal: array<vec4<u32>, 25>,
+    mr: array<vec4<u32>, 25>,
+}
 // Per-skin bone palette: row0 = current, row1 = prev.
 // LBS (params.z≈1): 4 texels/joint = mat4 columns.
 // DQS (params.z≈2): 2 texels/joint = dual-quat real + dual.
@@ -527,20 +538,56 @@ fn wire_gbuf(rgb: vec3<f32>) -> GBufferOut {
 @fragment
 fn fs_main(in: VertexOutput) -> GBufferOut {
     let sampled = textureSample(albedo_tex, samp, in.uv);
+    let mr = textureSample(mr_tex, samp, in.uv);
+    let n_ts = textureSample(normal_tex, samp, in.uv).xyz * 2.0 - 1.0;
     let cutoff = object.albedo.a;
     if cutoff > 0.001 && sampled.a < cutoff {
         discard;
     }
+    return shade_gbuffer(in, sampled, mr, n_ts);
+}
+
+fn lut_layer(lut: array<vec4<u32>, 25>, uv: vec2<f32>) -> i32 {
+    let u = i32(floor(uv.x));
+    let v = i32(floor(uv.y));
+    if u < 0 || u > 9 || v < 0 || v > 9 {
+        return 0;
+    }
+    let i = u32(u + v * 10);
+    let packed = lut[i / 4u];
+    switch i % 4u {
+        case 0u: { return i32(packed.x); }
+        case 1u: { return i32(packed.y); }
+        case 2u: { return i32(packed.z); }
+        default: { return i32(packed.w); }
+    }
+}
+
+@fragment
+fn fs_udim(in: VertexOutput) -> GBufferOut {
+    let uv = fract(in.uv);
+    let al = lut_layer(udim_lut.albedo, in.uv);
+    let nl = lut_layer(udim_lut.normal, in.uv);
+    let ml = lut_layer(udim_lut.mr, in.uv);
+    let sampled = textureSample(albedo_arr, udim_samp, uv, al);
+    let mr = textureSample(mr_arr, udim_samp, uv, ml);
+    let n_ts = textureSample(normal_arr, udim_samp, uv, nl).xyz * 2.0 - 1.0;
+    let cutoff = object.albedo.a;
+    if cutoff > 0.001 && sampled.a < cutoff {
+        discard;
+    }
+    return shade_gbuffer(in, sampled, mr, n_ts);
+}
+
+fn shade_gbuffer(in: VertexOutput, sampled: vec4<f32>, mr: vec4<f32>, n_ts: vec3<f32>) -> GBufferOut {
     let base = vec4<f32>(sampled.rgb * object.albedo.rgb, sampled.a);
     let albedo = base.rgb;
-    let mr = textureSample(mr_tex, samp, in.uv);
     let metallic = object.params.x * mr.b;
     let roughness = max(object.params.y * mr.g, 0.04);
 
     let t = normalize(in.world_tangent.xyz);
     let n0 = normalize(in.world_normal);
     let b = cross(n0, t) * in.world_tangent.w;
-    let n_ts = textureSample(normal_tex, samp, in.uv).xyz * 2.0 - 1.0;
     let n = normalize(mat3x3(t, b, n0) * n_ts);
 
     let v = normalize(frame.camera_pos.xyz - in.world_pos);
@@ -576,12 +623,10 @@ fn fs_main(in: VertexOutput) -> GBufferOut {
             sss_curvature,
         );
     }
-    // Always linear HDR into G-buffer color (present/tonemap happens later).
     var out: GBufferOut;
     out.color = vec4<f32>(lit, base.a);
     out.normal = vec4<f32>(n, 0.0);
     out.velocity = in.velocity_px;
-    // R = occlusion placeholder, G = roughness, B = metallic
     out.orm = vec4<f32>(1.0, roughness, metallic, 1.0);
     out.albedo = vec4<f32>(albedo, 1.0);
     return out;

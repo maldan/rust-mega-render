@@ -233,11 +233,7 @@ pub(crate) fn absorb_gltf(
 
     let mut mat_map = HashMap::new();
     for (h, mut mat) in take_all(&mut src.materials) {
-        mat.albedo_map = mat.albedo_map.and_then(|t| tex_map.get(&t.key()).copied());
-        mat.normal_map = mat.normal_map.and_then(|t| tex_map.get(&t.key()).copied());
-        mat.metallic_roughness_map = mat
-            .metallic_roughness_map
-            .and_then(|t| tex_map.get(&t.key()).copied());
+        mat.maps.remap_textures(|t| tex_map.get(&t.key()).copied());
         mat_map.insert(h.key(), dst.materials.insert(mat));
     }
 
@@ -550,19 +546,33 @@ fn convert_material(mat: &gltf::Material, textures: &[Handle<Texture>]) -> Mater
     if let Some(info) = pbr.base_color_texture() {
         let i = info.texture().source().index();
         if let Some(&tex) = textures.get(i) {
-            m.albedo_map = Some(tex);
+            m.maps = crate::MaterialMaps::Single {
+                albedo: Some(tex),
+                normal: None,
+                metallic_roughness: None,
+            };
         }
     }
     if let Some(info) = mat.normal_texture() {
         let i = info.texture().source().index();
         if let Some(&tex) = textures.get(i) {
-            m.normal_map = Some(tex);
+            match &mut m.maps {
+                crate::MaterialMaps::Single { normal, .. } => *normal = Some(tex),
+                _ => {}
+            }
         }
     }
     if let Some(info) = pbr.metallic_roughness_texture() {
         let i = info.texture().source().index();
         if let Some(&tex) = textures.get(i) {
-            m.metallic_roughness_map = Some(tex);
+            match &mut m.maps {
+                crate::MaterialMaps::Single {
+                    metallic_roughness, ..
+                } => {
+                    *metallic_roughness = Some(tex);
+                }
+                _ => {}
+            }
         }
     }
     m

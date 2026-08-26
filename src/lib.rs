@@ -9,6 +9,7 @@ pub mod hair;
 mod hud;
 mod hud_font;
 mod ibl;
+mod io;
 pub mod ik;
 mod input;
 mod light;
@@ -39,8 +40,8 @@ pub use hud::{Hud, HudId, HudLine, HudOutput, HudQuad, Rect as HudRect};
 pub use ik::{ccd_rotate_joint, quat_from_matrix, translate_bone_world, solve_ik, IkChainDef};
 pub use input::InputFrame;
 pub use light::{DirectionalLight, Light, PointLight};
-pub use material::{HairShading, Material, ShadingModel};
-pub use mesh::{Mesh, MorphTarget};
+pub use material::{HairShading, Material, MaterialMaps, ShadingModel};
+pub use mesh::{Mesh, MeshBytesError, MorphTarget};
 pub use node::{Node, Transform};
 pub use post_process::{
     AoMethod, AoSettings, BloomSettings, ColorGradeSettings, ContactShadowSettings, DofSettings,

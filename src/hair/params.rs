@@ -17,6 +17,7 @@ pub enum HairStyle {
     Wave,
     Crimp,
     Coil,
+    Braid,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -70,7 +71,7 @@ pub struct HairGuide {
     pub lift: f32,
     pub width: f32,
     pub fill_with: Option<usize>,
-    /// No bones / joint slots. Mesh verts get zero skin weights from this guide.
+    /// No bones. Cards go on a separate unskinned mesh (rest pose).
     pub is_static: bool,
 }
 
@@ -130,6 +131,13 @@ pub struct HairParams {
     pub coil_start: f32,
     pub coil_radius: f32,
     pub coil_taper: f32,
+    /// Braid: ply count around the guide spine (2 = twist, 3 = classic).
+    pub braid_strands: u32,
+    pub braid_turns: f32,
+    pub braid_start: f32,
+    pub braid_radius: f32,
+    /// 0 = round rope, 1 = flattened plait.
+    pub braid_flatten: f32,
     pub tip_density: f32,
     pub multiply: u32,
     pub layers: u32,
@@ -199,6 +207,11 @@ impl Default for HairParams {
             coil_start: 0.22,
             coil_radius: 0.012,
             coil_taper: 0.65,
+            braid_strands: 3,
+            braid_turns: 5.0,
+            braid_start: 0.06,
+            braid_radius: 0.014,
+            braid_flatten: 0.72,
             tip_density: 2.0,
             multiply: 1,
             layers: 0,

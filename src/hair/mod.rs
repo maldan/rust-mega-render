@@ -10,7 +10,10 @@ mod texture;
 pub const MAX_HAIR_BONES: u16 = 255;
 
 pub use curve::{HairColorStop, HairCurve, HairCurvePoint, HairCurvePreset};
-pub use mesh::{apply_hair_mesh, generate_hair_mesh, HairMeshBuffers};
+pub use mesh::{
+    apply_hair_mesh, apply_hair_mesh_rigid, clear_hair_mesh, generate_hair_mesh, hair_mesh_has_geo,
+    HairCardMeshes, HairMeshBuffers, HairMeshes,
+};
 pub use params::{
     fill_pairs_of, HairGuide, HairGuidePoint, HairParams, HairShape, HairStyle, LayerRandom,
     RandRange,
@@ -56,8 +59,29 @@ mod tests {
         assert_eq!(rig.chains[0].guide, 1);
         assert_eq!(rig.chains[0].bone_base, 0);
         assert_eq!(rig.joint_locals.len(), 2);
-        let (front, _) = generate_hair_mesh(&guides, &[], &HairParams::default(), 0);
-        let max_j = front.4.iter().flatten().copied().max().unwrap_or(0);
+        let meshes = generate_hair_mesh(&guides, &[], &HairParams::default(), 0);
+        assert!(meshes.rigid.has_geo());
+        assert!(meshes.skinned.has_geo());
+        let max_j = meshes
+            .skinned
+            .front
+            .4
+            .iter()
+            .flatten()
+            .copied()
+            .max()
+            .unwrap_or(0);
         assert!(max_j < 2);
+        assert!(meshes.rigid.front.5.iter().flatten().all(|&w| w.abs() < 1e-6));
+    }
+
+    #[test]
+    fn static_only_is_rigid_mesh() {
+        let guides = vec![guide(true, 0.0)];
+        let meshes = generate_hair_mesh(&guides, &[], &HairParams::default(), 0);
+        assert!(meshes.rigid.has_geo());
+        assert!(!meshes.skinned.has_geo());
+        let rig = generate_hair_rig(&guides, 0.06);
+        assert!(rig.chains.is_empty());
     }
 }

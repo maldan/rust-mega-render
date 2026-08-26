@@ -30,14 +30,62 @@ pub struct Strand {
     binds: [SkinBind; 2],
 }
 
+impl Strand {
+    fn is_skinned(&self) -> bool {
+        self.binds
+            .iter()
+            .any(|b| b.n_bones > 0 && b.weight.abs() > 1e-8)
+    }
+}
+
+/// One ribbon/tube draw: outward `front`, plus inward `back` for ribbons.
+#[derive(Clone)]
+pub struct HairCardMeshes {
+    pub front: HairMeshBuffers,
+    pub back: Option<HairMeshBuffers>,
+}
+
+impl HairCardMeshes {
+    pub fn empty() -> Self {
+        Self {
+            front: empty_hair_mesh(),
+            back: None,
+        }
+    }
+
+    pub fn has_geo(&self) -> bool {
+        hair_mesh_has_geo(&self.front)
+    }
+}
+
+/// Static guides (no bones) and skinned guides are separate meshes so a
+/// `Skin` on the animated cards cannot zero-weight the rest-pose cards.
+#[derive(Clone)]
+pub struct HairMeshes {
+    pub skinned: HairCardMeshes,
+    pub rigid: HairCardMeshes,
+}
+
 pub fn generate_hair_mesh(
     guides: &[HairGuide],
     fills: &[(usize, usize)],
     params: &HairParams,
     auto_idx: u32,
-) -> (HairMeshBuffers, Option<HairMeshBuffers>) {
+) -> HairMeshes {
     let strands = build_strands(guides, fills, params, auto_idx);
-    mesh_from_strands(&strands, params)
+    let mut skinned = Vec::new();
+    let mut rigid = Vec::new();
+    for s in strands {
+        if s.is_skinned() {
+            skinned.push(s);
+        } else {
+            rigid.push(s);
+        }
+    }
+    HairMeshes {
+        skinned: mesh_from_strands(&skinned, params),
+        rigid: mesh_from_strands(&rigid, params),
+    }
 }
 
 pub fn build_strands(
@@ -133,7 +181,7 @@ pub fn build_strands(
         refit_frames(s);
     }
 
-    strands
+    expand_style_strands(strands, params)
 }
 
 fn offset_along_root_normal(s: &Strand, dist: f32) -> Strand {
@@ -362,6 +410,34 @@ fn vary_strand(s: &mut Strand, id: u32, params: &HairParams, lr: &LayerRandom) {
         HairStyle::Coil => {
             apply_coil(s, coil_turns, coil_start, coil_radius, params.coil_taper)
         }
+        HairStyle::Braid => {}
+    }
+}
+
+/// Styles that emit more than one mesh strand per sampled guide/fill.
+fn expand_style_strands(strands: Vec<Strand>, params: &HairParams) -> Vec<Strand> {
+    match params.style {
+        HairStyle::Braid => {
+            let n = params.braid_strands.clamp(2, 4) as usize;
+            let mut out = Vec::with_capacity(strands.len() * n);
+            for s in strands {
+                for k in 0..n {
+                    let mut ply = s.clone();
+                    apply_braid_ply(
+                        &mut ply,
+                        k,
+                        n,
+                        params.braid_turns,
+                        params.braid_start,
+                        params.braid_radius,
+                        params.braid_flatten,
+                    );
+                    out.push(ply);
+                }
+            }
+            out
+        }
+        _ => strands,
     }
 }
 
@@ -550,6 +626,10 @@ fn sample_guide(g: &HairGuide, params: &HairParams) -> Strand {
         ),
         HairStyle::Coil => (
             params.coil_start.clamp(0.0, 0.95),
+            params.tip_density.max(1.0),
+        ),
+        HairStyle::Braid => (
+            params.braid_start.clamp(0.0, 0.95),
             params.tip_density.max(1.0),
         ),
     };
@@ -763,6 +843,42 @@ fn apply_coil(s: &mut Strand, turns: f32, start: f32, radius: f32, taper: f32) {
         let ang = sign * u * turns * std::f32::consts::TAU;
         let r = radius * fade * (1.0 - taper * u);
         (nor * ang.cos() + bin * ang.sin()) * r
+    });
+    refit_frames(s);
+}
+
+/// One ply of a 2–4 strand braid around the sampled spine.
+/// Lissajous in the (binormal, normal) plane so plies cross over/under
+/// instead of orbiting as a round rope. `flatten` squashes the normal axis.
+fn apply_braid_ply(
+    s: &mut Strand,
+    ply: usize,
+    ply_count: usize,
+    turns: f32,
+    start: f32,
+    radius: f32,
+    flatten: f32,
+) {
+    if turns.abs() <= 1e-4 || radius.abs() <= 1e-6 || s.pts.len() < 3 || ply_count < 2 {
+        return;
+    }
+    let flatten = flatten.clamp(0.0, 1.0);
+    let depth = (1.0 - flatten * 0.82).max(0.12);
+    let sign = turns.signum();
+    let turns = turns.abs();
+    let phase = ply as f32 / ply_count as f32 * std::f32::consts::TAU;
+    let w_scale = 1.15 / ply_count as f32;
+    for w in &mut s.widths {
+        *w = (*w * w_scale).max(0.0005);
+    }
+    s.shade = (s.shade * (1.0 + (ply as f32 / ply_count as f32 - 0.5) * 0.12))
+        .clamp(TINT_MIN, TINT_MAX);
+
+    displace_along_strand(s, start, |u, nor, bin| {
+        let fade = smoothstep01(0.0, 0.1, u);
+        let ang = sign * u * turns * std::f32::consts::TAU + phase;
+        let along = bin * ang.sin() + nor * ((2.0 * ang).sin() * depth);
+        along * (radius * fade)
     });
     refit_frames(s);
 }
@@ -1013,16 +1129,20 @@ fn strand_weight(width: f32, shade: f32, alpha: f32) -> [f32; 4] {
     [width.max(1e-4), shade, alpha.clamp(0.0, 1.0), 0.0]
 }
 
-fn dummy_hair_mesh() -> HairMeshBuffers {
+fn empty_hair_mesh() -> HairMeshBuffers {
     (
-        vec![[0.0, 0.0, 0.0], [0.01, 0.0, 0.0], [0.0, 0.01, 0.0]],
-        vec![[0.0, 1.0, 0.0]; 3],
-        vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
-        vec![[1.0, 1.0, 1.0, 0.0]; 3],
-        vec![[0; 4]; 3],
-        vec![[1.0, 0.0, 0.0, 0.0]; 3],
-        vec![0, 1, 2],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
     )
+}
+
+pub fn hair_mesh_has_geo(bufs: &HairMeshBuffers) -> bool {
+    bufs.0.len() >= 3 && bufs.6.len() >= 3
 }
 
 pub type HairMeshBuffers = (
@@ -1037,17 +1157,32 @@ pub type HairMeshBuffers = (
 
 /// Front mesh always; ribbons also return a separate back-side mesh so the
 /// renderer can draw back → front as two passes (soft-blend order).
-pub fn mesh_from_strands(
-    strands: &[Strand],
-    params: &HairParams,
-) -> (HairMeshBuffers, Option<HairMeshBuffers>) {
+pub fn mesh_from_strands(strands: &[Strand], params: &HairParams) -> HairCardMeshes {
+    if strands.is_empty() {
+        return HairCardMeshes::empty();
+    }
     match params.shape {
         HairShape::Ribbon => {
             let front = ribbons_from_strands(strands, false);
             let back = ribbons_from_strands(strands, true);
-            (front, Some(back))
+            if !hair_mesh_has_geo(&front) {
+                return HairCardMeshes::empty();
+            }
+            HairCardMeshes {
+                front,
+                back: Some(back).filter(hair_mesh_has_geo),
+            }
         }
-        HairShape::Tube => (tubes_from_strands(strands, params), None),
+        HairShape::Tube => {
+            let front = tubes_from_strands(strands, params);
+            if !hair_mesh_has_geo(&front) {
+                return HairCardMeshes::empty();
+            }
+            HairCardMeshes {
+                front,
+                back: None,
+            }
+        }
     }
 }
 
@@ -1109,7 +1244,7 @@ pub fn ribbons_from_strands(strands: &[Strand], back_side: bool) -> HairMeshBuff
         }
     }
     if pos.len() < 3 {
-        return dummy_hair_mesh();
+        return empty_hair_mesh();
     }
     (pos, nrm, uv, wts, joints, skin_w, idx)
 }
@@ -1230,7 +1365,7 @@ fn tubes_from_strands(strands: &[Strand], params: &HairParams) -> HairMeshBuffer
         }
     }
     if pos.len() < 3 {
-        return dummy_hair_mesh();
+        return empty_hair_mesh();
     }
     (pos, nrm, uv, wts, joints, skin_w, idx)
 }
@@ -1280,6 +1415,32 @@ pub fn apply_hair_mesh(mesh: &mut Mesh, (pos, nrm, uv, colors, joints, weights, 
     mesh.joints = vec![joints];
     mesh.weights = vec![weights];
     mesh.colors = vec![colors];
+    mesh.mark_changed();
+}
+
+/// Rest-pose cards: no joint palette. Safe even if a `Skin` is left on the node.
+pub fn apply_hair_mesh_rigid(
+    mesh: &mut Mesh,
+    (pos, nrm, uv, colors, _joints, _weights, idx): HairMeshBuffers,
+) {
+    mesh.positions = pos;
+    mesh.normals = nrm;
+    mesh.uvs = vec![uv];
+    mesh.indices = idx;
+    mesh.joints.clear();
+    mesh.weights.clear();
+    mesh.colors = vec![colors];
+    mesh.mark_changed();
+}
+
+pub fn clear_hair_mesh(mesh: &mut Mesh) {
+    mesh.positions = vec![[0.0, 0.0, 0.0], [0.01, 0.0, 0.0], [0.0, 0.01, 0.0]];
+    mesh.normals = vec![[0.0, 1.0, 0.0]; 3];
+    mesh.uvs = vec![vec![[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]]];
+    mesh.indices = vec![0, 1, 2];
+    mesh.joints.clear();
+    mesh.weights.clear();
+    mesh.colors.clear();
     mesh.mark_changed();
 }
 

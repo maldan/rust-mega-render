@@ -1,4 +1,6 @@
-use super::mesh::{apply_hair_mesh, generate_hair_mesh};
+use super::mesh::{
+    apply_hair_mesh, apply_hair_mesh_rigid, clear_hair_mesh, generate_hair_mesh, HairCardMeshes,
+};
 use super::params::{fill_pairs_of, HairGuide, HairParams, HairShape};
 use super::rig::{generate_hair_rig, spawn_hair_joints, HairChain};
 use super::texture::{bake_hair_maps, HairLayerBake};
@@ -27,6 +29,10 @@ pub struct HairStack {
     pub back_mesh: Handle<Mesh>,
     pub node: Handle<Node>,
     pub mesh: Handle<Mesh>,
+    pub static_back_node: Handle<Node>,
+    pub static_back_mesh: Handle<Mesh>,
+    pub static_node: Handle<Node>,
+    pub static_mesh: Handle<Mesh>,
 }
 
 pub struct HairLayerInstance {
@@ -85,7 +91,8 @@ pub fn spawn_hair(scene: &mut Scene, desc: &HairDesc) -> HairInstance {
         texs.push((grad, rough, normal));
     }
 
-    let mut backs = Vec::with_capacity(n);
+    // Draw order: skinned backs, rigid backs, skinned fronts, rigid fronts.
+    let mut skinned_backs = Vec::with_capacity(n);
     for li in 0..n {
         let mut row = Vec::new();
         for ai in 0..counts[li] {
@@ -95,56 +102,92 @@ pub fn spawn_hair(scene: &mut Scene, desc: &HairDesc) -> HairInstance {
                 mats[li],
             ));
         }
-        backs.push(row);
+        skinned_backs.push(row);
+    }
+    let mut rigid_backs = Vec::with_capacity(n);
+    for li in 0..n {
+        let mut row = Vec::new();
+        for ai in 0..counts[li] {
+            row.push(spawn_mesh_node(
+                scene,
+                &format!("hair_g{li}_a{ai}_static_back"),
+                mats[li],
+            ));
+        }
+        rigid_backs.push(row);
+    }
+    let mut skinned_fronts = Vec::with_capacity(n);
+    for li in 0..n {
+        let mut row = Vec::new();
+        for ai in 0..counts[li] {
+            row.push(spawn_mesh_node(
+                scene,
+                &format!("hair_g{li}_a{ai}_front"),
+                mats[li],
+            ));
+        }
+        skinned_fronts.push(row);
+    }
+    let mut rigid_fronts = Vec::with_capacity(n);
+    for li in 0..n {
+        let mut row = Vec::new();
+        for ai in 0..counts[li] {
+            row.push(spawn_mesh_node(
+                scene,
+                &format!("hair_g{li}_a{ai}_static_front"),
+                mats[li],
+            ));
+        }
+        rigid_fronts.push(row);
     }
 
     let mut layers = Vec::with_capacity(n);
     for (li, layer) in desc.layers.iter().enumerate() {
         let mut stacks = Vec::new();
         for ai in 0..counts[li] {
-            let (back_node, back_mesh) = backs[li][ai];
-            let (node, mesh) = spawn_mesh_node(
-                scene,
-                &format!("hair_g{li}_a{ai}_front"),
-                mats[li],
-            );
+            let (back_node, back_mesh) = skinned_backs[li][ai];
+            let (static_back_node, static_back_mesh) = rigid_backs[li][ai];
+            let (node, mesh) = skinned_fronts[li][ai];
+            let (static_node, static_mesh) = rigid_fronts[li][ai];
             stacks.push(HairStack {
                 back_node,
                 back_mesh,
                 node,
                 mesh,
+                static_back_node,
+                static_back_mesh,
+                static_node,
+                static_mesh,
             });
         }
 
         let fills = fill_pairs_of(&layer.guides);
-        let has = !layer.guides.is_empty();
+        let show = layer.visible && !layer.guides.is_empty();
         for (ai, slot) in stacks.iter().enumerate() {
-            let show = layer.visible && has;
-            if let Some(n) = scene.nodes.get_mut(slot.node) {
-                n.visible = show;
-            }
-            if !has {
+            if !show {
+                hide_pair(scene, slot.back_node, slot.node);
+                hide_pair(scene, slot.static_back_node, slot.static_node);
                 continue;
             }
-            let (front, back) = generate_hair_mesh(&layer.guides, &fills, &layer.params, ai as u32);
-            if let Some(mesh) = scene.meshes.get_mut(slot.mesh) {
-                apply_hair_mesh(mesh, front);
-            }
-            match back {
-                Some(bufs) => {
-                    if let Some(n) = scene.nodes.get_mut(slot.back_node) {
-                        n.visible = show;
-                    }
-                    if let Some(m) = scene.meshes.get_mut(slot.back_mesh) {
-                        apply_hair_mesh(m, bufs);
-                    }
-                }
-                None => {
-                    if let Some(n) = scene.nodes.get_mut(slot.back_node) {
-                        n.visible = false;
-                    }
-                }
-            }
+            let meshes = generate_hair_mesh(&layer.guides, &fills, &layer.params, ai as u32);
+            write_cards(
+                scene,
+                slot.back_node,
+                slot.back_mesh,
+                slot.node,
+                slot.mesh,
+                meshes.skinned,
+                true,
+            );
+            write_cards(
+                scene,
+                slot.static_back_node,
+                slot.static_back_mesh,
+                slot.static_node,
+                slot.static_mesh,
+                meshes.rigid,
+                false,
+            );
         }
 
         let rig = generate_hair_rig(&layer.guides, layer.guides.first().map(|g| g.lift).unwrap_or(0.0));
@@ -184,6 +227,63 @@ pub fn spawn_hair(scene: &mut Scene, desc: &HairDesc) -> HairInstance {
     }
 
     HairInstance { layers }
+}
+
+fn hide_pair(scene: &mut Scene, back: Handle<Node>, front: Handle<Node>) {
+    if let Some(n) = scene.nodes.get_mut(back) {
+        n.visible = false;
+    }
+    if let Some(n) = scene.nodes.get_mut(front) {
+        n.visible = false;
+    }
+}
+
+fn write_cards(
+    scene: &mut Scene,
+    back_node: Handle<Node>,
+    back_mesh: Handle<Mesh>,
+    node: Handle<Node>,
+    mesh: Handle<Mesh>,
+    cards: HairCardMeshes,
+    skinned: bool,
+) {
+    let show = cards.has_geo();
+    if let Some(n) = scene.nodes.get_mut(node) {
+        n.visible = show;
+    }
+    if show {
+        if let Some(m) = scene.meshes.get_mut(mesh) {
+            if skinned {
+                apply_hair_mesh(m, cards.front);
+            } else {
+                apply_hair_mesh_rigid(m, cards.front);
+            }
+        }
+    } else if let Some(m) = scene.meshes.get_mut(mesh) {
+        clear_hair_mesh(m);
+    }
+    match cards.back {
+        Some(bufs) if show => {
+            if let Some(n) = scene.nodes.get_mut(back_node) {
+                n.visible = true;
+            }
+            if let Some(m) = scene.meshes.get_mut(back_mesh) {
+                if skinned {
+                    apply_hair_mesh(m, bufs);
+                } else {
+                    apply_hair_mesh_rigid(m, bufs);
+                }
+            }
+        }
+        _ => {
+            if let Some(n) = scene.nodes.get_mut(back_node) {
+                n.visible = false;
+            }
+            if let Some(m) = scene.meshes.get_mut(back_mesh) {
+                clear_hair_mesh(m);
+            }
+        }
+    }
 }
 
 fn spawn_maps(
@@ -229,9 +329,11 @@ fn spawn_maps(
         gpu_resident: false,
     });
     let mut mat = Material::new([1.0, 1.0, 1.0, 1.0], 0.0, params.roughness);
-    mat.albedo_map = Some(grad);
-    mat.metallic_roughness_map = Some(rough);
-    mat.normal_map = Some(nrm);
+    mat.maps = crate::MaterialMaps::Single {
+        albedo: Some(grad),
+        normal: Some(nrm),
+        metallic_roughness: Some(rough),
+    };
     mat.alpha_cutoff = match params.shape {
         HairShape::Ribbon => params.cutout.clamp(0.02, 1.0),
         HairShape::Tube => 0.0,

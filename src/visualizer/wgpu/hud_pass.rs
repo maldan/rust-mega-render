@@ -1,7 +1,6 @@
 //! Screen-space HUD overlay pass (after post / present).
 
 use bytemuck::{Pod, Zeroable};
-use wgpu::util::DeviceExt;
 
 use crate::hud::{Hud, HudLine, HudQuad};
 
@@ -28,6 +27,12 @@ pub struct HudPass {
     atlas_tex: wgpu::Texture,
     atlas_view: wgpu::TextureView,
     atlas_uploaded: bool,
+    /// Kept alive across frames — a per-draw VBO is dropped before `submit`
+    /// and can come back as `hud_vbo is invalid` under GPU load (unwrap/paint).
+    quad_vbo: Option<wgpu::Buffer>,
+    quad_cap: u64,
+    line_vbo: Option<wgpu::Buffer>,
+    line_cap: u64,
 }
 
 impl HudPass {
@@ -65,8 +70,9 @@ impl HudPass {
             &[255u8],
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(1),
-                rows_per_image: Some(1),
+                // 1×1: omit bytes_per_row (Some(1) is not a multiple of 256).
+                bytes_per_row: None,
+                rows_per_image: None,
             },
             wgpu::Extent3d {
                 width: 1,
@@ -216,6 +222,10 @@ impl HudPass {
             atlas_tex,
             atlas_view,
             atlas_uploaded: false,
+            quad_vbo: None,
+            quad_cap: 0,
+            line_vbo: None,
+            line_cap: 0,
         }
     }
 
@@ -238,6 +248,7 @@ impl HudPass {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        let (atlas_bytes, atlas_bpr) = pad_texel_rows(&hud.atlas_pixels, w, h, 1);
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.atlas_tex,
@@ -245,10 +256,10 @@ impl HudPass {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &hud.atlas_pixels,
+            &atlas_bytes,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(w),
+                bytes_per_row: Some(atlas_bpr),
                 rows_per_image: Some(h),
             },
             wgpu::Extent3d {
@@ -323,24 +334,22 @@ impl HudPass {
             push_line(&mut line_verts, l, white_uv);
         }
 
-        let quad_vbo = if !quad_verts.is_empty() {
-            Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("hud_vbo"),
-                contents: bytemuck::cast_slice(&quad_verts),
-                usage: wgpu::BufferUsages::VERTEX,
-            }))
-        } else {
-            None
-        };
-        let line_vbo = if !line_verts.is_empty() {
-            Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("hud_line_vbo"),
-                contents: bytemuck::cast_slice(&line_verts),
-                usage: wgpu::BufferUsages::VERTEX,
-            }))
-        } else {
-            None
-        };
+        upload_hud_vbo(
+            device,
+            queue,
+            "hud_vbo",
+            &quad_verts,
+            &mut self.quad_vbo,
+            &mut self.quad_cap,
+        );
+        upload_hud_vbo(
+            device,
+            queue,
+            "hud_line_vbo",
+            &line_verts,
+            &mut self.line_vbo,
+            &mut self.line_cap,
+        );
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -360,15 +369,19 @@ impl HudPass {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &self.bind_group, &[]);
-            if let Some(ref vbo) = quad_vbo {
-                pass.set_pipeline(&self.pipeline);
-                pass.set_vertex_buffer(0, vbo.slice(..));
-                pass.draw(0..quad_verts.len() as u32, 0..1);
+            if !quad_verts.is_empty() {
+                if let Some(ref vbo) = self.quad_vbo {
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_vertex_buffer(0, vbo.slice(..));
+                    pass.draw(0..quad_verts.len() as u32, 0..1);
+                }
             }
-            if let Some(ref vbo) = line_vbo {
-                pass.set_pipeline(&self.line_pipeline);
-                pass.set_vertex_buffer(0, vbo.slice(..));
-                pass.draw(0..line_verts.len() as u32, 0..1);
+            if !line_verts.is_empty() {
+                if let Some(ref vbo) = self.line_vbo {
+                    pass.set_pipeline(&self.line_pipeline);
+                    pass.set_vertex_buffer(0, vbo.slice(..));
+                    pass.draw(0..line_verts.len() as u32, 0..1);
+                }
             }
         }
     }
@@ -413,4 +426,70 @@ fn push_line(out: &mut Vec<HudVertex>, l: &HudLine, white_uv: [f32; 2]) {
         uv: white_uv,
         color: l.color,
     });
+}
+
+/// WebGPU `write_texture` requires `bytes_per_row` % 256 == 0.
+fn pad_texel_rows(src: &[u8], w: u32, h: u32, bpp: u32) -> (Vec<u8>, u32) {
+    let row = (w * bpp).max(1);
+    let bpr = row.div_ceil(256) * 256;
+    if bpr == row && src.len() >= (row * h) as usize {
+        return (src.to_vec(), bpr);
+    }
+    let mut out = vec![0u8; (bpr * h.max(1)) as usize];
+    let copy = row.min(bpr) as usize;
+    for y in 0..h as usize {
+        let s = y * row as usize;
+        let d = y * bpr as usize;
+        if s + copy <= src.len() && d + copy <= out.len() {
+            out[d..d + copy].copy_from_slice(&src[s..s + copy]);
+        }
+    }
+    (out, bpr)
+}
+
+fn upload_hud_vbo(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    verts: &[HudVertex],
+    slot: &mut Option<wgpu::Buffer>,
+    cap: &mut u64,
+) {
+    if verts.is_empty() {
+        return;
+    }
+    let bytes: &[u8] = bytemuck::cast_slice(verts);
+    let size = (bytes.len() as u64).max(wgpu::COPY_BUFFER_ALIGNMENT);
+    if *cap < size {
+        let next = size.next_power_of_two().max(4096);
+        *slot = Some(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: next,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        *cap = next;
+    }
+    if let Some(buf) = slot.as_ref() {
+        queue.write_buffer(buf, 0, bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atlas_row_padded_to_256() {
+        // HUD atlas is 128×128 R8; WebGPU needs bytes_per_row % 256 == 0.
+        let w = 128u32;
+        let h = 8u32;
+        let dummy = vec![1u8; (w * h) as usize];
+        let (padded, bpr) = pad_texel_rows(&dummy, w, h, 1);
+        assert_eq!(bpr, 256);
+        assert_eq!(padded.len(), (256 * h) as usize);
+        assert_eq!(padded[0], 1);
+        assert_eq!(padded[w as usize - 1], 1);
+        assert_eq!(padded[w as usize], 0);
+    }
 }

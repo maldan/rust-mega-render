@@ -77,7 +77,7 @@ HairDesc
 |---|---|
 | `mirror_x` | Дублирует гайд через X=0, если он не на середине. Кости и веса тоже дублируются. |
 | `fill_with` | Индекс другого гайда: между парой сеются extra-стренды (`params.density`). |
-| `is_static` | **Костей нет.** Стренды этого гайда не скинаются. Соседний fill берёт веса только с живой стороны. |
+| `is_static` | **Отдельный меш без `Skin`.** Костей нет, карты стоят в rest. Fill между двумя static тоже rigid; fill к живому гайду остаётся на скиннутом меше (веса только с живой стороны). |
 
 Порядок костей = порядок expanded-гайдов: исходный, потом зеркало. Static и короткие (< 2 точек) слот не занимают. Лимит суставов на слой: `MAX_HAIR_BONES` (255).
 
@@ -107,7 +107,9 @@ CPU рисует тонкие «нити» в UV карты:
 
 ### 2. Меш
 
-`generate_hair_mesh(guides, fills, params, auto_stack_index)`
+`generate_hair_mesh(...) -> HairMeshes { skinned, rigid }`
+
+Каждый кусок — `HairCardMeshes { front, back }`. Пустой кусок: `has_geo() == false`.
 
 1. Гайды сэмплятся в стренды (`segments`, `smooth`, Catmull vs polyline).
 2. Стиль деформирует путь: Straight / Roll / Curl / Wave / Crimp / Coil.
@@ -116,7 +118,7 @@ CPU рисует тонкие «нити» в UV карты:
 5. `layers` + `layer_gap` — auto-stack: дополнительные меши вдоль **корневой** нормали (`auto_stack_index`).
 6. Ribbon = две карты (front + back, разные winding). Tube = призма по `section_curve`, без back.
 
-Веса суставов: вдоль стренда `t=0..1` блендятся соседние кости своей цепи; fill-стренды блендятся между двумя цепями.
+Веса суставов (только `skinned`): вдоль стренда `t=0..1` блендятся соседние кости своей цепи; fill-стренды блендятся между двумя цепями. `rigid` пишется через `apply_hair_mesh_rigid` (без joint palette), нода **без** `Skin`. Нулевые веса на общем скине утаскивают вершины в origin — поэтому static и animated разнесены.
 
 Вершинный `colors[0]`:
 
@@ -126,7 +128,7 @@ CPU рисует тонкие «нити» в UV карты:
 
 UV: `u=0..1` поперёк ленты, `v=0` корень, `v=1` кончик.
 
-`apply_hair_mesh` заливает `Mesh` (positions, normals, uv0, colors0, joints0, weights0, indices) и зовёт `mark_changed`.
+`apply_hair_mesh` — скиннутый буфер. `apply_hair_mesh_rigid` — тот же меш без joints/weights.
 
 ### 3. Риг
 
@@ -135,7 +137,7 @@ UV: `u=0..1` поперёк ленты, `v=0` корень, `v=1` кончик.
 
 Кость = сегмент между соседними точками гайда (после `pos + normal * lift`, без style-деформации). Inverse bind считается из rest-кадров. Joint-ноды невидимые, без родителя, `local` = rest.
 
-`spawn_hair` вешает один `Skin` на все stack-ноды слоя (front и back).
+`spawn_hair` вешает один `Skin` только на **skinned** front/back слоя. `HairStack.static_*` без скина.
 
 ---
 
@@ -167,7 +169,7 @@ Ribbon: back-нода рисуется раньше front (порядок спа
 
 После `spawn_hair` суставы в rest. Чтобы волосы шевелились, каждый кадр пиши `node.local` joint-нод (world-space кадр сегмента, как в редакторском test-режиме). GPU скиннет меш по `Skin.joints` + `inverse_bind`.
 
-Static-гайды в `joints` не попадают — меш на них не едет, это ок для чёлки / залома, которые должны стоять.
+Static-гайды в `joints` не попадают и рисуются отдельным мешем (`HairStack.static_node` / `static_back_node`). Rest-pose для чёлки / залома.
 
 Физики в рендере нет. Редакторский test-sim (`hair-editor` + `mega-physics`) только двигает уже созданные суставы.
 
@@ -179,8 +181,8 @@ Static-гайды в `joints` не попадают — меш на них не 
 
 ```rust
 use mega_render::hair::{
-    apply_hair_mesh, bake_hair_maps, fill_pairs_of, generate_hair_mesh, generate_hair_rig,
-    spawn_hair_joints, HairLayerBake,
+    apply_hair_mesh, apply_hair_mesh_rigid, bake_hair_maps, fill_pairs_of, generate_hair_mesh,
+    generate_hair_rig, spawn_hair_joints, HairLayerBake,
 };
 
 let maps = bake_hair_maps(&params, &[HairLayerBake {
@@ -190,8 +192,9 @@ let maps = bake_hair_maps(&params, &[HairLayerBake {
 // сам кладёшь maps.* в Texture + Material { shading_model: Hair(..) }
 
 let fills = fill_pairs_of(&guides);
-let (front, back) = generate_hair_mesh(&guides, &fills, &params, 0);
-apply_hair_mesh(mesh, front);
+let meshes = generate_hair_mesh(&guides, &fills, &params, 0);
+apply_hair_mesh(skinned_mesh, meshes.skinned.front);
+apply_hair_mesh_rigid(static_mesh, meshes.rigid.front);
 
 let rig = generate_hair_rig(&guides, lift);
 let (joints, skin) = spawn_hair_joints(scene, "hair_j0", &rig);

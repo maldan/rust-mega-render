@@ -1,5 +1,7 @@
 use glam::Vec3;
 
+pub use crate::io::mesh::MeshBytesError;
+
 /// Relative morph / shape-key target (glTF-style deltas from basis).
 #[derive(Clone, Debug)]
 pub struct MorphTarget {
@@ -68,6 +70,16 @@ impl Mesh {
     /// Positions/normals/tangents moved in place (CPU skinning). Skips Mikktspace.
     pub fn mark_vertices_moved(&mut self) {
         self.version += 1;
+    }
+
+    /// Encode this mesh as a `MESH` blob (`docs/mesh.md`). Rest pose, no morph weights.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        crate::io::mesh::to_bytes(self)
+    }
+
+    /// Decode a `MESH` blob. Unknown chunks are skipped.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MeshBytesError> {
+        crate::io::mesh::from_bytes(bytes)
     }
 
     /// Capture current `positions`/`normals` as basis if not yet stored.
@@ -262,7 +274,7 @@ fn recompute_normals_welded(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32
     out
 }
 
-fn compute_tangents(
+pub(crate) fn compute_tangents(
     positions: &[[f32; 3]],
     normals: &[[f32; 3]],
     uvs: &[[f32; 2]],

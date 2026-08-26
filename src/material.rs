@@ -57,6 +57,88 @@ impl Default for HairShading {
     }
 }
 
+/// How this material addresses albedo / normal / MR maps.
+/// `Single` is wrap-sampling one texture per slot. `Udim` is opt-in tile sets.
+#[derive(Clone)]
+pub enum MaterialMaps {
+    Single {
+        albedo: Option<Handle<Texture>>,
+        normal: Option<Handle<Texture>>,
+        metallic_roughness: Option<Handle<Texture>>,
+    },
+    Udim {
+        /// `(udim, texture)` e.g. `(1001, tex)`. `u = (id-1001)%10`, `v = (id-1001)/10`.
+        albedo: Vec<(u32, Handle<Texture>)>,
+        normal: Vec<(u32, Handle<Texture>)>,
+        metallic_roughness: Vec<(u32, Handle<Texture>)>,
+    },
+}
+
+impl Default for MaterialMaps {
+    fn default() -> Self {
+        Self::Single {
+            albedo: None,
+            normal: None,
+            metallic_roughness: None,
+        }
+    }
+}
+
+impl MaterialMaps {
+    pub fn remap_textures(&mut self, map: impl Fn(Handle<Texture>) -> Option<Handle<Texture>>) {
+        match self {
+            Self::Single {
+                albedo,
+                normal,
+                metallic_roughness,
+            } => {
+                *albedo = albedo.and_then(&map);
+                *normal = normal.and_then(&map);
+                *metallic_roughness = metallic_roughness.and_then(&map);
+            }
+            Self::Udim {
+                albedo,
+                normal,
+                metallic_roughness,
+            } => {
+                remap_udim_slot(albedo, &map);
+                remap_udim_slot(normal, &map);
+                remap_udim_slot(metallic_roughness, &map);
+            }
+        }
+    }
+}
+
+fn remap_udim_slot(
+    tiles: &mut Vec<(u32, Handle<Texture>)>,
+    map: &impl Fn(Handle<Texture>) -> Option<Handle<Texture>>,
+) {
+    tiles.retain_mut(|(_, h)| {
+        if let Some(next) = map(*h) {
+            *h = next;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// LUT index for Mari UDIM in a 10×10 tile grid, or `None` if out of range.
+pub(crate) fn udim_lut_index(udim: u32) -> Option<usize> {
+    let n = udim.checked_sub(1001)?;
+    let u = (n % 10) as usize;
+    let v = (n / 10) as usize;
+    (v < 10).then_some(u + v * 10)
+}
+
+pub(crate) fn first_udim_tile(tiles: &[(u32, Handle<Texture>)]) -> Option<Handle<Texture>> {
+    tiles
+        .iter()
+        .find(|(id, _)| *id == 1001)
+        .or(tiles.first())
+        .map(|(_, h)| *h)
+}
+
 pub struct Material {
     pub albedo: [f32; 4],
     pub metallic: f32,
@@ -67,9 +149,7 @@ pub struct Material {
     pub sss_color: [f32; 3],
     /// Curvature for the SSS LUT (0..1). Higher = thinner / softer wrap.
     pub sss_curvature: f32,
-    pub albedo_map: Option<Handle<Texture>>,
-    pub normal_map: Option<Handle<Texture>>,
-    pub metallic_roughness_map: Option<Handle<Texture>>,
+    pub maps: MaterialMaps,
     /// 0 = opaque. If > 0, fragments with albedo alpha below this are discarded (MASK).
     /// Deferred path has no alpha blend; this is the supported transparency mode.
     pub alpha_cutoff: f32,
@@ -85,16 +165,18 @@ impl Material {
             sss_strength: 0.0,
             sss_color: [1.0, 0.35, 0.2],
             sss_curvature: 0.3,
-            albedo_map: None,
-            normal_map: None,
-            metallic_roughness_map: None,
+            maps: MaterialMaps::default(),
             alpha_cutoff: 0.0,
             shading_model: ShadingModel::Standard,
         }
     }
 
     pub fn with_map(mut self, map: Handle<Texture>) -> Self {
-        self.albedo_map = Some(map);
+        self.maps = MaterialMaps::Single {
+            albedo: Some(map),
+            normal: None,
+            metallic_roughness: None,
+        };
         self
     }
 
@@ -109,5 +191,19 @@ impl Material {
 impl Default for Material {
     fn default() -> Self {
         Self::new([1.0, 1.0, 1.0, 1.0], 0.0, 0.5)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lut_index_mari() {
+        assert_eq!(udim_lut_index(1001), Some(0));
+        assert_eq!(udim_lut_index(1002), Some(1));
+        assert_eq!(udim_lut_index(1011), Some(10));
+        assert_eq!(udim_lut_index(1000), None);
+        assert_eq!(udim_lut_index(1101), None);
     }
 }

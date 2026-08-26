@@ -1,8 +1,9 @@
 use super::Visualizer;
 use crate::{
-    DebugView, DualQuat, Handle, Mesh, PostProcessSettings, Scene, ShadowFilter, ShadowSettings,
-    SkinningMode, Texture,
+    DebugView, DualQuat, Handle, MaterialMaps, Mesh, PostProcessSettings, Scene, ShadowFilter,
+    ShadowSettings, SkinningMode, Texture,
 };
+use crate::material::{first_udim_tile, udim_lut_index};
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
 use std::path::Path;
@@ -30,6 +31,8 @@ const MAX_BONES: usize = 255;
 const OBJECT_UBO_SIZE: u64 = (std::mem::size_of::<ObjectUniforms>() as u64 + 255) & !255;
 const OBJECT_STRIDE: u64 = OBJECT_UBO_SIZE;
 const SHADOW_EXTENT: f32 = 14.0;
+const UDIM_LUT_VEC4: usize = 25;
+const UDIM_MAX_LAYERS: u32 = 16;
 
 /// Texels per joint: mat4 columns (LBS) or dual-quat real+dual (DQS).
 fn bone_stride(mode: SkinningMode) -> u32 {
@@ -149,6 +152,40 @@ struct ObjectUniforms {
     hair1: [f32; 4],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct UdimLutGpu {
+    albedo: [[u32; 4]; UDIM_LUT_VEC4],
+    normal: [[u32; 4]; UDIM_LUT_VEC4],
+    mr: [[u32; 4]; UDIM_LUT_VEC4],
+}
+
+struct UdimDraw {
+    mat_key: (u32, u32),
+    albedo: Vec<(u32, Handle<Texture>)>,
+    normal: Vec<(u32, Handle<Texture>)>,
+    mr: Vec<(u32, Handle<Texture>)>,
+}
+
+#[derive(Clone)]
+struct UdimGpuCopy {
+    src: (u32, u32),
+    slot: u8,
+    layer: u32,
+    w: u32,
+    h: u32,
+}
+
+struct GpuUdimPacked {
+    fingerprint: u64,
+    bind_group: wgpu::BindGroup,
+    albedo: wgpu::Texture,
+    normal: wgpu::Texture,
+    mr: wgpu::Texture,
+    copies: Vec<UdimGpuCopy>,
+    _lut: wgpu::Buffer,
+}
+
 /// A single draw call's worth of per-object data, collected once per frame and
 /// shared by the shadow pass, opaque G-buffer pass, and (for hair materials)
 /// the hair depth-prepass + blend passes.
@@ -167,6 +204,8 @@ struct DrawItem {
     is_hair: bool,
     /// Hair: skip depth prepass → soft alpha composite between cards.
     soft_blend: bool,
+    is_udim: bool,
+    udim: Option<UdimDraw>,
     skin_key: Option<(u32, u32)>,
 }
 
@@ -225,6 +264,7 @@ pub struct WgpuVisualizer {
     wire_mesh_fill_pipeline: wgpu::RenderPipeline,
     /// Gray fill under wireframe lines (hair).
     wire_hair_fill_pipeline: wgpu::RenderPipeline,
+    udim_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     line_overlay_pipeline: wgpu::RenderPipeline,
@@ -241,11 +281,13 @@ pub struct WgpuVisualizer {
     shadow_frame_buf: wgpu::Buffer,
     sky_uniform_buf: wgpu::Buffer,
     object_bind_layout: wgpu::BindGroupLayout,
+    udim_bind_layout: wgpu::BindGroupLayout,
     bone_bind_layout: wgpu::BindGroupLayout,
     sky_bind_layout: wgpu::BindGroupLayout,
     sky_pipeline: wgpu::RenderPipeline,
     sky_bind_group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
+    udim_sampler: wgpu::Sampler,
     shadow_samp: wgpu::Sampler,
     shadow_depth_samp: wgpu::Sampler,
     white: GpuTexture,
@@ -274,6 +316,12 @@ pub struct WgpuVisualizer {
     default_object_bg: wgpu::BindGroup,
     /// Material bind groups keyed by albedo/normal/MR texture keys.
     object_material_bgs: HashMap<[(u32, u32); 3], wgpu::BindGroup>,
+    default_udim_bg: wgpu::BindGroup,
+    udim_gpu: HashMap<(u32, u32), GpuUdimPacked>,
+    _udim_dummy_albedo: wgpu::Texture,
+    _udim_dummy_normal: wgpu::Texture,
+    _udim_dummy_mr: wgpu::Texture,
+    _udim_dummy_lut: wgpu::Buffer,
     /// One small bone texture per skin.
     skin_bones: HashMap<(u32, u32), GpuSkinBones>,
     /// Last uploaded skinning layout — recreate palettes when mode flips.
@@ -325,6 +373,15 @@ impl WgpuVisualizer {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let udim_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
         let shadow_samp = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -530,6 +587,7 @@ impl WgpuVisualizer {
                 },
             ],
         });
+        let udim_bind_layout = udim_bind_group_layout(device);
         let bone_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("bone_palette"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -581,6 +639,15 @@ impl WgpuVisualizer {
             ],
             immediate_size: 0,
         });
+        let udim_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("udim_mesh"),
+            bind_group_layouts: &[
+                Some(&frame_bind_layout),
+                Some(&udim_bind_layout),
+                Some(&bone_bind_layout),
+            ],
+            immediate_size: 0,
+        });
         let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[
@@ -627,6 +694,17 @@ impl WgpuVisualizer {
             &depth_stencil,
             "mesh_mrt",
             "fs_main",
+            wgpu::PolygonMode::Fill,
+            Some(wgpu::Face::Back),
+        );
+        let udim_pipeline = mesh_pipeline(
+            device,
+            &udim_pipeline_layout,
+            &shader,
+            &mesh_buffers,
+            &depth_stencil,
+            "mesh_udim",
+            "fs_udim",
             wgpu::PolygonMode::Fill,
             Some(wgpu::Face::Back),
         );
@@ -994,6 +1072,28 @@ impl WgpuVisualizer {
             &default_mr.view,
             &sampler,
         );
+        let (udim_dummy_albedo, udim_dummy_albedo_view) =
+            dummy_udim_array(device, queue, [255, 255, 255, 255]);
+        let (udim_dummy_normal, udim_dummy_normal_view) =
+            dummy_udim_array(device, queue, [128, 128, 255, 255]);
+        let (udim_dummy_mr, udim_dummy_mr_view) =
+            dummy_udim_array(device, queue, [255, 255, 255, 255]);
+        let udim_dummy_lut = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("udim_lut_default"),
+            size: std::mem::size_of::<UdimLutGpu>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let default_udim_bg = udim_bind_group(
+            device,
+            &udim_bind_layout,
+            &object_buf,
+            &udim_dummy_albedo_view,
+            &udim_dummy_normal_view,
+            &udim_dummy_mr_view,
+            &udim_sampler,
+            &udim_dummy_lut,
+        );
         let (identity_bone_tex, identity_bone_bg) =
             identity_bone_palette(device, queue, &bone_bind_layout);
 
@@ -1009,6 +1109,7 @@ impl WgpuVisualizer {
             wire_hair_pipeline,
             wire_mesh_fill_pipeline,
             wire_hair_fill_pipeline,
+            udim_pipeline,
             shadow_pipeline,
             line_pipeline,
             line_overlay_pipeline,
@@ -1025,11 +1126,13 @@ impl WgpuVisualizer {
             shadow_frame_buf,
             sky_uniform_buf,
             object_bind_layout,
+            udim_bind_layout,
             bone_bind_layout,
             sky_bind_layout,
             sky_pipeline,
             sky_bind_group,
             sampler,
+            udim_sampler,
             shadow_samp,
             shadow_depth_samp,
             white,
@@ -1055,6 +1158,12 @@ impl WgpuVisualizer {
             object_slots: 1,
             default_object_bg,
             object_material_bgs: HashMap::new(),
+            default_udim_bg,
+            udim_gpu: HashMap::new(),
+            _udim_dummy_albedo: udim_dummy_albedo,
+            _udim_dummy_normal: udim_dummy_normal,
+            _udim_dummy_mr: udim_dummy_mr,
+            _udim_dummy_lut: udim_dummy_lut,
             skin_bones: HashMap::new(),
             skin_upload_mode: SkinningMode::LinearBlend,
             _identity_bone_tex: identity_bone_tex,
@@ -1069,6 +1178,7 @@ impl WgpuVisualizer {
 
     fn invalidate_object_bind_groups(&mut self) {
         self.object_material_bgs.clear();
+        self.udim_gpu.clear();
         self.default_object_bg = object_bind_group(
             &self.device,
             &self.object_bind_layout,
@@ -1077,6 +1187,19 @@ impl WgpuVisualizer {
             &self.flat_normal.view,
             &self.default_mr.view,
             &self.sampler,
+        );
+        let albedo_view = self._udim_dummy_albedo.create_view(&array_view_desc());
+        let normal_view = self._udim_dummy_normal.create_view(&array_view_desc());
+        let mr_view = self._udim_dummy_mr.create_view(&array_view_desc());
+        self.default_udim_bg = udim_bind_group(
+            &self.device,
+            &self.udim_bind_layout,
+            &self.object_buf,
+            &albedo_view,
+            &normal_view,
+            &mr_view,
+            &self.udim_sampler,
+            &self._udim_dummy_lut,
         );
     }
 
@@ -1106,6 +1229,99 @@ impl WgpuVisualizer {
         });
         self.object_slots = new_slots;
         self.invalidate_object_bind_groups();
+    }
+
+    fn sync_udim_packs(&mut self, scene: &Scene, draws: &[DrawItem]) {
+        let live: std::collections::HashSet<(u32, u32)> = draws
+            .iter()
+            .filter_map(|d| d.udim.as_ref().map(|u| u.mat_key))
+            .collect();
+        self.udim_gpu.retain(|k, _| live.contains(k));
+        for d in draws {
+            let Some(u) = d.udim.as_ref() else {
+                continue;
+            };
+            let fp = udim_fingerprint(u, scene);
+            if self
+                .udim_gpu
+                .get(&u.mat_key)
+                .is_some_and(|g| g.fingerprint == fp)
+            {
+                continue;
+            }
+            let packed = pack_udim_material(
+                &self.device,
+                &self.queue,
+                &self.udim_bind_layout,
+                &self.object_buf,
+                &self.udim_sampler,
+                scene,
+                u,
+                fp,
+            );
+            self.udim_gpu.insert(u.mat_key, packed);
+        }
+        self.copy_udim_from_gpu();
+    }
+
+    /// Paint maps are GPU-resident; the array pack must copy tiles from GPU,
+    /// not the (often empty / stale) CPU `rgba`.
+    fn copy_udim_from_gpu(&mut self) {
+        let copies: Vec<(UdimGpuCopy, (u32, u32))> = self
+            .udim_gpu
+            .iter()
+            .flat_map(|(mat, packed)| packed.copies.iter().map(|c| (c.clone(), *mat)))
+            .collect();
+        if copies.is_empty() {
+            return;
+        }
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("udim_gpu_copy"),
+        });
+        let mut any = false;
+        for (c, mat) in &copies {
+            let Some(src) = self.textures.get(&c.src) else {
+                continue;
+            };
+            if src.width != c.w || src.height != c.h {
+                continue;
+            }
+            let Some(packed) = self.udim_gpu.get(mat) else {
+                continue;
+            };
+            let dst = match c.slot {
+                0 => &packed.albedo,
+                1 => &packed.normal,
+                _ => &packed.mr,
+            };
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &src.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: dst,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: c.layer,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: c.w,
+                    height: c.h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            any = true;
+        }
+        if any {
+            self.queue.submit(Some(encoder.finish()));
+        }
     }
 
     fn ensure_skin_bones(&mut self, skin_key: (u32, u32), joint_count: usize, mode: SkinningMode) {
@@ -1435,9 +1651,21 @@ impl WgpuVisualizer {
             if !self.meshes.contains_key(&mesh_key) {
                 continue;
             }
-            let (albedo, mut params, sss, albedo_key, normal_key, mr_key, hair0, hair1, is_hair, soft_blend) =
-                match node.material.and_then(|m| scene.materials.get(m)) {
-                    Some(mat) => {
+            let (
+                albedo,
+                mut params,
+                sss,
+                albedo_key,
+                normal_key,
+                mr_key,
+                hair0,
+                hair1,
+                is_hair,
+                soft_blend,
+                is_udim,
+                udim,
+            ) = match node.material.and_then(|m| scene.materials.get(m).map(|mat| (m, mat))) {
+                    Some((mat_h, mat)) => {
                         let (hair0, hair1, tip_fade, is_hair, soft_blend, cutout_fringe) =
                             match mat.shading_model {
                             crate::ShadingModel::Standard => {
@@ -1467,6 +1695,8 @@ impl WgpuVisualizer {
                             // Hair: params.w carries cutout soft-fringe width.
                             params[3] = cutout_fringe;
                         }
+                        let (albedo_key, normal_key, mr_key, is_udim, udim) =
+                            resolve_material_maps(&mat.maps, is_hair, mat_h.key());
                         (
                             [
                                 mat.albedo[0],
@@ -1479,20 +1709,21 @@ impl WgpuVisualizer {
                                 mat.sss_color[0],
                                 mat.sss_color[1],
                                 mat.sss_color[2],
-                                // Hair: unused SSS curvature slot carries tip_fade.
                                 if is_hair {
                                     tip_fade
                                 } else {
                                     mat.sss_curvature
                                 },
                             ],
-                            mat.albedo_map.map(|t| t.key()),
-                            mat.normal_map.map(|t| t.key()),
-                            mat.metallic_roughness_map.map(|t| t.key()),
+                            albedo_key,
+                            normal_key,
+                            mr_key,
                             hair0,
                             hair1,
                             is_hair,
                             soft_blend,
+                            is_udim,
+                            udim,
                         )
                     }
                     None => (
@@ -1506,6 +1737,8 @@ impl WgpuVisualizer {
                         [0.0; 4],
                         false,
                         false,
+                        false,
+                        None,
                     ),
                 };
             let mut skin_key = None;
@@ -1532,6 +1765,8 @@ impl WgpuVisualizer {
                 hair1,
                 is_hair,
                 soft_blend,
+                is_udim,
+                udim,
                 skin_key,
             });
         }
@@ -1652,6 +1887,7 @@ impl WgpuVisualizer {
             );
             self.object_material_bgs.insert(cache_key, bg);
         }
+        self.sync_udim_packs(scene, &draws);
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let wireframe = self.debug_view == DebugView::Wireframe;
@@ -1795,6 +2031,7 @@ impl WgpuVisualizer {
                     &self.skin_bones,
                     default_maps,
                     &draws,
+                    false,
                 );
                 pass.set_pipeline(&self.wire_hair_fill_pipeline);
                 draw_hair_items(
@@ -1817,6 +2054,7 @@ impl WgpuVisualizer {
                     &self.skin_bones,
                     default_maps,
                     &draws,
+                    false,
                 );
                 pass.set_pipeline(&self.wire_hair_pipeline);
                 draw_hair_items(
@@ -1840,7 +2078,20 @@ impl WgpuVisualizer {
                     &self.skin_bones,
                     default_maps,
                     &draws,
+                    true,
                 );
+                if draws.iter().any(|d| d.is_udim) {
+                    pass.set_pipeline(&self.udim_pipeline);
+                    draw_udim_mesh_items(
+                        &mut pass,
+                        &self.meshes,
+                        &self.default_udim_bg,
+                        &self.udim_gpu,
+                        &self.identity_bone_bg,
+                        &self.skin_bones,
+                        &draws,
+                    );
+                }
             }
 
             // Depth-tested debug (floor grid, etc.) BEFORE hair so soft-blend
@@ -2741,9 +2992,13 @@ fn draw_mesh_items(
     skin_bones: &HashMap<(u32, u32), GpuSkinBones>,
     default_maps: ((u32, u32), (u32, u32), (u32, u32)),
     draws: &[DrawItem],
+    skip_udim: bool,
 ) {
     for (i, d) in draws.iter().enumerate() {
         if d.is_hair {
+            continue;
+        }
+        if skip_udim && d.is_udim {
             continue;
         }
         let Some(mesh) = meshes.get(&d.mesh_key) else {
@@ -2759,6 +3014,40 @@ fn draw_mesh_items(
         } else {
             &object_material_bgs[&cache_key]
         };
+        pass.set_bind_group(1, bg, &[(i as u32) * OBJECT_STRIDE as u32]);
+        if let Some(s) = d.skin_key.as_ref().and_then(|k| skin_bones.get(k)) {
+            pass.set_bind_group(2, &s.bind_group, &[]);
+        } else {
+            pass.set_bind_group(2, identity_bone_bg, &[]);
+        }
+        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+    }
+}
+
+fn draw_udim_mesh_items(
+    pass: &mut wgpu::RenderPass<'_>,
+    meshes: &HashMap<(u32, u32), GpuMesh>,
+    default_udim_bg: &wgpu::BindGroup,
+    udim_gpu: &HashMap<(u32, u32), GpuUdimPacked>,
+    identity_bone_bg: &wgpu::BindGroup,
+    skin_bones: &HashMap<(u32, u32), GpuSkinBones>,
+    draws: &[DrawItem],
+) {
+    for (i, d) in draws.iter().enumerate() {
+        if !d.is_udim {
+            continue;
+        }
+        let Some(mesh) = meshes.get(&d.mesh_key) else {
+            continue;
+        };
+        let bg = d
+            .udim
+            .as_ref()
+            .and_then(|u| udim_gpu.get(&u.mat_key))
+            .map(|g| &g.bind_group)
+            .unwrap_or(default_udim_bg);
         pass.set_bind_group(1, bg, &[(i as u32) * OBJECT_STRIDE as u32]);
         if let Some(s) = d.skin_key.as_ref().and_then(|k| skin_bones.get(k)) {
             pass.set_bind_group(2, &s.bind_group, &[]);
@@ -2887,6 +3176,384 @@ fn gbuffer_targets(
             write_mask: side_mask,
         }),
     ]
+}
+
+fn resolve_material_maps(
+    maps: &MaterialMaps,
+    is_hair: bool,
+    mat_key: (u32, u32),
+) -> (
+    Option<(u32, u32)>,
+    Option<(u32, u32)>,
+    Option<(u32, u32)>,
+    bool,
+    Option<UdimDraw>,
+) {
+    match maps {
+        MaterialMaps::Single {
+            albedo,
+            normal,
+            metallic_roughness,
+        } => (
+            albedo.map(|t| t.key()),
+            normal.map(|t| t.key()),
+            metallic_roughness.map(|t| t.key()),
+            false,
+            None,
+        ),
+        MaterialMaps::Udim {
+            albedo,
+            normal,
+            metallic_roughness,
+        } if is_hair => (
+            first_udim_tile(albedo).map(|t| t.key()),
+            first_udim_tile(normal).map(|t| t.key()),
+            first_udim_tile(metallic_roughness).map(|t| t.key()),
+            false,
+            None,
+        ),
+        MaterialMaps::Udim {
+            albedo,
+            normal,
+            metallic_roughness,
+        } => (
+            None,
+            None,
+            None,
+            true,
+            Some(UdimDraw {
+                mat_key,
+                albedo: albedo.clone(),
+                normal: normal.clone(),
+                mr: metallic_roughness.clone(),
+            }),
+        ),
+    }
+}
+
+fn udim_fingerprint(u: &UdimDraw, scene: &Scene) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    let mix = |h: &mut u64, x: u64| {
+        *h ^= x;
+        *h = h.wrapping_mul(0x100000001b3);
+    };
+    for (udim, tex) in u.albedo.iter().chain(&u.normal).chain(&u.mr) {
+        mix(&mut h, *udim as u64);
+        let k = tex.key();
+        mix(&mut h, k.0 as u64);
+        mix(&mut h, k.1 as u64);
+        // Layout only — GPU paint does not bump CPU `version`.
+        if let Some(t) = scene.textures.get(*tex) {
+            mix(&mut h, t.width as u64);
+            mix(&mut h, t.height as u64);
+        }
+    }
+    h
+}
+
+fn lut_set(lut: &mut [[u32; 4]; UDIM_LUT_VEC4], index: usize, layer: u32) {
+    lut[index / 4][index % 4] = layer;
+}
+
+fn array_view_desc<'a>() -> wgpu::TextureViewDescriptor<'a> {
+    wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    }
+}
+
+fn dummy_udim_array(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    rgba: [u8; 4],
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("udim_dummy"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&array_view_desc());
+    (texture, view)
+}
+
+fn udim_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let tex = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("udim_object"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(OBJECT_UBO_SIZE),
+                },
+                count: None,
+            },
+            tex(5),
+            tex(6),
+            tex(7),
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(
+                        std::mem::size_of::<UdimLutGpu>() as u64
+                    ),
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn udim_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    object_buf: &wgpu::Buffer,
+    albedo: &wgpu::TextureView,
+    normal: &wgpu::TextureView,
+    mr: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+    lut: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("udim_object"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: object_buf,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(OBJECT_UBO_SIZE),
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(albedo),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(normal),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(mr),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: lut.as_entire_binding(),
+            },
+        ],
+    })
+}
+
+fn write_array_layer(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    layer: u32,
+    w: u32,
+    h: u32,
+    rgba: &[u8],
+) {
+    let need = (w * h * 4) as usize;
+    if rgba.len() < need {
+        return;
+    }
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: 0,
+                y: 0,
+                z: layer,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        &rgba[..need],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * w),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
+fn pack_udim_array_slot(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene: &Scene,
+    tiles: &[(u32, Handle<Texture>)],
+    fill: [u8; 4],
+    slot: u8,
+) -> (
+    wgpu::Texture,
+    wgpu::TextureView,
+    [[u32; 4]; UDIM_LUT_VEC4],
+    Vec<UdimGpuCopy>,
+) {
+    let mut lut = [[0u32; 4]; UDIM_LUT_VEC4];
+    let (w, h) = tiles
+        .iter()
+        .filter_map(|(_, h)| scene.textures.get(*h).map(|t| (t.width.max(1), t.height.max(1))))
+        .max_by_key(|(w, h)| *w * *h)
+        .unwrap_or((1, 1));
+    let layers = 1 + (tiles.len() as u32).min(UDIM_MAX_LAYERS - 1);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("udim_array"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: layers,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let mut fill_px = vec![0u8; (w * h * 4) as usize];
+    for px in fill_px.chunks_exact_mut(4) {
+        px.copy_from_slice(&fill);
+    }
+    write_array_layer(queue, &texture, 0, w, h, &fill_px);
+    let mut copies = Vec::new();
+    let mut layer = 1u32;
+    for (udim, handle) in tiles {
+        if layer >= layers {
+            break;
+        }
+        let Some(tex) = scene.textures.get(*handle) else {
+            continue;
+        };
+        if tex.width != w || tex.height != h {
+            continue;
+        }
+        let Some(idx) = udim_lut_index(*udim) else {
+            continue;
+        };
+        write_array_layer(queue, &texture, layer, w, h, &tex.rgba);
+        lut_set(&mut lut, idx, layer);
+        copies.push(UdimGpuCopy {
+            src: handle.key(),
+            slot,
+            layer,
+            w,
+            h,
+        });
+        layer += 1;
+    }
+    let view = texture.create_view(&array_view_desc());
+    (texture, view, lut, copies)
+}
+
+fn pack_udim_material(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    object_buf: &wgpu::Buffer,
+    sampler: &wgpu::Sampler,
+    scene: &Scene,
+    u: &UdimDraw,
+    fingerprint: u64,
+) -> GpuUdimPacked {
+    let (albedo, albedo_view, albedo_lut, mut copies) =
+        pack_udim_array_slot(device, queue, scene, &u.albedo, [255, 255, 255, 255], 0);
+    let (normal, normal_view, normal_lut, n_copies) =
+        pack_udim_array_slot(device, queue, scene, &u.normal, [128, 128, 255, 255], 1);
+    let (mr, mr_view, mr_lut, m_copies) =
+        pack_udim_array_slot(device, queue, scene, &u.mr, [255, 255, 255, 255], 2);
+    copies.extend(n_copies);
+    copies.extend(m_copies);
+    let lut = UdimLutGpu {
+        albedo: albedo_lut,
+        normal: normal_lut,
+        mr: mr_lut,
+    };
+    let lut_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("udim_lut"),
+        size: std::mem::size_of::<UdimLutGpu>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&lut_buf, 0, bytemuck::bytes_of(&lut));
+    let bind_group = udim_bind_group(
+        device,
+        layout,
+        object_buf,
+        &albedo_view,
+        &normal_view,
+        &mr_view,
+        sampler,
+        &lut_buf,
+    );
+    GpuUdimPacked {
+        fingerprint,
+        bind_group,
+        albedo,
+        normal,
+        mr,
+        copies,
+        _lut: lut_buf,
+    }
 }
 
 fn object_bind_group(

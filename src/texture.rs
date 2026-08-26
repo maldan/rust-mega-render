@@ -38,19 +38,27 @@ impl Texture {
         }
     }
 
-    /// Empty (zeroed) map that lives on the GPU after the first `sync`.
-    /// Any material slot (`albedo_map`, `normal_map`, …) can use this.
+    /// GPU-backed map after the first `sync`. CPU `rgba` stays empty until
+    /// [`Self::ensure_rgba`] — paint layers must not allocate 2k×2k host pixels.
     pub fn gpu_resident(width: u32, height: u32, srgb: bool) -> Self {
         let w = width.max(1);
         let h = height.max(1);
         Self {
             width: w,
             height: h,
-            rgba: vec![0; (w * h * 4) as usize],
+            rgba: Vec::new(),
             version: 1,
             srgb,
             dirty: None,
             gpu_resident: true,
+        }
+    }
+
+    /// Allocate a CPU mirror (`width * height * 4`). Used to seed material maps.
+    pub fn ensure_rgba(&mut self) {
+        let n = (self.width.max(1) * self.height.max(1) * 4) as usize;
+        if self.rgba.len() != n {
+            self.rgba.resize(n, 0);
         }
     }
 
@@ -87,5 +95,20 @@ impl Texture {
             }
             None => (x, y, nw, nh),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_resident_skips_cpu_pixels() {
+        let t = Texture::gpu_resident(2048, 2048, true);
+        assert!(t.rgba.is_empty());
+        assert_eq!(t.width, 2048);
+        let mut seeded = Texture::gpu_resident(4, 4, true);
+        seeded.ensure_rgba();
+        assert_eq!(seeded.rgba.len(), 64);
     }
 }
