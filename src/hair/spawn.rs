@@ -362,6 +362,7 @@ fn spawn_mesh_node(
         vec![0, 1, 2],
     ));
     let node = scene.nodes.insert(Node {
+        id: Node::new_id(),
         name: name.into(),
         parent: None,
         local: Transform::default(),

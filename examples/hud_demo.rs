@@ -165,6 +165,7 @@ impl App {
             .insert(Material::new([0.85, 0.25, 0.2, 1.0], 0.0, 0.4));
 
         let root = scene.nodes.insert(Node {
+            id: Node::new_id(),
             name: "root".into(),
             parent: None,
             local: Transform::default(),
@@ -174,6 +175,7 @@ impl App {
             visible: true,
         });
         scene.nodes.insert(Node {
+            id: Node::new_id(),
             name: "ground".into(),
             parent: Some(root),
             local: Transform::default(),
@@ -183,6 +185,7 @@ impl App {
             visible: true,
         });
         scene.nodes.insert(Node {
+            id: Node::new_id(),
             name: "cube0".into(),
             parent: Some(root),
             local: Transform::from_translation(Vec3::new(0.0, 0.35, 0.0)),
@@ -257,12 +260,15 @@ impl App {
         .expect("device");
 
         let caps = surface.get_capabilities(&adapter);
+        // Swapchain format is platform/backend-dependent (e.g. `Bgra8UnormSrgb` on
+        // macOS/Metal vs. commonly `Rgba8UnormSrgb` on Windows/Vulkan/DX12) — pick
+        // whatever sRGB format the surface actually reports instead of hardcoding one.
         let format = caps
             .formats
             .iter()
             .copied()
-            .find(|f| *f == wgpu::TextureFormat::Rgba8UnormSrgb)
-            .expect("Rgba8UnormSrgb");
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -276,7 +282,7 @@ impl App {
         };
         surface.configure(&device, &config);
 
-        let mut visualizer = WgpuVisualizer::new(&device, &queue);
+        let mut visualizer = WgpuVisualizer::new(&device, &queue, format);
         visualizer.ensure_target(config.width, config.height);
         // Light post so the scene isn't raw HDR.
         visualizer.post_process().tonemap.exposure = 1.0;
@@ -317,6 +323,7 @@ impl App {
         };
         let y = if sphere { 0.4 } else { 0.35 };
         self.scene.nodes.insert(Node {
+            id: Node::new_id(),
             name: format!("spawn_{i}"),
             parent: Some(self.root),
             local: Transform::from_translation(Vec3::new(x, y, z)),

@@ -111,6 +111,7 @@ fn spawn_joints(file: SkinFile, nodes: &mut Store<Node>) -> Skin {
         let name = file.names.get(i).cloned().unwrap_or_default();
         let local = file.locals.get(i).copied().unwrap_or_default();
         joints.push(nodes.insert(Node {
+            id: Node::new_id(),
             name,
             parent: None,
             local,
@@ -532,6 +533,7 @@ mod tests {
     fn node_roundtrip() {
         let mut nodes = Store::default();
         let root = nodes.insert(Node {
+            id: Node::new_id(),
             name: "root".into(),
             parent: None,
             local: Transform::from_translation(Vec3::X),
@@ -541,6 +543,7 @@ mod tests {
             visible: true,
         });
         let child = nodes.insert(Node {
+            id: Node::new_id(),
             name: "child".into(),
             parent: Some(root),
             local: Transform::from_translation(Vec3::Y),

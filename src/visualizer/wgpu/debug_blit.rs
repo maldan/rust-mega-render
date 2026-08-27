@@ -23,7 +23,11 @@ pub struct DebugBlit {
 }
 
 impl DebugBlit {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+    /// `output_format` must match whatever [`Self::blit`]'s `target` view actually is
+    /// (e.g. the negotiated swapchain format — `Bgra8UnormSrgb` on macOS/Metal,
+    /// commonly `Rgba8UnormSrgb` on Windows/Vulkan/DX12). Render pipelines are bound
+    /// to an exact color target format, so this can't be discovered at draw time.
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, output_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::include_wgsl!("debug_blit.wgsl"));
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("debug_blit"),
@@ -114,7 +118,7 @@ impl DebugBlit {
                 module: &shader,
                 entry_point: Some("fs"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    format: output_format,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],

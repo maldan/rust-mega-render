@@ -31,7 +31,10 @@ pub struct FrameTargets {
 }
 
 impl FrameTargets {
-    pub fn new(device: &wgpu::Device, w: u32, h: u32) -> Self {
+    /// `present_format` should match the visualizer's negotiated output format
+    /// (see [`super::WgpuVisualizer::new`]) so the offscreen `present` target stays
+    /// consistent with the pipelines that may render into it.
+    pub fn new(device: &wgpu::Device, w: u32, h: u32, present_format: wgpu::TextureFormat) -> Self {
         let w = w.max(1);
         let h = h.max(1);
         let size = wgpu::Extent3d {
@@ -83,7 +86,7 @@ impl FrameTargets {
         );
         let (present, present_view) = make_tex(
             "present",
-            wgpu::TextureFormat::Rgba8UnormSrgb,
+            present_format,
             wgpu::TextureUsages::empty(),
         );
         let depth = device.create_texture(&wgpu::TextureDescriptor {
@@ -117,13 +120,19 @@ impl FrameTargets {
         }
     }
 
-    pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32) -> bool {
+    pub fn resize(
+        &mut self,
+        device: &wgpu::Device,
+        w: u32,
+        h: u32,
+        present_format: wgpu::TextureFormat,
+    ) -> bool {
         let w = w.max(1);
         let h = h.max(1);
         if self.size == (w, h) {
             return false;
         }
-        *self = Self::new(device, w, h);
+        *self = Self::new(device, w, h, present_format);
         true
     }
 

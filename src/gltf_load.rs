@@ -71,6 +71,7 @@ pub fn load_gltf(
     let default_mat = scene.materials.insert(Material::default());
 
     let root = scene.nodes.insert(Node {
+        id: Node::new_id(),
         name: path
             .as_ref()
             .file_stem()
@@ -248,6 +249,7 @@ pub(crate) fn absorb_gltf(
         node_map.insert(
             h.key(),
             dst.nodes.insert(Node {
+                id: Node::new_id(),
                 name: String::new(),
                 parent: None,
                 local: Transform::default(),
@@ -274,6 +276,7 @@ pub(crate) fn absorb_gltf(
         }
         if let Some(node) = dst.nodes.get_mut(new_h) {
             *node = Node {
+                id: n.id,
                 name: n.name,
                 parent: new_parent,
                 local: n.local,
@@ -377,6 +380,7 @@ fn spawn_hierarchy(
     node_map: &mut [Option<Handle<Node>>],
 ) {
     let h = scene.nodes.insert(Node {
+        id: Node::new_id(),
         name: node.name().unwrap_or("node").into(),
         parent,
         local: convert_transform(node),
@@ -420,6 +424,7 @@ fn attach_meshes(
             for (i, prim) in prims.iter().enumerate() {
                 let (mesh_h, mat_h) = load_primitive(scene, prim, buffers, mats, default_mat)?;
                 scene.nodes.insert(Node {
+                    id: Node::new_id(),
                     name: format!("{}_prim{i}", mesh.name().unwrap_or("mesh")),
                     parent: Some(h),
                     local: Transform::default(),

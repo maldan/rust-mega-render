@@ -261,6 +261,10 @@ pub struct PostFx {
     bloom_up_pipe: wgpu::RenderPipeline,
     composite_pipe: wgpu::RenderPipeline,
     fxaa_pipe: wgpu::RenderPipeline,
+    /// Straight copy of `composite_temp` into the (possibly non-sRGB-Rgba8) final
+    /// target when FXAA is off — keeps `composite_pipe` itself locked to the fixed
+    /// internal `Rgba8UnormSrgb` `composite_temp` format regardless of platform.
+    final_copy_pipe: wgpu::RenderPipeline,
     dof_pipe: wgpu::RenderPipeline,
     dof_coc_pipe: wgpu::RenderPipeline,
     dof_temporal_pipe: wgpu::RenderPipeline,
@@ -362,7 +366,10 @@ pub struct PostFx {
 }
 
 impl PostFx {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+    /// `output_format` is the color format of the final present target (e.g. the
+    /// negotiated swapchain format, which varies by platform/backend — commonly
+    /// `Bgra8UnormSrgb` on macOS/Metal, `Rgba8UnormSrgb` on Windows/Vulkan/DX12).
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, output_format: wgpu::TextureFormat) -> Self {
         let ssao_shader = device.create_shader_module(wgpu::include_wgsl!("ssao.wgsl"));
         let gtao_shader = device.create_shader_module(wgpu::include_wgsl!("gtao.wgsl"));
         let contact_shader = device.create_shader_module(wgpu::include_wgsl!("contact_shadow.wgsl"));
@@ -832,7 +839,16 @@ impl PostFx {
             &fxaa_bgl,
             &fxaa_shader,
             "fs",
-            wgpu::TextureFormat::Rgba8UnormSrgb,
+            output_format,
+            None,
+        );
+        let final_copy_pipe = fullscreen_pipe(
+            device,
+            "final_copy",
+            &copy_bgl,
+            &copy_shader,
+            "fs",
+            output_format,
             None,
         );
         let dof_pipe = fullscreen_pipe(
@@ -1081,6 +1097,7 @@ impl PostFx {
             bloom_up_pipe,
             composite_pipe,
             fxaa_pipe,
+            final_copy_pipe,
             dof_pipe,
             dof_coc_pipe,
             dof_temporal_pipe,
@@ -3135,11 +3152,11 @@ impl PostFx {
             }),
         );
 
-        let composite_dst = if settings.fxaa.enabled {
-            &self.composite_temp.view
-        } else {
-            target
-        };
+        // Always composite into the fixed-format internal target first: `composite_pipe`
+        // is built for `Rgba8UnormSrgb` (matching `composite_temp`), which may differ
+        // from `target`'s actual format (e.g. the platform swapchain format). The final
+        // copy/FXAA pass below writes into `target` using a pipeline built for its format.
+        let composite_dst = &self.composite_temp.view;
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("composite"),
             layout: &self.composite_bgl,
@@ -3232,6 +3249,26 @@ impl PostFx {
             let mut pass =
                 color_pass(encoder, "fxaa", target, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
             pass.set_pipeline(&self.fxaa_pipe);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..3, 0..1);
+        } else {
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("final_copy"),
+                layout: &self.copy_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.composite_temp.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_samp),
+                    },
+                ],
+            });
+            let mut pass =
+                color_pass(encoder, "final_copy", target, wgpu::LoadOp::Clear(wgpu::Color::BLACK));
+            pass.set_pipeline(&self.final_copy_pipe);
             pass.set_bind_group(0, &bg, &[]);
             pass.draw(0..3, 0..1);
         }

@@ -262,6 +262,7 @@ impl App {
         ];
 
         let root = scene.nodes.insert(Node {
+            id: Node::new_id(),
             name: "root".into(),
             parent: None,
             local: Transform::default(),
@@ -271,6 +272,7 @@ impl App {
             visible: true,
         });
         scene.nodes.insert(Node {
+            id: Node::new_id(),
             name: "ground".into(),
             parent: Some(root),
             local: Transform::default(),
@@ -287,6 +289,7 @@ impl App {
         ];
         let targets = specs.map(|(name, pos, mode, mat)| {
             let node = scene.nodes.insert(Node {
+                id: Node::new_id(),
                 name: name.into(),
                 parent: Some(root),
                 local: Transform {
@@ -364,12 +367,15 @@ impl App {
         .expect("device");
 
         let caps = surface.get_capabilities(&adapter);
+        // Swapchain format is platform/backend-dependent (e.g. `Bgra8UnormSrgb` on
+        // macOS/Metal vs. commonly `Rgba8UnormSrgb` on Windows/Vulkan/DX12) — pick
+        // whatever sRGB format the surface actually reports instead of hardcoding one.
         let format = caps
             .formats
             .iter()
             .copied()
-            .find(|f| *f == wgpu::TextureFormat::Rgba8UnormSrgb)
-            .expect("Rgba8UnormSrgb");
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -383,7 +389,7 @@ impl App {
         };
         surface.configure(&device, &config);
 
-        let mut visualizer = WgpuVisualizer::new(&device, &queue);
+        let mut visualizer = WgpuVisualizer::new(&device, &queue, format);
         visualizer.ensure_target(config.width, config.height);
         visualizer.post_process().tonemap.exposure = 1.05;
 

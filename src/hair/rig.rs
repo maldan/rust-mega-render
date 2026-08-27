@@ -73,6 +73,7 @@ pub fn spawn_hair_joints(scene: &mut Scene, prefix: &str, rig: &HairRig) -> (Vec
     let mut joints = Vec::with_capacity(rig.joint_locals.len());
     for (i, local) in rig.joint_locals.iter().enumerate() {
         joints.push(scene.nodes.insert(Node {
+            id: Node::new_id(),
             name: format!("{prefix}_{i}"),
             parent: None,
             local: *local,

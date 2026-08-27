@@ -36,7 +36,9 @@ pub struct HudPass {
 }
 
 impl HudPass {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+    /// `output_format` must match the view [`Self::draw`] targets (the present/
+    /// swapchain format — pipelines are bound to an exact color target format).
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, output_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::include_wgsl!("hud.wgsl"));
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("hud_uniform"),
@@ -155,7 +157,7 @@ impl HudPass {
         })];
 
         let color_target = [Some(wgpu::ColorTargetState {
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: output_format,
             blend: Some(wgpu::BlendState::ALPHA_BLENDING),
             write_mask: wgpu::ColorWrites::ALL,
         })];

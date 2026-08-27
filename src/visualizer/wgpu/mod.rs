@@ -299,6 +299,10 @@ pub struct WgpuVisualizer {
     pending_env: Option<mpsc::Receiver<Result<crate::ibl::EnvMaps, String>>>,
     meshes: HashMap<(u32, u32), GpuMesh>,
     textures: HashMap<(u32, u32), GpuTexture>,
+    /// Color format of the final present target (whatever [`Self::render_to`]'s
+    /// `color` view actually is — e.g. the negotiated swapchain format). Pipelines
+    /// that write directly to that view are built against this format.
+    output_format: wgpu::TextureFormat,
     frames: FrameTargets,
     debug_blit: DebugBlit,
     hud_pass: HudPass,
@@ -338,7 +342,12 @@ pub struct WgpuVisualizer {
 }
 
 impl WgpuVisualizer {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+    /// `output_format` is the color format [`Self::render_to`] will be asked to
+    /// write into (typically the negotiated swapchain format — this varies by
+    /// platform/backend, e.g. `Bgra8UnormSrgb` on macOS/Metal vs. commonly
+    /// `Rgba8UnormSrgb` on Windows/Vulkan/DX12). Passing the wrong format here
+    /// causes a render-pipeline/color-attachment format mismatch at draw time.
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, output_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::include_wgsl!("mesh.wgsl"));
         let hair_shader = device.create_shader_module(wgpu::include_wgsl!("hair.wgsl"));
         let shadow_shader = device.create_shader_module(wgpu::include_wgsl!("shadow.wgsl"));
@@ -1049,13 +1058,13 @@ impl WgpuVisualizer {
             &depth_stencil,
         );
 
-        let frames = FrameTargets::new(device, 1, 1);
+        let frames = FrameTargets::new(device, 1, 1, output_format);
         let white = upload_texture(device, queue, &Texture::solid(255, 255, 255, 255));
         let flat_normal = upload_texture(device, queue, &Texture::solid_linear(128, 128, 255, 255));
         let default_mr = upload_texture(device, queue, &Texture::solid_linear(255, 255, 255, 255));
-        let post_fx = PostFx::new(device, queue);
-        let debug_blit = DebugBlit::new(device, queue);
-        let hud_pass = HudPass::new(device, queue);
+        let post_fx = PostFx::new(device, queue, output_format);
+        let debug_blit = DebugBlit::new(device, queue, output_format);
+        let hud_pass = HudPass::new(device, queue, output_format);
 
         let object_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("object_uniforms"),
@@ -1100,6 +1109,7 @@ impl WgpuVisualizer {
         Self {
             device: device.clone(),
             queue: queue.clone(),
+            output_format,
             pipeline,
             hair_depth_pipeline,
             hair_pipeline,
@@ -1512,7 +1522,7 @@ impl WgpuVisualizer {
             return false;
         }
         self.size = (w, h);
-        self.frames.resize(&self.device, w, h);
+        self.frames.resize(&self.device, w, h, self.output_format);
         self.post_fx.resize(&self.device, w, h);
         self.motion_has_history = false;
         true
@@ -1520,7 +1530,7 @@ impl WgpuVisualizer {
 
     /// Render into an external color target (e.g. swapchain).
     ///
-    /// `color` must be `Rgba8UnormSrgb`.
+    /// `color` must be the same format passed as `output_format` to [`Self::new`].
     pub fn render_to(&mut self, scene: &Scene, aspect: f32, color: &wgpu::TextureView) {
         self.render_inner(scene, aspect, Some(color));
     }

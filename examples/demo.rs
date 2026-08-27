@@ -60,6 +60,7 @@ fn build_demo_scene() -> Scene {
         .insert(Material::new([0.72, 0.72, 0.75, 1.0], 1.0, 0.35));
 
     let root = scene.nodes.insert(Node {
+        id: Node::new_id(),
         name: "root".into(),
         parent: None,
         local: Transform::default(),
@@ -70,6 +71,7 @@ fn build_demo_scene() -> Scene {
     });
 
     scene.nodes.insert(Node {
+        id: Node::new_id(),
         name: "ground".into(),
         parent: Some(root),
         local: Transform::default(),
@@ -86,6 +88,7 @@ fn build_demo_scene() -> Scene {
             .insert(Material::new([0.85, 0.15, 0.12, 1.0], 0.0, r));
         let x = -4.0 + i as f32 * 1.6;
         scene.nodes.insert(Node {
+            id: Node::new_id(),
             name: format!("di_sphere_{i}"),
             parent: Some(root),
             local: Transform::from_translation(Vec3::new(x, 0.45, 0.0)),
@@ -103,6 +106,7 @@ fn build_demo_scene() -> Scene {
             .insert(Material::new([0.95, 0.78, 0.35, 1.0], 1.0, r));
         let x = -4.0 + i as f32 * 1.6;
         scene.nodes.insert(Node {
+            id: Node::new_id(),
             name: format!("metal_sphere_{i}"),
             parent: Some(root),
             local: Transform::from_translation(Vec3::new(x, 0.45, 2.2)),
@@ -125,6 +129,7 @@ fn build_demo_scene() -> Scene {
             .materials
             .insert(Material::new(albedo, metallic, roughness));
         scene.nodes.insert(Node {
+            id: Node::new_id(),
             name: format!("cube_{i}"),
             parent: Some(root),
             local: Transform::from_translation(pos),

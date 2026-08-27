@@ -68,6 +68,7 @@ fn build_scene() -> (Scene, usize) {
         .insert(Material::new([0.5, 0.55, 0.6, 1.0], 0.0, 0.8));
 
     let root = scene.nodes.insert(Node {
+        id: Node::new_id(),
         name: "root".into(),
         parent: None,
         local: Transform::default(),
@@ -78,6 +79,7 @@ fn build_scene() -> (Scene, usize) {
     });
 
     scene.nodes.insert(Node {
+        id: Node::new_id(),
         name: "ground".into(),
         parent: Some(root),
         local: Transform::default(),
@@ -100,6 +102,7 @@ fn build_scene() -> (Scene, usize) {
                 .materials
                 .insert(Material::new([color[0], color[1], color[2], 1.0], 0.1, 0.4));
             scene.nodes.insert(Node {
+                id: Node::new_id(),
                 name: format!("cube_{i}"),
                 parent: Some(root),
                 local: Transform::from_translation(pos),
@@ -113,6 +116,7 @@ fn build_scene() -> (Scene, usize) {
                 .materials
                 .insert(Material::new([color[0], color[1], color[2], 1.0], 0.8, 0.25));
             scene.nodes.insert(Node {
+                id: Node::new_id(),
                 name: format!("sphere_{i}"),
                 parent: Some(root),
                 local: Transform::from_translation(pos + Vec3::Y * 0.05),
@@ -128,6 +132,7 @@ fn build_scene() -> (Scene, usize) {
         .materials
         .insert(Material::new([0.9, 0.85, 0.2, 1.0], 0.0, 0.5));
     scene.nodes.insert(Node {
+        id: Node::new_id(),
         name: "marker".into(),
         parent: Some(root),
         local: Transform {
@@ -184,7 +189,11 @@ fn main() {
     let xr_wgpu = unsafe { XrWgpu::from_xr(&xr) }.expect("XrWgpu::from_xr");
     let actions = XrActions::new(&xr.xr_instance, xr.session()).expect("XrActions::new");
 
-    let mut visualizer = WgpuVisualizer::new(&xr_wgpu.device, &xr_wgpu.queue);
+    let mut visualizer = WgpuVisualizer::new(
+        &xr_wgpu.device,
+        &xr_wgpu.queue,
+        mega_render::xr::XR_COLOR_FORMAT_WGPU,
+    );
     {
         let post = visualizer.post_process();
         post.env.enabled = false;

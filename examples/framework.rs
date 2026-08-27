@@ -459,12 +459,15 @@ impl<D: Demo> Host<D> {
         .expect("request_device");
 
         let caps = surface.get_capabilities(&adapter);
+        // Swapchain format is platform/backend-dependent (e.g. `Bgra8UnormSrgb` on
+        // macOS/Metal vs. commonly `Rgba8UnormSrgb` on Windows/Vulkan/DX12) — pick
+        // whatever sRGB format the surface actually reports instead of hardcoding one.
         let format = caps
             .formats
             .iter()
             .copied()
-            .find(|f| *f == wgpu::TextureFormat::Rgba8UnormSrgb)
-            .expect("adapter must support Rgba8UnormSrgb swapchain");
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -484,7 +487,12 @@ impl<D: Demo> Host<D> {
         };
         surface.configure(&device, &config);
 
-        let mut visualizer = WgpuVisualizer::new(&device, &queue);
+        // Unlike the swapchain `format` above, the visualizer here always renders
+        // into `scene_target` (an offscreen `Rgba8UnormSrgb` texture composited into
+        // the UI by mega-ui), not directly into the window surface — so its output
+        // format must match `SceneTarget`'s fixed format, not the swapchain's.
+        let mut visualizer =
+            WgpuVisualizer::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
         let vp = (
             self.viewport_size.x.max(1.0) as u32,
             self.viewport_size.y.max(1.0) as u32,
