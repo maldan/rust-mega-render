@@ -1,5 +1,7 @@
 use super::store::Handle;
-use super::texture::Texture;
+use super::texture::{Texture, TextureStore};
+
+pub use crate::io::material::{MaterialBytesError, MaterialFile, MaterialFileMaps};
 
 /// Distinguishes the fragment shading path a material is drawn with. `Standard`
 /// materials go through the opaque G-buffer pipeline (alpha-cutout only);
@@ -157,6 +159,11 @@ pub struct Material {
 }
 
 impl Material {
+    /// Lookup texture ids in `textures` and write a `MAT ` blob. Handles are not stored.
+    pub fn to_bytes(&self, textures: &TextureStore) -> Vec<u8> {
+        MaterialFile::from_material(self, textures).to_bytes()
+    }
+
     pub fn new(albedo: [f32; 4], metallic: f32, roughness: f32) -> Self {
         Self {
             albedo,
