@@ -18,6 +18,7 @@ mod frame_targets;
 mod debug_blit;
 mod hud_pass;
 mod sss_lut;
+mod tess;
 use ibl_gpu::GpuIbl;
 use post::{PostFx, SsrEnvInput};
 use frame_targets::FrameTargets;
@@ -207,6 +208,9 @@ struct DrawItem {
     is_udim: bool,
     udim: Option<UdimDraw>,
     skin_key: Option<(u32, u32)>,
+    height_key: Option<(u32, u32)>,
+    displacement_scale: f32,
+    tess_factor: u32,
 }
 
 /// Per-skin bone palette texture (RGBA32F, row0=current, row1=prev).
@@ -226,6 +230,8 @@ struct GpuMesh {
     index_buf: wgpu::Buffer,
     vertex_count: u32,
     index_count: u32,
+    aabb_center: glam::Vec3,
+    aabb_radius: f32,
     synced: u64,
 }
 
@@ -339,6 +345,7 @@ pub struct WgpuVisualizer {
     last_frame: Instant,
     /// Reused debug vertex buffers (avoid create/destroy every frame).
     debug_scratch: DebugScratch,
+    tess: tess::TessPass,
 }
 
 impl WgpuVisualizer {
@@ -382,6 +389,10 @@ impl WgpuVisualizer {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            // MaterialMaps::Single is wrap-sampling (tiling UVs).
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
             ..Default::default()
         });
         let udim_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1183,6 +1194,7 @@ impl WgpuVisualizer {
             motion_has_history: false,
             last_frame: Instant::now(),
             debug_scratch: DebugScratch::default(),
+            tess: tess::TessPass::new(device),
         }
     }
 
@@ -1221,6 +1233,7 @@ impl WgpuVisualizer {
         self.textures.clear();
         self.skin_bones.clear();
         self.prev_models.clear();
+        self.tess.clear();
         self.motion_has_history = false;
         self.invalidate_object_bind_groups();
     }
@@ -1674,6 +1687,9 @@ impl WgpuVisualizer {
                 soft_blend,
                 is_udim,
                 udim,
+                height_key,
+                displacement_scale,
+                tess_factor,
             ) = match node.material.and_then(|m| scene.materials.get(m).map(|mat| (m, mat))) {
                     Some((mat_h, mat)) => {
                         let (hair0, hair1, tip_fade, is_hair, soft_blend, cutout_fringe) =
@@ -1734,6 +1750,9 @@ impl WgpuVisualizer {
                             soft_blend,
                             is_udim,
                             udim,
+                            mat.height.map(|h| h.key()),
+                            mat.displacement_scale,
+                            mat.tess_factor.max(1),
                         )
                     }
                     None => (
@@ -1749,6 +1768,9 @@ impl WgpuVisualizer {
                         false,
                         false,
                         None,
+                        None,
+                        0.0,
+                        1,
                     ),
                 };
             let mut skin_key = None;
@@ -1778,6 +1800,9 @@ impl WgpuVisualizer {
                 is_udim,
                 udim,
                 skin_key,
+                height_key,
+                displacement_scale,
+                tess_factor,
             });
         }
 
@@ -1901,6 +1926,17 @@ impl WgpuVisualizer {
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let wireframe = self.debug_view == DebugView::Wireframe;
+
+        self.tess.dispatch(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &self.sampler,
+            &self.meshes,
+            &self.textures,
+            &draws,
+            eye,
+        );
 
         // Shadow pass (unchanged).
         if !wireframe && scene.shadow_directional().is_some() {
@@ -2035,6 +2071,7 @@ impl WgpuVisualizer {
                 draw_mesh_items(
                     &mut pass,
                     &self.meshes,
+                    &self.tess,
                     &self.default_object_bg,
                     &self.object_material_bgs,
                     &self.identity_bone_bg,
@@ -2058,6 +2095,7 @@ impl WgpuVisualizer {
                 draw_mesh_items(
                     &mut pass,
                     &self.meshes,
+                    &self.tess,
                     &self.default_object_bg,
                     &self.object_material_bgs,
                     &self.identity_bone_bg,
@@ -2082,6 +2120,7 @@ impl WgpuVisualizer {
                 draw_mesh_items(
                     &mut pass,
                     &self.meshes,
+                    &self.tess,
                     &self.default_object_bg,
                     &self.object_material_bgs,
                     &self.identity_bone_bg,
@@ -2475,6 +2514,7 @@ impl Visualizer for WgpuVisualizer {
             pack_gpu_verts(mesh, &mut vert_scratch);
             let vcount = vert_scratch.len() as u32;
             let icount = mesh.indices.len() as u32;
+            let (aabb_center, aabb_radius) = tess::mesh_bounds(&mesh.positions);
             if let Some(gpu) = self.meshes.get_mut(&key) {
                 if gpu.vertex_count == vcount && gpu.index_count == icount {
                     self.queue.write_buffer(
@@ -2482,6 +2522,8 @@ impl Visualizer for WgpuVisualizer {
                         0,
                         bytemuck::cast_slice(&vert_scratch),
                     );
+                    gpu.aabb_center = aabb_center;
+                    gpu.aabb_radius = aabb_radius;
                     gpu.synced = mesh.version;
                     continue;
                 }
@@ -2996,6 +3038,7 @@ fn debug_pipeline(
 fn draw_mesh_items(
     pass: &mut wgpu::RenderPass<'_>,
     meshes: &HashMap<(u32, u32), GpuMesh>,
+    tess: &tess::TessPass,
     default_object_bg: &wgpu::BindGroup,
     object_material_bgs: &HashMap<[(u32, u32); 3], wgpu::BindGroup>,
     identity_bone_bg: &wgpu::BindGroup,
@@ -3030,9 +3073,15 @@ fn draw_mesh_items(
         } else {
             pass.set_bind_group(2, identity_bone_bg, &[]);
         }
-        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        if let Some((vb, ib, n)) = tess.buffers(d.node_key) {
+            pass.set_vertex_buffer(0, vb.slice(..));
+            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..n, 0, 0..1);
+        } else {
+            pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+            pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
     }
 }
 
@@ -3736,19 +3785,26 @@ fn pack_gpu_verts(mesh: &Mesh, out: &mut Vec<GpuVertex>) {
 }
 
 fn upload_mesh(device: &wgpu::Device, mesh: &Mesh, verts: &[GpuVertex]) -> GpuMesh {
+    let (aabb_center, aabb_radius) = tess::mesh_bounds(&mesh.positions);
     GpuMesh {
         vertex_buf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh_vb"),
             contents: bytemuck::cast_slice(verts),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
         }),
         index_buf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh_ib"),
             contents: bytemuck::cast_slice(&mesh.indices),
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::INDEX
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
         }),
         vertex_count: verts.len() as u32,
         index_count: mesh.indices.len() as u32,
+        aabb_center,
+        aabb_radius,
         synced: mesh.version,
     }
 }

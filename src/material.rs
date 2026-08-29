@@ -152,6 +152,12 @@ pub struct Material {
     /// Curvature for the SSS LUT (0..1). Higher = thinner / softer wrap.
     pub sss_curvature: f32,
     pub maps: MaterialMaps,
+    /// Height map for GPU displacement. `None` or [`Self::displacement_scale`] ≤ 0 skips tessellation.
+    pub height: Option<Handle<Texture>>,
+    /// World-unit height at map value 1. Ignored when [`Self::height`] is `None`.
+    pub displacement_scale: f32,
+    /// GPU tessellation level (1..=32). Ignored when height tessellation is off.
+    pub tess_factor: u32,
     /// 0 = opaque. If > 0, fragments with albedo alpha below this are discarded (MASK).
     /// Deferred path has no alpha blend; this is the supported transparency mode.
     pub alpha_cutoff: f32,
@@ -173,9 +179,18 @@ impl Material {
             sss_color: [1.0, 0.35, 0.2],
             sss_curvature: 0.3,
             maps: MaterialMaps::default(),
+            height: None,
+            displacement_scale: 0.0,
+            tess_factor: 32,
             alpha_cutoff: 0.0,
             shading_model: ShadingModel::Standard,
         }
+    }
+
+    pub fn with_height(mut self, map: Handle<Texture>, scale: f32) -> Self {
+        self.height = Some(map);
+        self.displacement_scale = scale.max(0.0);
+        self
     }
 
     pub fn with_map(mut self, map: Handle<Texture>) -> Self {

@@ -38,8 +38,8 @@ pollster = "0.4"
 winit = "0.30"
 
 [[example]]
-name = "demo"
-path = "examples/demo.rs"
+name = "tess_demo"
+path = "examples/tess_demo.rs"
 
 [[example]]
 name = "hud_demo"
