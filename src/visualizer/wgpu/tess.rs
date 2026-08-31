@@ -36,6 +36,8 @@ pub struct TessPass {
     slots: Vec<TessSlot>,
     /// node_key → slot index for this frame.
     live: HashMap<(u32, u32), usize>,
+    /// Storage dest buffers must fit both max_buffer_size and max_storage_buffer_binding_size.
+    max_storage_bytes: u64,
 }
 
 impl TessPass {
@@ -94,6 +96,7 @@ impl TessPass {
             layout,
             slots: Vec::new(),
             live: HashMap::new(),
+            max_storage_bytes: tess_storage_limit(&device.limits()),
         }
     }
 
@@ -142,10 +145,20 @@ impl TessPass {
             if tri_count == 0 {
                 continue;
             }
-            let dest_verts = tri_count as u64 * verts_per_tri(MAX_TESS) as u64;
-            let dest_idx = tri_count as u64 * idx_per_tri(MAX_TESS) as u64;
+            let tess = d
+                .tess_factor
+                .max(1)
+                .min(MAX_TESS)
+                .min(max_tess_fitting(tri_count, self.max_storage_bytes));
+            let dest_verts = tri_count as u64 * verts_per_tri(tess) as u64;
+            let dest_idx = tri_count as u64 * idx_per_tri(tess) as u64;
+            let vert_bytes = dest_verts * VERT_BYTES;
+            let idx_bytes = dest_idx * 4;
+            if vert_bytes > self.max_storage_bytes || idx_bytes > self.max_storage_bytes {
+                continue;
+            }
             let slot_i = packed.len();
-            self.ensure_slot(device, slot_i, dest_verts * VERT_BYTES, dest_idx * 4);
+            self.ensure_slot(device, slot_i, vert_bytes, idx_bytes);
             queue.write_buffer(
                 &self.slots[slot_i].params_buf,
                 0,
@@ -155,7 +168,7 @@ impl TessPass {
                     lod_near: LOD_NEAR,
                     lod_far: LOD_FAR,
                     camera_pos: eye.to_array(),
-                    tess_factor: d.tess_factor.max(1).min(MAX_TESS),
+                    tess_factor: tess,
                     model: d.model.to_cols_array_2d(),
                 }),
             );
@@ -284,6 +297,31 @@ pub fn idx_per_tri(t: u32) -> u32 {
     t * t * 3
 }
 
+fn tess_storage_limit(limits: &wgpu::Limits) -> u64 {
+    limits
+        .max_buffer_size
+        .min(limits.max_storage_buffer_binding_size)
+}
+
+fn max_tess_fitting(tri_count: u32, max_buf: u64) -> u32 {
+    if tri_count == 0 {
+        return 1;
+    }
+    let mut t = MAX_TESS;
+    while t >= 1 {
+        let vb = tri_count as u64 * verts_per_tri(t) as u64 * VERT_BYTES;
+        let ib = tri_count as u64 * idx_per_tri(t) as u64 * 4;
+        if vb <= max_buf && ib <= max_buf {
+            return t;
+        }
+        if t == 1 {
+            break;
+        }
+        t -= 1;
+    }
+    1
+}
+
 pub fn mesh_bounds(positions: &[[f32; 3]]) -> (Vec3, f32) {
     if positions.is_empty() {
         return (Vec3::ZERO, 0.0);
@@ -298,4 +336,23 @@ pub fn mesh_bounds(positions: &[[f32; 3]]) -> (Vec3, f32) {
     let c = (min + max) * 0.5;
     let r = (max - min).length() * 0.5;
     (c, r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_cube_tess_fits_storage_bind() {
+        let tris = 24 * 24 * 2 * 6;
+        // Default WebGPU max_storage_buffer_binding_size (128 MiB).
+        let max = 128 << 20;
+        let t = max_tess_fitting(tris, max);
+        let vb = tris as u64 * verts_per_tri(t) as u64 * VERT_BYTES;
+        let ib = tris as u64 * idx_per_tri(t) as u64 * 4;
+        assert!(vb <= max, "verts t={t} bytes={vb}");
+        assert!(ib <= max, "idx t={t} bytes={ib}");
+        assert!(t >= 8, "tess collapsed too far: {t}");
+        assert!(t < MAX_TESS);
+    }
 }

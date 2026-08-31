@@ -22,6 +22,10 @@ struct TessParams {
 
 const MAX_TESS: u32 = 32u;
 
+fn tess_cap() -> u32 {
+    return clamp(params.tess_factor, 1u, MAX_TESS);
+}
+
 @group(0) @binding(0) var<uniform> params: TessParams;
 @group(0) @binding(1) var height_tex: texture_2d<f32>;
 @group(0) @binding(2) var height_samp: sampler;
@@ -143,7 +147,7 @@ fn tess_from_dist(world: vec3<f32>) -> u32 {
         case 3u: { level = 8u; }
         default: { level = MAX_TESS; }
     }
-    let cap = clamp(params.tess_factor, 1u, MAX_TESS);
+    let cap = tess_cap();
     return min(level, cap);
 }
 
@@ -201,24 +205,33 @@ fn displace(pos: vec3<f32>, nrm: vec3<f32>, uv: vec2<f32>, tan: vec4<f32>) -> ve
 
 fn displaced_normal(pos: vec3<f32>, nrm: vec3<f32>, uv: vec2<f32>, tan: vec4<f32>) -> vec3<f32> {
     let n = normalize(nrm);
+    if abs(params.scale) < 1e-8 {
+        return n;
+    }
     var t = tan.xyz;
     let tl = length(t);
     if tl < 1e-5 {
         return n;
     }
     t = t / tl;
+    // Same TBN as mesh.wgsl / glTF. Do not light with T×B: mirrored UVs (tan.w
+    // = -1) make that product −N, which reads as a view-locked dark blob.
     let b = normalize(cross(n, t)) * tan.w;
     let sz = vec2<f32>(textureDimensions(height_tex, 0));
     let e = vec2<f32>(1.0) / max(sz, vec2<f32>(1.0));
     let p0 = displace(pos, n, uv, tan);
     let p1w = displace(pos + t * 0.02, n, uv + vec2<f32>(e.x, 0.0), tan);
     let p2w = displace(pos + b * 0.02, n, uv + vec2<f32>(0.0, e.y), tan);
-    let nn = cross(p1w - p0, p2w - p0);
+    var nn = cross(p1w - p0, p2w - p0);
     let ln = length(nn);
     if ln < 1e-8 {
         return n;
     }
-    return nn / ln;
+    nn = nn / ln;
+    if dot(nn, n) < 0.0 {
+        nn = -nn;
+    }
+    return nn;
 }
 
 @compute @workgroup_size(64)
@@ -239,9 +252,10 @@ fn tess_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let te_ca = tess_from_dist(world_pos((c.pos + a.pos) * 0.5));
     let t_in = tess_from_dist(world_pos((a.pos + b.pos + c.pos) / 3.0));
     let t = max(max(max(te_ab, te_bc), te_ca), max(t_in, 1u));
+    let cap = tess_cap();
 
-    let vbase = tri * verts_per_tri(MAX_TESS);
-    let ibase = tri * idx_per_tri(MAX_TESS);
+    let vbase = tri * verts_per_tri(cap);
+    let ibase = tri * idx_per_tri(cap);
 
     for (var i = 0u; i <= t; i++) {
         for (var j = 0u; j <= (t - i); j++) {
@@ -288,7 +302,7 @@ fn tess_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
     }
-    let pad_n = idx_per_tri(MAX_TESS);
+    let pad_n = idx_per_tri(cap);
     let degener = vbase;
     for (var p = wtri * 3u; p < pad_n; p++) {
         dst_idx[ibase + p] = degener;
