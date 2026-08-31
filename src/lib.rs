@@ -22,6 +22,7 @@ mod scene;
 mod shadow;
 mod skin;
 mod store;
+mod tess_settings;
 mod texture;
 pub mod view_gizmo;
 mod visualizer;
@@ -58,6 +59,7 @@ pub use skin::{
     blend_skin_matrix, blend_skin_point, blend_skin_vector, skin_mesh_matrix, skin_mesh_point,
     DualQuat, Skin, SkinBytesError, SkinFile, SkinningMode,
 };
+pub use tess_settings::TessSettings;
 pub use store::{Handle, Store};
 pub use texture::{Texture, TextureStore};
 pub use view_gizmo::ViewAxis;

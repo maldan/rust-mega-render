@@ -448,7 +448,7 @@ pub use mega_render::{
 - `new(device, queue)`
 - `ensure_target(w, h)` / `target_view()`
 - `sync(scene)` / `render` / `render_to`
-- `post_process()` / `shadow_settings()` / `effect_settings()`
+- `post_process()` / `shadow_settings()` / `tess_settings()` / `effect_settings()` / `all_settings()`
 - `set_env_map` / `set_env_map_async` / `clear_env_map`
 - `set_debug_view`
 

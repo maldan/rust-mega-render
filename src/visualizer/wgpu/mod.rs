@@ -1,7 +1,7 @@
 use super::Visualizer;
 use crate::{
     DebugView, DualQuat, Handle, MaterialMaps, Mesh, PostProcessSettings, Scene, ShadowFilter,
-    ShadowSettings, SkinningMode, Texture,
+    ShadowSettings, SkinningMode, Texture, TessSettings,
 };
 use crate::material::{first_udim_tile, udim_lut_index};
 use glam::{Mat4, Vec3};
@@ -345,7 +345,8 @@ pub struct WgpuVisualizer {
     last_frame: Instant,
     /// Reused debug vertex buffers (avoid create/destroy every frame).
     debug_scratch: DebugScratch,
-    tess: tess::TessPass,
+    tess_pass: tess::TessPass,
+    tess: TessSettings,
 }
 
 impl WgpuVisualizer {
@@ -1194,7 +1195,8 @@ impl WgpuVisualizer {
             motion_has_history: false,
             last_frame: Instant::now(),
             debug_scratch: DebugScratch::default(),
-            tess: tess::TessPass::new(device),
+            tess_pass: tess::TessPass::new(device),
+            tess: TessSettings::default(),
         }
     }
 
@@ -1233,7 +1235,7 @@ impl WgpuVisualizer {
         self.textures.clear();
         self.skin_bones.clear();
         self.prev_models.clear();
-        self.tess.clear();
+        self.tess_pass.clear();
         self.motion_has_history = false;
         self.invalidate_object_bind_groups();
     }
@@ -1927,7 +1929,7 @@ impl WgpuVisualizer {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let wireframe = self.debug_view == DebugView::Wireframe;
 
-        self.tess.dispatch(
+        self.tess_pass.dispatch(
             &self.device,
             &self.queue,
             &mut encoder,
@@ -1937,6 +1939,8 @@ impl WgpuVisualizer {
             &draws,
             eye,
             view_proj,
+            self.tess.sanitized_target_px(),
+            self.size,
         );
 
         // Shadow pass (unchanged).
@@ -2072,7 +2076,7 @@ impl WgpuVisualizer {
                 draw_mesh_items(
                     &mut pass,
                     &self.meshes,
-                    &self.tess,
+                    &self.tess_pass,
                     &self.default_object_bg,
                     &self.object_material_bgs,
                     &self.identity_bone_bg,
@@ -2096,7 +2100,7 @@ impl WgpuVisualizer {
                 draw_mesh_items(
                     &mut pass,
                     &self.meshes,
-                    &self.tess,
+                    &self.tess_pass,
                     &self.default_object_bg,
                     &self.object_material_bgs,
                     &self.identity_bone_bg,
@@ -2121,7 +2125,7 @@ impl WgpuVisualizer {
                 draw_mesh_items(
                     &mut pass,
                     &self.meshes,
-                    &self.tess,
+                    &self.tess_pass,
                     &self.default_object_bg,
                     &self.object_material_bgs,
                     &self.identity_bone_bg,
@@ -2587,6 +2591,14 @@ impl Visualizer for WgpuVisualizer {
 
     fn effect_settings(&mut self) -> (&mut PostProcessSettings, &mut ShadowSettings) {
         (&mut self.post, &mut self.shadow)
+    }
+
+    fn tess_settings(&mut self) -> &mut TessSettings {
+        &mut self.tess
+    }
+
+    fn all_settings(&mut self) -> (&mut PostProcessSettings, &mut ShadowSettings, &mut TessSettings) {
+        (&mut self.post, &mut self.shadow, &mut self.tess)
     }
 
     fn render(&mut self, scene: &Scene, aspect: f32) {

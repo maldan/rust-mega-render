@@ -174,6 +174,7 @@ impl Demo for TessDemo {
             dock,
             viewport_size,
             stats,
+            tess,
             ..
         } = ctx;
 
@@ -194,8 +195,11 @@ impl Demo for TessDemo {
             "Debug" => {
                 let size = ui.available_size();
                 ui.scroll_area("tess_dbg", size, ScrollAxes::Vertical, |ui| {
-                    ui.label("Per-triangle LOD: near cells denser than far (wireframe).");
+                    ui.label("Screen-space LOD: subdivides until each edge is ~target_px long.");
                     ui.label("Box has no height map → original mesh.");
+                    ui.separator();
+                    ui.label("Tess target (px/edge)");
+                    ui.slider("tess_target_px", &mut tess.target_px, 1.0..=64.0);
                     ui.separator();
                     let mut idx = DebugView::ALL
                         .iter()

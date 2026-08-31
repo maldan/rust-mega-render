@@ -13,14 +13,20 @@ const OFF_COLOR: u32 = 18u;
 struct TessParams {
     tri_count: u32,
     scale: f32,
-    lod_near: f32,
-    lod_far: f32,
+    // Target on-screen edge length in pixels (see crate::TessSettings).
+    target_px: f32,
+    _reserved: f32,
     camera_pos: vec3<f32>,
     tess_factor: u32,
     model: mat4x4<f32>,
     // World-space frustum planes (left, right, bottom, top, near, far),
     // each normalized so dot(xyz, p) + w is a true signed distance.
     planes: array<vec4<f32>, 6>,
+    // Combined view_proj * model, for projecting triangle edges to screen
+    // space to drive the adaptive tessellation level.
+    mvp: mat4x4<f32>,
+    // (viewport_width_px, viewport_height_px, unused, unused).
+    viewport: vec4<f32>,
 }
 
 const MAX_TESS: u32 = 32u;
@@ -180,21 +186,31 @@ fn is_backface(a_nrm: vec3<f32>, b_nrm: vec3<f32>, c_nrm: vec3<f32>, center: vec
     return facing < -BACKFACE_BIAS;
 }
 
-fn tess_from_dist(world: vec3<f32>) -> u32 {
-    let dist = length(world - params.camera_pos);
-    let span = max(params.lod_far - params.lod_near, 1e-3);
-    let t = clamp((dist - params.lod_near) / span, 0.0, 1.0);
-    let lod = u32(round(4.0 * (1.0 - t)));
-    var level: u32;
-    switch lod {
-        case 0u: { level = 1u; }
-        case 1u: { level = 2u; }
-        case 2u: { level = 4u; }
-        case 3u: { level = 8u; }
-        default: { level = MAX_TESS; }
+// Converts a clip-space position to screen-space pixel coordinates.
+fn clip_to_px(clip: vec4<f32>) -> vec2<f32> {
+    let ndc = clip.xy / max(clip.w, 1e-5);
+    return (ndc * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5)) * params.viewport.xy;
+}
+
+// On-screen length, in pixels, of the edge between two local-space points.
+// Points behind the camera don't have a meaningful screen-space length; in
+// that case we return a huge value so the caller falls back to the
+// tessellation cap instead of under-tessellating near the eye.
+fn edge_px(a_local: vec3<f32>, b_local: vec3<f32>) -> f32 {
+    let ca = params.mvp * vec4<f32>(a_local, 1.0);
+    let cb = params.mvp * vec4<f32>(b_local, 1.0);
+    if ca.w <= 1e-4 || cb.w <= 1e-4 {
+        return 1e9;
     }
-    let cap = tess_cap();
-    return min(level, cap);
+    return distance(clip_to_px(ca), clip_to_px(cb));
+}
+
+// Subdivisions needed so a `px`-pixel-long edge splits into segments no
+// longer than params.target_px, capped by the per-draw tess_factor.
+fn tess_from_px(px: f32) -> u32 {
+    let target_edge_px = max(params.target_px, 1.0);
+    let level = u32(ceil(px / target_edge_px));
+    return clamp(level, 1u, tess_cap());
 }
 
 fn snap_edge(s: u32, t: u32, e: u32) -> f32 {
@@ -316,11 +332,14 @@ fn tess_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let te_ab = tess_from_dist(world_pos((a.pos + b.pos) * 0.5));
-    let te_bc = tess_from_dist(world_pos((b.pos + c.pos) * 0.5));
-    let te_ca = tess_from_dist(world_pos((c.pos + a.pos) * 0.5));
-    let t_in = tess_from_dist(center);
-    let t = max(max(max(te_ab, te_bc), te_ca), max(t_in, 1u));
+    // Adaptive level per edge: keep subdividing until each edge is roughly
+    // params.target_px pixels long on screen. This scales with the actual
+    // on-screen footprint (distance, FOV and viewport all fall out of the
+    // projection), unlike a fixed world-space distance band.
+    let te_ab = tess_from_px(edge_px(a.pos, b.pos));
+    let te_bc = tess_from_px(edge_px(b.pos, c.pos));
+    let te_ca = tess_from_px(edge_px(c.pos, a.pos));
+    let t = max(max(te_ab, te_bc), te_ca);
 
     for (var i = 0u; i <= t; i++) {
         for (var j = 0u; j <= (t - i); j++) {

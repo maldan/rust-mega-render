@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use glam::{Vec2, Vec3};
 use mega_render::{
-    Camera, DebugView, PostProcessSettings, Scene, ShadowSettings, Visualizer, WgpuVisualizer,
-    WGPU_FEATURES,
+    Camera, DebugView, PostProcessSettings, Scene, ShadowSettings, TessSettings, Visualizer,
+    WgpuVisualizer, WGPU_FEATURES,
 };
 use mega_ui::wgpu::{DrawStats, UiRenderer};
 use mega_ui::{CursorIcon, DockState, Ui, UiInput};
@@ -29,6 +29,7 @@ pub struct UiCtx<'a> {
     pub scene: &'a mut Scene,
     pub post: &'a mut PostProcessSettings,
     pub shadow: &'a mut ShadowSettings,
+    pub tess: &'a mut TessSettings,
     pub debug_view: &'a mut DebugView,
     pub dock: &'a mut DockState,
     /// Full window size in pixels (for dock layout).
@@ -611,11 +612,12 @@ impl<D: Demo> Host<D> {
             let mut viewport_size = self.viewport_size;
             let mut debug_view = gpu.visualizer.debug_view();
             let keep_ui = {
-                let (post, shadow) = gpu.visualizer.effect_settings();
+                let (post, shadow, tess) = gpu.visualizer.all_settings();
                 let mut ctx = UiCtx {
                     scene: &mut self.scene,
                     post,
                     shadow,
+                    tess,
                     debug_view: &mut debug_view,
                     dock: &mut self.dock,
                     window_size: viewport,

@@ -5,23 +5,27 @@ use wgpu::util::DeviceExt;
 
 pub const MAX_TESS: u32 = 32;
 const VERT_BYTES: u64 = 88;
-const PARAMS_SIZE: u64 = 192;
-const LOD_NEAR: f32 = 4.0;
-const LOD_FAR: f32 = 28.0;
+const PARAMS_SIZE: u64 = 272;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct TessParamsGpu {
     tri_count: u32,
     scale: f32,
-    lod_near: f32,
-    lod_far: f32,
+    /// Target on-screen edge length in pixels (see [`crate::TessSettings`]).
+    target_px: f32,
+    _reserved: f32,
     camera_pos: [f32; 3],
     tess_factor: u32,
     model: [[f32; 4]; 4],
     /// World-space frustum planes (left, right, bottom, top, near, far),
     /// each normalized so `dot(xyz, p) + w` is a true signed distance.
     planes: [[f32; 4]; 6],
+    /// Combined `view_proj * model`, used to project triangle edges to
+    /// screen space for the adaptive tessellation level.
+    mvp: [[f32; 4]; 4],
+    /// (viewport_width_px, viewport_height_px, unused, unused).
+    viewport: [f32; 4],
 }
 
 const _: () = assert!(std::mem::size_of::<TessParamsGpu>() == PARAMS_SIZE as usize);
@@ -159,6 +163,8 @@ impl TessPass {
         draws: &[DrawItem],
         eye: Vec3,
         view_proj: Mat4,
+        target_px: f32,
+        viewport: (u32, u32),
     ) {
         self.live.clear();
         struct Job {
@@ -167,6 +173,7 @@ impl TessPass {
         }
         let mut packed: Vec<Job> = Vec::new();
         let planes = frustum_planes(view_proj).map(|p| p.to_array());
+        let viewport = [viewport.0 as f32, viewport.1 as f32, 0.0, 0.0];
         for d in draws {
             if !wants_tess(d) {
                 continue;
@@ -204,12 +211,14 @@ impl TessPass {
                 bytemuck::bytes_of(&TessParamsGpu {
                     tri_count,
                     scale: d.displacement_scale,
-                    lod_near: LOD_NEAR,
-                    lod_far: LOD_FAR,
+                    target_px,
+                    _reserved: 0.0,
                     camera_pos: eye.to_array(),
                     tess_factor: tess,
                     model: d.model.to_cols_array_2d(),
                     planes,
+                    mvp: (view_proj * d.model).to_cols_array_2d(),
+                    viewport,
                 }),
             );
             self.slots[slot_i].index_count = dest_idx as u32;
