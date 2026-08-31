@@ -18,6 +18,9 @@ struct TessParams {
     camera_pos: vec3<f32>,
     tess_factor: u32,
     model: mat4x4<f32>,
+    // World-space frustum planes (left, right, bottom, top, near, far),
+    // each normalized so dot(xyz, p) + w is a true signed distance.
+    planes: array<vec4<f32>, 6>,
 }
 
 const MAX_TESS: u32 = 32u;
@@ -134,6 +137,49 @@ fn world_pos(local: vec3<f32>) -> vec3<f32> {
     return (params.model * vec4<f32>(local, 1.0)).xyz;
 }
 
+fn world_dir(local: vec3<f32>) -> vec3<f32> {
+    return (params.model * vec4<f32>(local, 0.0)).xyz;
+}
+
+// Signed distance from `p` to a normalized plane (dot(xyz, p) + w).
+fn plane_dist(p: vec4<f32>, pos: vec3<f32>) -> f32 {
+    return dot(p.xyz, pos) + p.w;
+}
+
+// True if the bounding sphere (center, radius) lies fully outside any
+// single frustum plane, i.e. is guaranteed not to touch the screen.
+fn frustum_reject(center: vec3<f32>, radius: f32) -> bool {
+    for (var i = 0u; i < 6u; i++) {
+        if plane_dist(params.planes[i], center) < -radius {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Small negative bias so we don't cull triangles right at the silhouette
+// edge, where interpolated vertex normals can be slightly off from the
+// true geometric facing direction.
+const BACKFACE_BIAS: f32 = 0.10;
+
+// True if the triangle's outward-facing normal points away from the
+// camera by more than BACKFACE_BIAS, i.e. it would be backface-culled by
+// the rasterizer regardless of how much detail we generate for it.
+fn is_backface(a_nrm: vec3<f32>, b_nrm: vec3<f32>, c_nrm: vec3<f32>, center: vec3<f32>) -> bool {
+    let n = world_dir(a_nrm + b_nrm + c_nrm);
+    let nlen = length(n);
+    if nlen < 1e-6 {
+        return false;
+    }
+    let to_cam = params.camera_pos - center;
+    let vlen = length(to_cam);
+    if vlen < 1e-6 {
+        return false;
+    }
+    let facing = dot(n / nlen, to_cam / vlen);
+    return facing < -BACKFACE_BIAS;
+}
+
 fn tess_from_dist(world: vec3<f32>) -> u32 {
     let dist = length(world - params.camera_pos);
     let span = max(params.lod_far - params.lod_near, 1e-3);
@@ -247,15 +293,34 @@ fn tess_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let b = load_ctrl(i1);
     let c = load_ctrl(i2);
 
+    let aw = world_pos(a.pos);
+    let bw = world_pos(b.pos);
+    let cw = world_pos(c.pos);
+    let center = (aw + bw + cw) / 3.0;
+    let cap = tess_cap();
+    let vbase = tri * verts_per_tri(cap);
+    let ibase = tri * idx_per_tri(cap);
+
+    // Skip triangles that can't possibly reach the screen: fully outside
+    // the camera frustum, or facing away from the camera. Both checks are
+    // cheap (a handful of dot products) compared to the O(t^2) subdivision
+    // loop below, which is what actually costs GPU time.
+    let radius = max(max(distance(center, aw), distance(center, bw)), distance(center, cw))
+        + abs(params.scale) + 1e-4;
+    if frustum_reject(center, radius) || is_backface(a.nrm, b.nrm, c.nrm, center) {
+        let pad_n = idx_per_tri(cap);
+        let degener = vbase;
+        for (var p = 0u; p < pad_n; p++) {
+            dst_idx[ibase + p] = degener;
+        }
+        return;
+    }
+
     let te_ab = tess_from_dist(world_pos((a.pos + b.pos) * 0.5));
     let te_bc = tess_from_dist(world_pos((b.pos + c.pos) * 0.5));
     let te_ca = tess_from_dist(world_pos((c.pos + a.pos) * 0.5));
-    let t_in = tess_from_dist(world_pos((a.pos + b.pos + c.pos) / 3.0));
+    let t_in = tess_from_dist(center);
     let t = max(max(max(te_ab, te_bc), te_ca), max(t_in, 1u));
-    let cap = tess_cap();
-
-    let vbase = tri * verts_per_tri(cap);
-    let ibase = tri * idx_per_tri(cap);
 
     for (var i = 0u; i <= t; i++) {
         for (var j = 0u; j <= (t - i); j++) {

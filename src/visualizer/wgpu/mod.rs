@@ -1936,6 +1936,7 @@ impl WgpuVisualizer {
             &self.textures,
             &draws,
             eye,
+            view_proj,
         );
 
         // Shadow pass (unchanged).
