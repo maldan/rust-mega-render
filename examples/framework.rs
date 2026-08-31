@@ -52,6 +52,8 @@ pub trait Demo {
     }
     fn build_scene() -> Scene;
     fn configure(_visualizer: &mut WgpuVisualizer) {}
+    /// Called once after the GPU device exists. Bake procedural maps here.
+    fn on_gpu(_visualizer: &mut WgpuVisualizer, _scene: &mut Scene) {}
     fn init_ui(ui: &mut Ui) {
         ui.load_builtin_icons();
     }
@@ -500,6 +502,7 @@ impl<D: Demo> Host<D> {
         );
         visualizer.ensure_target(vp.0, vp.1);
         D::configure(&mut visualizer);
+        D::on_gpu(&mut visualizer, &mut self.scene);
 
         let mut ui_renderer = UiRenderer::new(&device, &queue, format, &self.ui);
         ui_renderer.set_viewport(&queue, width as f32, height as f32);

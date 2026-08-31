@@ -144,6 +144,8 @@ impl HeightMode {
             Self::Parallax => "Parallax",
         }
     }
+
+    pub const LABELS: [&'static str; 2] = ["Tessellation", "Parallax"];
 }
 
 /// LUT index for Mari UDIM in a 10×10 tile grid, or `None` if out of range.

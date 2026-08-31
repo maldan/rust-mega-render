@@ -43,6 +43,10 @@ name = "tess_demo"
 path = "examples/tess_demo.rs"
 
 [[example]]
+name = "texgen_demo"
+path = "examples/texgen_demo.rs"
+
+[[example]]
 name = "hud_demo"
 path = "examples/hud_demo.rs"
 

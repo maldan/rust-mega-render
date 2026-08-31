@@ -1581,6 +1581,14 @@ impl WgpuVisualizer {
         self.render_inner(scene, aspect, Some(color));
     }
 
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
     /// GPU texture for a scene [`Texture`] after [`Visualizer::sync`].
     ///
     /// When [`Texture::gpu_resident`] is set, this resource includes `STORAGE_BINDING`
