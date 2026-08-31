@@ -12,7 +12,7 @@ const PARAMS_SIZE: u64 = 272;
 struct TessParamsGpu {
     tri_count: u32,
     scale: f32,
-    /// Target on-screen edge length in pixels (see [`crate::TessSettings`]).
+    /// Pixel budget for projected edges and leftover height error.
     target_px: f32,
     _reserved: f32,
     camera_pos: [f32; 3],
@@ -333,6 +333,7 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
 pub fn wants_tess(d: &DrawItem) -> bool {
     d.height_key.is_some()
         && d.displacement_scale > 0.0
+        && d.height_mode == crate::HeightMode::Tessellate
         && d.skin_key.is_none()
         && !d.is_hair
         && !d.is_udim

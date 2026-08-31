@@ -1,7 +1,7 @@
 use super::Visualizer;
 use crate::{
-    DebugView, DualQuat, Handle, MaterialMaps, Mesh, PostProcessSettings, Scene, ShadowFilter,
-    ShadowSettings, SkinningMode, Texture, TessSettings,
+    DebugView, DualQuat, Handle, HeightMode, MaterialMaps, Mesh, PostProcessSettings, Scene,
+    ShadowFilter, ShadowSettings, SkinningMode, Texture, TessSettings,
 };
 use crate::material::{first_udim_tile, udim_lut_index};
 use glam::{Mat4, Vec3};
@@ -34,6 +34,13 @@ const OBJECT_STRIDE: u64 = OBJECT_UBO_SIZE;
 const SHADOW_EXTENT: f32 = 14.0;
 const UDIM_LUT_VEC4: usize = 25;
 const UDIM_MAX_LAYERS: u32 = 16;
+type ObjectMapKey = [(u32, u32); 4];
+const DEFAULT_MAP_SLOTS: ObjectMapKey = [
+    (u32::MAX, 0),
+    (u32::MAX, 1),
+    (u32::MAX, 2),
+    (u32::MAX, 3),
+];
 
 /// Texels per joint: mat4 columns (LBS) or dual-quat real+dual (DQS).
 fn bone_stride(mode: SkinningMode) -> u32 {
@@ -47,6 +54,15 @@ fn bone_stride(mode: SkinningMode) -> u32 {
 fn bone_tex_width(joint_count: usize, mode: SkinningMode) -> u32 {
     let w = joint_count.max(1).min(MAX_BONES) as u32 * bone_stride(mode);
     w.div_ceil(16) * 16
+}
+
+fn object_map_key(d: &DrawItem) -> ObjectMapKey {
+    [
+        d.albedo_key.unwrap_or(DEFAULT_MAP_SLOTS[0]),
+        d.normal_key.unwrap_or(DEFAULT_MAP_SLOTS[1]),
+        d.mr_key.unwrap_or(DEFAULT_MAP_SLOTS[2]),
+        d.height_key.unwrap_or(DEFAULT_MAP_SLOTS[3]),
+    ]
 }
 
 #[repr(C)]
@@ -151,6 +167,8 @@ struct ObjectUniforms {
     hair0: [f32; 4],
     /// Hair-only: rgb = secondary tint, w = secondary strength.
     hair1: [f32; 4],
+    /// x = world-unit height scale, y = POM steps, z = 1 if parallax else 0.
+    height: [f32; 4],
 }
 
 #[repr(C)]
@@ -211,6 +229,7 @@ struct DrawItem {
     height_key: Option<(u32, u32)>,
     displacement_scale: f32,
     tess_factor: u32,
+    height_mode: HeightMode,
 }
 
 /// Per-skin bone palette texture (RGBA32F, row0=current, row1=prev).
@@ -324,8 +343,8 @@ pub struct WgpuVisualizer {
     object_buf: wgpu::Buffer,
     object_slots: u64,
     default_object_bg: wgpu::BindGroup,
-    /// Material bind groups keyed by albedo/normal/MR texture keys.
-    object_material_bgs: HashMap<[(u32, u32); 3], wgpu::BindGroup>,
+    /// Material bind groups keyed by albedo/normal/MR/height texture keys.
+    object_material_bgs: HashMap<ObjectMapKey, wgpu::BindGroup>,
     default_udim_bg: wgpu::BindGroup,
     udim_gpu: HashMap<(u32, u32), GpuUdimPacked>,
     _udim_dummy_albedo: wgpu::Texture,
@@ -604,6 +623,16 @@ impl WgpuVisualizer {
                     binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
                     count: None,
                 },
             ],
@@ -1091,6 +1120,7 @@ impl WgpuVisualizer {
             &white.view,
             &flat_normal.view,
             &default_mr.view,
+            &white.view,
             &sampler,
         );
         let (udim_dummy_albedo, udim_dummy_albedo_view) =
@@ -1210,6 +1240,7 @@ impl WgpuVisualizer {
             &self.white.view,
             &self.flat_normal.view,
             &self.default_mr.view,
+            &self.white.view,
             &self.sampler,
         );
         let albedo_view = self._udim_dummy_albedo.create_view(&array_view_desc());
@@ -1692,6 +1723,7 @@ impl WgpuVisualizer {
                 height_key,
                 displacement_scale,
                 tess_factor,
+                height_mode,
             ) = match node.material.and_then(|m| scene.materials.get(m).map(|mat| (m, mat))) {
                     Some((mat_h, mat)) => {
                         let (hair0, hair1, tip_fade, is_hair, soft_blend, cutout_fringe) =
@@ -1755,6 +1787,7 @@ impl WgpuVisualizer {
                             mat.height.map(|h| h.key()),
                             mat.displacement_scale,
                             mat.tess_factor.max(1),
+                            mat.height_mode,
                         )
                     }
                     None => (
@@ -1773,6 +1806,7 @@ impl WgpuVisualizer {
                         None,
                         0.0,
                         1,
+                        HeightMode::Tessellate,
                     ),
                 };
             let mut skin_key = None;
@@ -1805,6 +1839,7 @@ impl WgpuVisualizer {
                 height_key,
                 displacement_scale,
                 tess_factor,
+                height_mode,
             });
         }
 
@@ -1838,6 +1873,21 @@ impl WgpuVisualizer {
                 prev_model: prev_model.to_cols_array_2d(),
                 hair0: d.hair0,
                 hair1: d.hair1,
+                height: [
+                    d.displacement_scale,
+                    d.tess_factor.max(1) as f32,
+                    if d.height_mode == HeightMode::Parallax
+                        && d.height_key.is_some()
+                        && d.displacement_scale > 0.0
+                        && !d.is_hair
+                        && !d.is_udim
+                    {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    0.0,
+                ],
             };
             self.queue
                 .write_buffer(&self.object_buf, base, bytemuck::bytes_of(&uniforms));
@@ -1885,14 +1935,9 @@ impl WgpuVisualizer {
             &debug.tris_overlay,
         );
 
-        let default_maps = ((u32::MAX, 0), (u32::MAX, 1), (u32::MAX, 2));
         for d in &draws {
-            let cache_key = [
-                d.albedo_key.unwrap_or(default_maps.0),
-                d.normal_key.unwrap_or(default_maps.1),
-                d.mr_key.unwrap_or(default_maps.2),
-            ];
-            if cache_key == [default_maps.0, default_maps.1, default_maps.2] {
+            let cache_key = object_map_key(d);
+            if cache_key == DEFAULT_MAP_SLOTS {
                 continue;
             }
             if self.object_material_bgs.contains_key(&cache_key) {
@@ -1913,6 +1958,11 @@ impl WgpuVisualizer {
                 .and_then(|k| self.textures.get(&k))
                 .map(|t| &t.view)
                 .unwrap_or(&self.default_mr.view);
+            let height_view = d
+                .height_key
+                .and_then(|k| self.textures.get(&k))
+                .map(|t| &t.view)
+                .unwrap_or(&self.white.view);
             let bg = object_bind_group(
                 &self.device,
                 &self.object_bind_layout,
@@ -1920,6 +1970,7 @@ impl WgpuVisualizer {
                 albedo_view,
                 normal_view,
                 mr_view,
+                height_view,
                 &self.sampler,
             );
             self.object_material_bgs.insert(cache_key, bg);
@@ -1966,12 +2017,8 @@ impl WgpuVisualizer {
                 let Some(mesh) = self.meshes.get(&d.mesh_key) else {
                     continue;
                 };
-                let cache_key = [
-                    d.albedo_key.unwrap_or(default_maps.0),
-                    d.normal_key.unwrap_or(default_maps.1),
-                    d.mr_key.unwrap_or(default_maps.2),
-                ];
-                let bg = if cache_key == [default_maps.0, default_maps.1, default_maps.2] {
+                let cache_key = object_map_key(d);
+                let bg = if cache_key == DEFAULT_MAP_SLOTS {
                     &self.default_object_bg
                 } else {
                     &self.object_material_bgs[&cache_key]
@@ -2081,7 +2128,6 @@ impl WgpuVisualizer {
                     &self.object_material_bgs,
                     &self.identity_bone_bg,
                     &self.skin_bones,
-                    default_maps,
                     &draws,
                     false,
                 );
@@ -2093,7 +2139,6 @@ impl WgpuVisualizer {
                     &self.object_material_bgs,
                     &self.identity_bone_bg,
                     &self.skin_bones,
-                    default_maps,
                     &draws,
                 );
                 pass.set_pipeline(&self.wire_mesh_pipeline);
@@ -2105,7 +2150,6 @@ impl WgpuVisualizer {
                     &self.object_material_bgs,
                     &self.identity_bone_bg,
                     &self.skin_bones,
-                    default_maps,
                     &draws,
                     false,
                 );
@@ -2117,7 +2161,6 @@ impl WgpuVisualizer {
                     &self.object_material_bgs,
                     &self.identity_bone_bg,
                     &self.skin_bones,
-                    default_maps,
                     &draws,
                 );
             } else {
@@ -2130,7 +2173,6 @@ impl WgpuVisualizer {
                     &self.object_material_bgs,
                     &self.identity_bone_bg,
                     &self.skin_bones,
-                    default_maps,
                     &draws,
                     true,
                 );
@@ -2193,7 +2235,6 @@ impl WgpuVisualizer {
                             &self.object_material_bgs,
                             &self.identity_bone_bg,
                             &self.skin_bones,
-                            default_maps,
                             i,
                             d,
                         );
@@ -2210,7 +2251,6 @@ impl WgpuVisualizer {
                             &self.object_material_bgs,
                             &self.identity_bone_bg,
                             &self.skin_bones,
-                            default_maps,
                             i,
                             d,
                         );
@@ -2227,7 +2267,6 @@ impl WgpuVisualizer {
                             &self.object_material_bgs,
                             &self.identity_bone_bg,
                             &self.skin_bones,
-                            default_maps,
                             i,
                             d,
                         );
@@ -2247,7 +2286,6 @@ impl WgpuVisualizer {
                             &self.object_material_bgs,
                             &self.identity_bone_bg,
                             &self.skin_bones,
-                            default_maps,
                             i,
                             d,
                         );
@@ -3053,10 +3091,9 @@ fn draw_mesh_items(
     meshes: &HashMap<(u32, u32), GpuMesh>,
     tess: &tess::TessPass,
     default_object_bg: &wgpu::BindGroup,
-    object_material_bgs: &HashMap<[(u32, u32); 3], wgpu::BindGroup>,
+    object_material_bgs: &HashMap<ObjectMapKey, wgpu::BindGroup>,
     identity_bone_bg: &wgpu::BindGroup,
     skin_bones: &HashMap<(u32, u32), GpuSkinBones>,
-    default_maps: ((u32, u32), (u32, u32), (u32, u32)),
     draws: &[DrawItem],
     skip_udim: bool,
 ) {
@@ -3070,12 +3107,8 @@ fn draw_mesh_items(
         let Some(mesh) = meshes.get(&d.mesh_key) else {
             continue;
         };
-        let cache_key = [
-            d.albedo_key.unwrap_or(default_maps.0),
-            d.normal_key.unwrap_or(default_maps.1),
-            d.mr_key.unwrap_or(default_maps.2),
-        ];
-        let bg = if cache_key == [default_maps.0, default_maps.1, default_maps.2] {
+        let cache_key = object_map_key(d);
+        let bg = if cache_key == DEFAULT_MAP_SLOTS {
             default_object_bg
         } else {
             &object_material_bgs[&cache_key]
@@ -3136,10 +3169,9 @@ fn draw_hair_items(
     pass: &mut wgpu::RenderPass<'_>,
     meshes: &HashMap<(u32, u32), GpuMesh>,
     default_object_bg: &wgpu::BindGroup,
-    object_material_bgs: &HashMap<[(u32, u32); 3], wgpu::BindGroup>,
+    object_material_bgs: &HashMap<ObjectMapKey, wgpu::BindGroup>,
     identity_bone_bg: &wgpu::BindGroup,
     skin_bones: &HashMap<(u32, u32), GpuSkinBones>,
-    default_maps: ((u32, u32), (u32, u32), (u32, u32)),
     draws: &[DrawItem],
 ) {
     for (i, d) in draws.iter().enumerate() {
@@ -3153,7 +3185,6 @@ fn draw_hair_items(
             object_material_bgs,
             identity_bone_bg,
             skin_bones,
-            default_maps,
             i,
             d,
         );
@@ -3164,22 +3195,17 @@ fn draw_hair_item(
     pass: &mut wgpu::RenderPass<'_>,
     meshes: &HashMap<(u32, u32), GpuMesh>,
     default_object_bg: &wgpu::BindGroup,
-    object_material_bgs: &HashMap<[(u32, u32); 3], wgpu::BindGroup>,
+    object_material_bgs: &HashMap<ObjectMapKey, wgpu::BindGroup>,
     identity_bone_bg: &wgpu::BindGroup,
     skin_bones: &HashMap<(u32, u32), GpuSkinBones>,
-    default_maps: ((u32, u32), (u32, u32), (u32, u32)),
     i: usize,
     d: &DrawItem,
 ) {
     let Some(mesh) = meshes.get(&d.mesh_key) else {
         return;
     };
-    let cache_key = [
-        d.albedo_key.unwrap_or(default_maps.0),
-        d.normal_key.unwrap_or(default_maps.1),
-        d.mr_key.unwrap_or(default_maps.2),
-    ];
-    let bg = if cache_key == [default_maps.0, default_maps.1, default_maps.2] {
+    let cache_key = object_map_key(d);
+    let bg = if cache_key == DEFAULT_MAP_SLOTS {
         default_object_bg
     } else {
         &object_material_bgs[&cache_key]
@@ -3635,6 +3661,7 @@ fn object_bind_group(
     albedo: &wgpu::TextureView,
     normal: &wgpu::TextureView,
     mr: &wgpu::TextureView,
+    height: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3664,6 +3691,10 @@ fn object_bind_group(
             wgpu::BindGroupEntry {
                 binding: 4,
                 resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(height),
             },
         ],
     })

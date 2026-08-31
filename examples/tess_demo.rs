@@ -12,7 +12,7 @@ mod framework;
 use framework::{Demo, Host, SCENE_TEX, UiCtx};
 use glam::Vec2;
 use mega_render::{
-    cube, DebugView, Light, Material, Mesh, Node, Scene, Texture, Transform, Visualizer,
+    cube, DebugView, HeightMode, Light, Material, Mesh, Node, Scene, Texture, Transform, Visualizer,
 };
 use mega_ui::{DockNode, DockState, ScrollAxes, TextStyle, Ui};
 
@@ -58,10 +58,19 @@ fn hills(w: u32, h: u32) -> Texture {
         for x in 0..w {
             let u = x as f32 / w as f32;
             let v = y as f32 / h as f32;
+            // Left: rolling hills + noise (needs tess). Right: flat plateau.
             let a = (u * std::f32::consts::TAU * 3.0).sin() * 0.5 + 0.5;
             let b = (v * std::f32::consts::TAU * 2.0).sin() * 0.5 + 0.5;
             let c = ((u * 37.0 + v * 19.0).sin() * 0.5 + 0.5) * 0.25;
-            let n = (a * b * 0.85 + c).clamp(0.0, 1.0);
+            let hills = (a * b * 0.85 + c).clamp(0.0, 1.0);
+            let n = if u < 0.48 {
+                hills
+            } else if u < 0.52 {
+                let t = (u - 0.48) / 0.04;
+                hills * (1.0 - t) + 0.12 * t
+            } else {
+                0.12
+            };
             let g = (n * 255.0) as u8;
             let i = ((y * w + x) * 4) as usize;
             rgba[i] = g;
@@ -195,8 +204,9 @@ impl Demo for TessDemo {
             "Debug" => {
                 let size = ui.available_size();
                 ui.scroll_area("tess_dbg", size, ScrollAxes::Vertical, |ui| {
-                    ui.label("Screen-space LOD: subdivides until each edge is ~target_px long.");
-                    ui.label("Box has no height map → original mesh.");
+                    ui.label("LOD: screen size caps the level; height curvature drops it on flats.");
+                    ui.label("Left hills tess dense, right plateau stays coarse. Box: no height.");
+                    ui.label("Parallax keeps the flat mesh; tessellation moves silhouettes.");
                     ui.separator();
                     ui.label("Tess target (px/edge)");
                     ui.slider("tess_target_px", &mut tess.target_px, 1.0..=64.0);
@@ -210,11 +220,26 @@ impl Demo for TessDemo {
                         **debug_view = DebugView::ALL[idx];
                     }
                     ui.separator();
+                    ui.label("Height mode");
                     if let Some((_, node)) = scene.nodes.iter().find(|(_, n)| n.name == "terrain") {
                         if let Some(mh) = node.material {
                             if let Some(mat) = scene.materials.get_mut(mh) {
+                                let mut idx = HeightMode::ALL
+                                    .iter()
+                                    .position(|m| *m == mat.height_mode)
+                                    .unwrap_or(0);
+                                let labels: Vec<&str> =
+                                    HeightMode::ALL.iter().map(|m| m.label()).collect();
+                                if ui.select("height_mode", &mut idx, &labels).changed() {
+                                    mat.height_mode = HeightMode::ALL[idx];
+                                }
                                 ui.label("Displacement scale");
                                 ui.slider("scale", &mut mat.displacement_scale, 0.0..=6.0);
+                                ui.label("Tess cap / POM steps");
+                                let mut steps = mat.tess_factor as f32;
+                                if ui.slider("tess_factor", &mut steps, 1.0..=32.0).changed() {
+                                    mat.tess_factor = steps.round() as u32;
+                                }
                             }
                         }
                     }

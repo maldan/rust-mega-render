@@ -44,7 +44,10 @@ pub use hud::{Hud, HudId, HudLine, HudOutput, HudQuad, Rect as HudRect};
 pub use ik::{ccd_rotate_joint, quat_from_matrix, translate_bone_world, solve_ik, IkChainDef};
 pub use input::InputFrame;
 pub use light::{DirectionalLight, Light, PointLight};
-pub use material::{HairShading, Material, MaterialBytesError, MaterialFile, MaterialFileMaps, MaterialMaps, ShadingModel};
+pub use material::{
+    HairShading, HeightMode, Material, MaterialBytesError, MaterialFile, MaterialFileMaps,
+    MaterialMaps, ShadingModel,
+};
 pub use mesh::{Mesh, MeshBytesError, MorphTarget};
 pub use node::{Node, Transform};
 pub use post_process::{

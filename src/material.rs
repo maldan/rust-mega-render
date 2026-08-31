@@ -125,6 +125,27 @@ fn remap_udim_slot(
     });
 }
 
+/// How a height map is applied. Tessellation displaces real vertices (correct
+/// silhouettes, extra geometry). Parallax only offsets UVs in the fragment
+/// shader (cheap, silhouette stays the original mesh).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HeightMode {
+    #[default]
+    Tessellate,
+    Parallax,
+}
+
+impl HeightMode {
+    pub const ALL: [Self; 2] = [Self::Tessellate, Self::Parallax];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tessellate => "Tessellation",
+            Self::Parallax => "Parallax",
+        }
+    }
+}
+
 /// LUT index for Mari UDIM in a 10×10 tile grid, or `None` if out of range.
 pub(crate) fn udim_lut_index(udim: u32) -> Option<usize> {
     let n = udim.checked_sub(1001)?;
@@ -152,12 +173,16 @@ pub struct Material {
     /// Curvature for the SSS LUT (0..1). Higher = thinner / softer wrap.
     pub sss_curvature: f32,
     pub maps: MaterialMaps,
-    /// Height map for GPU displacement. `None` or [`Self::displacement_scale`] ≤ 0 skips tessellation.
+    /// Height map for GPU displacement or parallax. `None` or
+    /// [`Self::displacement_scale`] ≤ 0 skips both.
     pub height: Option<Handle<Texture>>,
     /// World-unit height at map value 1. Ignored when [`Self::height`] is `None`.
     pub displacement_scale: f32,
-    /// GPU tessellation level (1..=32). Ignored when height tessellation is off.
+    /// GPU tessellation cap (1..=32), or parallax ray-march steps when
+    /// [`Self::height_mode`] is [`HeightMode::Parallax`].
     pub tess_factor: u32,
+    /// Tessellate vertices vs offset UVs. Ignored when height is off.
+    pub height_mode: HeightMode,
     /// 0 = opaque. If > 0, fragments with albedo alpha below this are discarded (MASK).
     /// Deferred path has no alpha blend; this is the supported transparency mode.
     pub alpha_cutoff: f32,
@@ -182,6 +207,7 @@ impl Material {
             height: None,
             displacement_scale: 0.0,
             tess_factor: 32,
+            height_mode: HeightMode::Tessellate,
             alpha_cutoff: 0.0,
             shading_model: ShadingModel::Standard,
         }
@@ -190,6 +216,14 @@ impl Material {
     pub fn with_height(mut self, map: Handle<Texture>, scale: f32) -> Self {
         self.height = Some(map);
         self.displacement_scale = scale.max(0.0);
+        self.height_mode = HeightMode::Tessellate;
+        self
+    }
+
+    pub fn with_parallax(mut self, map: Handle<Texture>, scale: f32) -> Self {
+        self.height = Some(map);
+        self.displacement_scale = scale.max(0.0);
+        self.height_mode = HeightMode::Parallax;
         self
     }
 

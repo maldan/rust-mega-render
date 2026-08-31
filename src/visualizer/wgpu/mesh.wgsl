@@ -29,6 +29,10 @@ struct ObjectUniforms {
     // rgb = scatter tint, w = curvature (0..1)
     sss: vec4<f32>,
     prev_model: mat4x4<f32>,
+    hair0: vec4<f32>,
+    hair1: vec4<f32>,
+    // x = world-unit height, y = POM steps, z = 1 if parallax
+    height: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
@@ -50,6 +54,7 @@ struct ObjectUniforms {
 @group(1) @binding(7) var mr_arr: texture_2d_array<f32>;
 @group(1) @binding(8) var udim_samp: sampler;
 @group(1) @binding(9) var<uniform> udim_lut: UdimLut;
+@group(1) @binding(10) var height_tex: texture_2d<f32>;
 
 struct UdimLut {
     albedo: array<vec4<u32>, 25>,
@@ -537,14 +542,80 @@ fn wire_gbuf(rgb: vec3<f32>) -> GBufferOut {
 
 @fragment
 fn fs_main(in: VertexOutput) -> GBufferOut {
-    let sampled = textureSample(albedo_tex, samp, in.uv);
-    let mr = textureSample(mr_tex, samp, in.uv);
-    let n_ts = textureSample(normal_tex, samp, in.uv).xyz * 2.0 - 1.0;
+    let uv = parallax_uv(in);
+    let sampled = textureSample(albedo_tex, samp, uv);
+    let mr = textureSample(mr_tex, samp, uv);
+    let n_ts = textureSample(normal_tex, samp, uv).xyz * 2.0 - 1.0;
     let cutoff = object.albedo.a;
     if cutoff > 0.001 && sampled.a < cutoff {
         discard;
     }
     return shade_gbuffer(in, sampled, mr, n_ts);
+}
+
+fn sample_height(uv: vec2<f32>) -> f32 {
+    return textureSampleLevel(height_tex, samp, uv, 0.0).r;
+}
+
+/// Parallax occlusion: walk the height field in tangent space and return the
+/// UV of the first hit. `object.height.x` is world-unit displacement (same
+/// as tessellation); derivatives convert that to UV so the slider matches.
+fn parallax_uv(in: VertexOutput) -> vec2<f32> {
+    let uv = in.uv;
+    if object.height.z < 0.5 {
+        return uv;
+    }
+    let scale = object.height.x;
+    if scale < 1e-6 {
+        return uv;
+    }
+
+    let t = normalize(in.world_tangent.xyz);
+    let n0 = normalize(in.world_normal);
+    let b = cross(n0, t) * in.world_tangent.w;
+    let view = frame.camera_pos.xyz - in.world_pos;
+    let v_ts = vec3(dot(view, t), dot(view, b), dot(view, n0));
+    let vz = max(abs(v_ts.z), 0.08);
+
+    let dpdx_p = dpdx(in.world_pos);
+    let dpdy_p = dpdy(in.world_pos);
+    let duvdx = dpdx(uv);
+    let duvdy = dpdy(uv);
+    // Inverse of screen-space UV Jacobian: world length of one UV unit.
+    let det = duvdx.x * duvdy.y - duvdy.x * duvdx.y;
+    if abs(det) < 1e-12 {
+        return uv;
+    }
+    let pu = (dpdx_p * duvdy.y - dpdy_p * duvdx.y) / det;
+    let pv = (dpdy_p * duvdx.x - dpdx_p * duvdy.x) / det;
+    let world_per_uv = max(length(pu), length(pv));
+    if world_per_uv < 1e-8 {
+        return uv;
+    }
+    let uv_scale = scale / world_per_uv;
+    let delta = (v_ts.xy / vz) * uv_scale;
+
+    let steps = u32(clamp(object.height.y, 4.0, 64.0));
+    let dt = 1.0 / f32(steps);
+    var layer = 1.0;
+    var uv_curr = uv;
+    var uv_prev = uv;
+    var h = sample_height(uv);
+    var h_prev = h;
+    for (var i = 0u; i < steps; i++) {
+        if h >= layer {
+            break;
+        }
+        h_prev = h;
+        uv_prev = uv_curr;
+        layer -= dt;
+        uv_curr -= delta * dt;
+        h = sample_height(uv_curr);
+    }
+    let after = h - layer;
+    let before = h_prev - (layer + dt);
+    let w = after / max(after - before, 1e-5);
+    return mix(uv_curr, uv_prev, clamp(w, 0.0, 1.0));
 }
 
 fn lut_layer(lut: array<vec4<u32>, 25>, uv: vec2<f32>) -> i32 {

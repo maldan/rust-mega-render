@@ -48,6 +48,7 @@ struct ObjectUniforms {
 @group(1) @binding(2) var normal_tex: texture_2d<f32>;
 @group(1) @binding(3) var mr_tex: texture_2d<f32>;
 @group(1) @binding(4) var samp: sampler;
+@group(1) @binding(10) var height_tex: texture_2d<f32>;
 @group(2) @binding(0) var bone_tex: texture_2d<f32>;
 
 struct VertexInput {

@@ -15,7 +15,7 @@ pub trait Visualizer {
     fn shadow_settings(&mut self) -> &mut ShadowSettings;
     /// Post + shadow settings together (avoids double-borrow of the visualizer).
     fn effect_settings(&mut self) -> (&mut PostProcessSettings, &mut ShadowSettings);
-    /// GPU tessellation quality (screen-space edge-length target for height-displaced draws).
+    /// GPU tessellation quality (pixel budget for edge length and height error).
     fn tess_settings(&mut self) -> &mut TessSettings;
     /// Post + shadow + tessellation settings together (avoids double-borrow of the visualizer).
     fn all_settings(&mut self) -> (&mut PostProcessSettings, &mut ShadowSettings, &mut TessSettings);

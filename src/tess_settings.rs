@@ -1,20 +1,19 @@
 //! Visualizer GPU tessellation quality settings (not part of scene/material data).
 //!
 //! [`Material::tess_factor`](crate::Material::tess_factor) still caps how far a
-//! single draw is allowed to subdivide, but the actual level chosen per triangle
-//! edge is driven by [`TessSettings::target_px`]: the tessellator keeps
-//! subdividing until each edge is roughly that many screen pixels long, so
-//! nearby-but-small geometry doesn't get over-tessellated and distant-but-large
-//! geometry still gets enough detail.
+//! single draw is allowed to subdivide. Per-edge level is the minimum of:
+//! screen-space size ([`TessSettings::target_px`]), height-map curvature
+//! (linear interpolant already good enough → stay coarse), and height-texel
+//! span (no extra verts beyond the map).
 
 /// Backend tessellation quality knobs, shared by all height-displaced draws.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TessSettings {
-    /// Target on-screen edge length, in pixels, that the tessellator tries to
-    /// keep sub-triangle edges under. Smaller = denser mesh / higher quality
-    /// / more GPU work; larger = coarser mesh / cheaper. Typical range is
-    /// roughly `4.0` (high quality) to `24.0` (low quality); `8.0..=12.0` is a
-    /// reasonable default for most content.
+    /// Pixel budget for both projected edge length *and* leftover height
+    /// error after linear interpolation. Smaller = denser where the height
+    /// map actually bends / higher quality / more GPU work; larger = coarser.
+    /// Typical range is roughly `4.0` (high quality) to `24.0` (low quality);
+    /// `8.0..=12.0` is a reasonable default for most content.
     ///
     /// This is independent of [`Material::tess_factor`](crate::Material::tess_factor),
     /// which remains a hard per-draw ceiling regardless of how small

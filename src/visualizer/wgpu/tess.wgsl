@@ -13,7 +13,7 @@ const OFF_COLOR: u32 = 18u;
 struct TessParams {
     tri_count: u32,
     scale: f32,
-    // Target on-screen edge length in pixels (see crate::TessSettings).
+    // Pixel budget for projected edges and leftover height error.
     target_px: f32,
     _reserved: f32,
     camera_pos: vec3<f32>,
@@ -205,12 +205,42 @@ fn edge_px(a_local: vec3<f32>, b_local: vec3<f32>) -> f32 {
     return distance(clip_to_px(ca), clip_to_px(cb));
 }
 
-// Subdivisions needed so a `px`-pixel-long edge splits into segments no
-// longer than params.target_px, capped by the per-draw tess_factor.
+// Subdivisions needed so a `px`-pixel-long quantity (edge length or
+// displacement error) fits under params.target_px, capped by tess_factor.
 fn tess_from_px(px: f32) -> u32 {
     let target_edge_px = max(params.target_px, 1.0);
     let level = u32(ceil(px / target_edge_px));
     return clamp(level, 1u, tess_cap());
+}
+
+// Max |height - linear interpolant| along an edge. Flat / linear ramps
+// return ~0, so they don't spend tessellation budget.
+fn height_edge_err(uv0: vec2<f32>, uv1: vec2<f32>) -> f32 {
+    let h0 = sample_h(uv0);
+    let h1 = sample_h(uv1);
+    var err = 0.0;
+    for (var s = 1u; s <= 5u; s++) {
+        let u = f32(s) / 6.0;
+        let hs = sample_h(mix(uv0, uv1, u));
+        err = max(err, abs(hs - mix(h0, h1, u)));
+    }
+    return err;
+}
+
+// Screen-space tess, then drop levels the height map doesn't need.
+// `err_h` is height-unit deviation from linear interpolation; projected
+// to pixels with this edge's px-per-world ratio. Also never finer than
+// the height texture along the edge (extra verts can't see extra texels).
+fn tess_for_edge(a_pos: vec3<f32>, b_pos: vec3<f32>, a_uv: vec2<f32>, b_uv: vec2<f32>, err_h: f32) -> u32 {
+    let px = edge_px(a_pos, b_pos);
+    let screen_t = tess_from_px(px);
+    let world_len = max(distance(a_pos, b_pos), 1e-6);
+    let err_px = abs(err_h) * abs(params.scale) * (px / world_len);
+    let height_t = tess_from_px(err_px);
+    let tex_sz = vec2<f32>(textureDimensions(height_tex, 0));
+    let uv_texels = length((b_uv - a_uv) * tex_sz);
+    let texel_t = clamp(u32(ceil(uv_texels)), 1u, tess_cap());
+    return min(screen_t, min(height_t, texel_t));
 }
 
 fn snap_edge(s: u32, t: u32, e: u32) -> f32 {
@@ -332,14 +362,28 @@ fn tess_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // Adaptive level per edge: keep subdividing until each edge is roughly
-    // params.target_px pixels long on screen. This scales with the actual
-    // on-screen footprint (distance, FOV and viewport all fall out of the
-    // projection), unlike a fixed world-space distance band.
-    let te_ab = tess_from_px(edge_px(a.pos, b.pos));
-    let te_bc = tess_from_px(edge_px(b.pos, c.pos));
-    let te_ca = tess_from_px(edge_px(c.pos, a.pos));
-    let t = max(max(te_ab, te_bc), te_ca);
+    // Per-edge level: screen-space size is a cap; height curvature decides
+    // whether those extra verts are worth it. Shared-edge neighbors see the
+    // same UV/positions so T-junctions stay snapped via snap_edge.
+    let err_ab = height_edge_err(a.uv, b.uv);
+    let err_bc = height_edge_err(b.uv, c.uv);
+    let err_ca = height_edge_err(c.uv, a.uv);
+    let te_ab = tess_for_edge(a.pos, b.pos, a.uv, b.uv, err_ab);
+    let te_bc = tess_for_edge(b.pos, c.pos, b.uv, c.uv, err_bc);
+    let te_ca = tess_for_edge(c.pos, a.pos, c.uv, a.uv, err_ca);
+
+    // Interior bump that misses all three edges: centroid vs planar height.
+    let uv_m = (a.uv + b.uv + c.uv) / 3.0;
+    let h_plan = (sample_h(a.uv) + sample_h(b.uv) + sample_h(c.uv)) / 3.0;
+    let err_in = abs(sample_h(uv_m) - h_plan);
+    let px_in = max(max(edge_px(a.pos, b.pos), edge_px(b.pos, c.pos)), edge_px(c.pos, a.pos));
+    let world_in = max(max(distance(a.pos, b.pos), distance(b.pos, c.pos)), distance(c.pos, a.pos));
+    let te_in = min(
+        tess_from_px(err_in * abs(params.scale) * (px_in / max(world_in, 1e-6))),
+        tess_from_px(px_in),
+    );
+
+    let t = max(max(te_ab, te_bc), max(te_ca, te_in));
 
     for (var i = 0u; i <= t; i++) {
         for (var j = 0u; j <= (t - i); j++) {
