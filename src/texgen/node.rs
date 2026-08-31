@@ -84,6 +84,67 @@ impl NodeKind {
             Self::GrayToColor | Self::ColorToGray | Self::Invert
         )
     }
+
+    pub(crate) fn to_u8(self) -> u8 {
+        match self {
+            Self::Output => 0,
+            Self::Color => 1,
+            Self::Noise => 2,
+            Self::Blend => 3,
+            Self::Gradient => 4,
+            Self::Levels => 5,
+            Self::HeightToNormal => 6,
+            Self::Curvature => 7,
+            Self::GrayToColor => 8,
+            Self::ColorToGray => 9,
+            Self::ColorRamp => 10,
+            Self::Lines => 11,
+            Self::Distort => 12,
+            Self::Checker => 13,
+            Self::Tile => 14,
+            Self::Bricks => 15,
+            Self::FloodFill => 16,
+            Self::Invert => 17,
+            Self::Warp => 18,
+            Self::DirectionalWarp => 19,
+            Self::Blur => 20,
+            Self::SlopeBlur => 21,
+            Self::Shape => 22,
+            Self::Transform => 23,
+            Self::TileSampler => 24,
+        }
+    }
+
+    pub(crate) fn from_u8(id: u8) -> Option<Self> {
+        Some(match id {
+            0 => Self::Output,
+            1 => Self::Color,
+            2 => Self::Noise,
+            3 => Self::Blend,
+            4 => Self::Gradient,
+            5 => Self::Levels,
+            6 => Self::HeightToNormal,
+            7 => Self::Curvature,
+            8 => Self::GrayToColor,
+            9 => Self::ColorToGray,
+            10 => Self::ColorRamp,
+            11 => Self::Lines,
+            12 => Self::Distort,
+            13 => Self::Checker,
+            14 => Self::Tile,
+            15 => Self::Bricks,
+            16 => Self::FloodFill,
+            17 => Self::Invert,
+            18 => Self::Warp,
+            19 => Self::DirectionalWarp,
+            20 => Self::Blur,
+            21 => Self::SlopeBlur,
+            22 => Self::Shape,
+            23 => Self::Transform,
+            24 => Self::TileSampler,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -505,10 +566,12 @@ impl Default for CheckerParams {
 pub struct TileParams {
     pub x_amount: i32,
     pub y_amount: i32,
-    /// Mortar width as fraction of average cell (0..0.4).
+    /// Mortar width as fraction of the smaller average cell (same in U and V).
     pub gap: f32,
-    /// How uneven cell sizes are (0 = regular grid, 1 = wild).
-    pub size_rand: f32,
+    /// How uneven column widths are (0 = regular, 1 = wild).
+    pub size_rand_x: f32,
+    /// How uneven row heights are (0 = regular, 1 = wild).
+    pub size_rand_y: f32,
     /// Horizontal row stagger (brick bond), 0..1.
     pub offset: f32,
     /// Corner roundness 0..1.
@@ -522,7 +585,8 @@ impl Default for TileParams {
             x_amount: 4,
             y_amount: 4,
             gap: 0.12,
-            size_rand: 0.65,
+            size_rand_x: 0.65,
+            size_rand_y: 0.65,
             offset: 0.35,
             roundness: 0.35,
             seed: 1.0,

@@ -56,7 +56,7 @@ pub use post_process::{
     EnvMapSettings, FogSettings, FxaaSettings, GrainSettings, MotionBlurSettings,
     PostProcessSettings, SsgiQuality, SsgiSettings, SsrSettings, TonemapSettings, VignetteSettings,
 };
-pub use primitives::{cube, cube_subdiv, plane, sphere};
+pub use primitives::{cube, cube_subdiv, plane, plane_tiles, sphere};
 pub use scene::{Scene, SkeletonDebugOpts};
 pub use shadow::{ShadowFilter, ShadowSettings};
 pub use skin::{

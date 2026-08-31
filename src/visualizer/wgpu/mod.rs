@@ -1998,6 +1998,7 @@ impl WgpuVisualizer {
             &draws,
             eye,
             view_proj,
+            self.tess.enabled,
             self.tess.sanitized_target_px(),
             self.size,
         );

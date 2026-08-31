@@ -134,6 +134,46 @@ pub fn cube_subdiv(size: f32, segs: u32) -> Mesh {
     Mesh::new(positions, normals, uvs, indices)
 }
 
+/// Meter-square tiles on XZ (`y = 0`), each with `segs×segs` quads and its own 0–1 UV.
+/// The brick (and any other 0–1 procedural) pattern repeats once per tile instead of
+/// stretching across the whole floor. Centered on the origin.
+pub fn plane_tiles(tiles_x: u32, tiles_z: u32, segs: u32) -> Mesh {
+    let tiles_x = tiles_x.max(1);
+    let tiles_z = tiles_z.max(1);
+    let segs = segs.max(1);
+    let cols = segs + 1;
+    let ox = -(tiles_x as f32) * 0.5;
+    let oz = -(tiles_z as f32) * 0.5;
+    let n = [0.0, 1.0, 0.0];
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut uvs = Vec::new();
+    let mut indices = Vec::new();
+    for tz in 0..tiles_z {
+        for tx in 0..tiles_x {
+            let x0 = ox + tx as f32;
+            let z0 = oz + tz as f32;
+            let base = positions.len() as u32;
+            for v in 0..cols {
+                let tv = v as f32 / segs as f32;
+                for u in 0..cols {
+                    let tu = u as f32 / segs as f32;
+                    positions.push([x0 + tu, 0.0, z0 + 1.0 - tv]);
+                    normals.push(n);
+                    uvs.push([tu, tv]);
+                }
+            }
+            for y in 0..segs {
+                for x in 0..segs {
+                    let i = base + y * cols + x;
+                    indices.extend_from_slice(&[i, i + 1, i + cols + 1, i, i + cols + 1, i + cols]);
+                }
+            }
+        }
+    }
+    Mesh::new(positions, normals, uvs, indices)
+}
+
 fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     [
         a[0] + (b[0] - a[0]) * t,

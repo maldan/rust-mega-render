@@ -467,11 +467,12 @@ fn eval_tile(u: f32, v: f32) -> f32 {
     let nx = i32(p.octaves);
     let ny = i32(p.kind);
     let gap = p.f0;
-    let size_rand = p.f1;
+    let size_rand_x = p.f1;
     let offset = p.f2;
     let roundness = p.f3;
+    let size_rand_y = p.f4;
     let seed = p.seed;
-    let row = find_split_w(ny, v, seed + 3.0, size_rand);
+    let row = find_split_w(ny, v, seed + 3.0, size_rand_y);
     let ri = i32(row.x);
     let v0 = row.y;
     let v1 = row.z;
@@ -483,14 +484,15 @@ fn eval_tile(u: f32, v: f32) -> f32 {
         row_shift = offset * 0.15 * (hash2(ri, 0, seed + 91.0) - 0.5);
     }
     let u_shift = rem_euclid_f(u - row_shift, 1.0);
-    let col = find_split_w(nx, u_shift, seed + 17.0 + f32(ri) * 31.0, size_rand);
+    let col = find_split_w(nx, u_shift, seed + 17.0 + f32(ri) * 31.0, size_rand_x);
     let u0 = col.y;
     let u1 = col.z;
     let cell_w = max(u1 - u0, 1e-5);
     let lu = u_shift - u0;
     let lv = v - v0;
-    let gap_u = gap * cell_w;
-    let gap_v = gap * cell_h;
+    let g = gap * min(1.0 / max(f32(nx), 1.0), 1.0 / max(f32(ny), 1.0));
+    let gap_u = g;
+    let gap_v = g;
     let inner_w = max(cell_w - 2.0 * gap_u, 0.0);
     let inner_h = max(cell_h - 2.0 * gap_v, 0.0);
     let hx = inner_w * 0.5;

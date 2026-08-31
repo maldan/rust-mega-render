@@ -9,6 +9,10 @@
 /// Backend tessellation quality knobs, shared by all height-displaced draws.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TessSettings {
+    /// When `false`, GPU tessellation is skipped for every draw even if the
+    /// material has a height map and [`crate::HeightMode::Tessellate`]. The base
+    /// mesh is drawn as-is (albedo/normal/MR still apply). Parallax is unchanged.
+    pub enabled: bool,
     /// Pixel budget for both projected edge length *and* leftover height
     /// error after linear interpolation. Smaller = denser where the height
     /// map actually bends / higher quality / more GPU work; larger = coarser.
@@ -23,7 +27,10 @@ pub struct TessSettings {
 
 impl Default for TessSettings {
     fn default() -> Self {
-        Self { target_px: 10.0 }
+        Self {
+            enabled: true,
+            target_px: 10.0,
+        }
     }
 }
 

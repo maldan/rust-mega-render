@@ -1,4 +1,5 @@
 use crate::material::{HairShading, Material, MaterialMaps, ShadingModel};
+use crate::texgen::{TexGraphBytesError, TexGraphFile};
 use crate::texture::TextureStore;
 
 const MAGIC: &[u8; 4] = b"MAT ";
@@ -15,9 +16,10 @@ const ID_MR: [u8; 4] = *b"MR  ";
 const ID_UALB: [u8; 4] = *b"UALB";
 const ID_UNRM: [u8; 4] = *b"UNRM";
 const ID_UMR: [u8; 4] = *b"UMR ";
+const ID_TEXG: [u8; 4] = *b"TEXG";
 
 /// Recipe from a `MAT ` blob. Texture slots are string ids, not handles.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct MaterialFile {
     pub albedo: [f32; 4],
     pub metallic: f32,
@@ -28,6 +30,8 @@ pub struct MaterialFile {
     pub alpha_cutoff: f32,
     pub shading_model: ShadingModel,
     pub maps: MaterialFileMaps,
+    /// Procedural maps. If set, bake this instead of resolving `maps` ids.
+    pub graph: Option<TexGraphFile>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +65,7 @@ impl Default for MaterialFile {
                 normal: None,
                 metallic_roughness: None,
             },
+            graph: None,
         }
     }
 }
@@ -75,6 +80,8 @@ pub enum MaterialBytesError {
     MixedMaps,
     SizeMismatch,
     BadUtf8,
+    NotProcedural,
+    Graph(TexGraphBytesError),
 }
 
 impl std::fmt::Display for MaterialBytesError {
@@ -88,6 +95,8 @@ impl std::fmt::Display for MaterialBytesError {
             Self::MixedMaps => write!(f, "single and UDIM map chunks in one MAT"),
             Self::SizeMismatch => write!(f, "chunk size does not match payload"),
             Self::BadUtf8 => write!(f, "texture id is not UTF-8"),
+            Self::NotProcedural => write!(f, "MAT has no TEXG graph"),
+            Self::Graph(e) => write!(f, "{e}"),
         }
     }
 }
@@ -126,6 +135,7 @@ impl MaterialFile {
             alpha_cutoff: mat.alpha_cutoff,
             shading_model: mat.shading_model,
             maps,
+            graph: None,
         }
     }
 
@@ -135,6 +145,10 @@ impl MaterialFile {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, MaterialBytesError> {
         from_bytes(bytes)
+    }
+
+    pub fn is_procedural(&self) -> bool {
+        self.graph.is_some()
     }
 
     /// Texture catalog keys referenced by this recipe (order: albedo, normal, MR).
@@ -254,6 +268,9 @@ pub fn to_bytes(file: &MaterialFile) -> Vec<u8> {
             write_udim_chunk(&mut out, ID_UMR, metallic_roughness);
         }
     }
+    if let Some(graph) = &file.graph {
+        write_chunk(&mut out, ID_TEXG, &graph.to_bytes());
+    }
     out
 }
 
@@ -284,6 +301,7 @@ pub fn from_bytes(bytes: &[u8]) -> Result<MaterialFile, MaterialBytesError> {
     let mut saw_ualb = false;
     let mut saw_unrm = false;
     let mut saw_umr = false;
+    let mut saw_texg = false;
     let mut single = MaterialFileMaps::Single {
         albedo: None,
         normal: None,
@@ -399,6 +417,12 @@ pub fn from_bytes(bytes: &[u8]) -> Result<MaterialFile, MaterialBytesError> {
                 {
                     *metallic_roughness = read_udim(payload)?;
                 }
+            }
+            ID_TEXG => {
+                dup(&mut saw_texg, "TEXG")?;
+                file.graph = Some(
+                    TexGraphFile::from_bytes(payload).map_err(MaterialBytesError::Graph)?,
+                );
             }
             _ => {}
         }
@@ -675,5 +699,27 @@ mod tests {
         bytes.extend(1u16.to_le_bytes());
         bytes.extend(1u16.to_le_bytes());
         assert_eq!(err(MaterialFile::from_bytes(&bytes)), MaterialBytesError::Quantized);
+    }
+
+    #[test]
+    fn texg_roundtrip() {
+        use crate::texgen::{NodeKind, TexGraph, TexGraphFile};
+
+        let mut g = TexGraph::new();
+        let out = g.output_id.clone();
+        let n = g.add(NodeKind::Noise);
+        g.connect(&n, "out", &out, "roughness");
+        let mut file = MaterialFile::default();
+        file.albedo = [0.2, 0.3, 0.4, 1.0];
+        file.graph = Some(TexGraphFile {
+            resolution: 256,
+            graph: g,
+        });
+        let back = MaterialFile::from_bytes(&file.to_bytes()).unwrap();
+        assert!(back.is_procedural());
+        assert_eq!(back.albedo, [0.2, 0.3, 0.4, 1.0]);
+        let g = back.graph.unwrap();
+        assert_eq!(g.resolution, 256);
+        assert_eq!(g.graph.links.len(), 1);
     }
 }

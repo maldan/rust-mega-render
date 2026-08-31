@@ -83,6 +83,46 @@ impl TexGraph {
     pub fn output(&self) -> Option<&GraphNode> {
         self.nodes.iter().find(|n| n.id == self.output_id)
     }
+
+    /// Rebuild a graph from a file. `next` is the next node serial (`n{next}`).
+    pub fn from_decoded(
+        nodes: Vec<GraphNode>,
+        links: Vec<TexLink>,
+        output_id: String,
+        next: u64,
+    ) -> Result<Self, super::ser::TexGraphBytesError> {
+        use super::ser::TexGraphBytesError;
+        if !nodes.iter().any(|n| n.kind == NodeKind::Output) {
+            return Err(TexGraphBytesError::NoOutput);
+        }
+        let output_id = if nodes.iter().any(|n| n.id == output_id) {
+            output_id
+        } else {
+            nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::Output)
+                .map(|n| n.id.clone())
+                .expect("output checked")
+        };
+        let mut next = next.max(1);
+        for n in &nodes {
+            if let Some(rest) = n.id.strip_prefix('n') {
+                if let Ok(v) = rest.parse::<u64>() {
+                    next = next.max(v + 1);
+                }
+            }
+        }
+        Ok(Self {
+            nodes,
+            links,
+            output_id,
+            next,
+        })
+    }
+
+    pub fn next_serial(&self) -> u64 {
+        self.next
+    }
 }
 
 pub fn find_link<'a>(links: &'a [TexLink], to_node: &str, to_port: &str) -> Option<&'a TexLink> {
@@ -294,7 +334,8 @@ fn node_param_hash(node: &GraphNode) -> u64 {
             node.tile.x_amount.hash(&mut h);
             node.tile.y_amount.hash(&mut h);
             node.tile.gap.to_bits().hash(&mut h);
-            node.tile.size_rand.to_bits().hash(&mut h);
+            node.tile.size_rand_x.to_bits().hash(&mut h);
+            node.tile.size_rand_y.to_bits().hash(&mut h);
             node.tile.offset.to_bits().hash(&mut h);
             node.tile.roundness.to_bits().hash(&mut h);
             node.tile.seed.to_bits().hash(&mut h);

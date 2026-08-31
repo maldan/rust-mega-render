@@ -72,6 +72,7 @@ aligned = (8 + size + 3) & !3
 | `UALB` | список `(udim, id-строка)`       | `maps: Udim { albedo }`                         |
 | `UNRM` | список `(udim, id-строка)`       | `maps: Udim { normal }`                         |
 | `UMR ` | список `(udim, id-строка)`       | `maps: Udim { metallic_roughness }`             |
+| `TEXG` | IR процедурного графа           | `graph: Option<TexGraphFile>`                    |
 
 `ShadingModel::Standard` в файл не пишется никак — отсутствие `HAIR` и означает `Standard`.
 
@@ -160,6 +161,29 @@ pad = (4 - (tile_section_bytes % 4)) % 4
 
 Этот pad **входит** в `size` (в отличие от pad чанка на верхнем уровне, который в `size` не входит). `size = 4 + Σ (tile_section_bytes + pad)`. Пустой список — чанк не пишется.
 
+### `TEXG` — процедурный граф
+
+Пишется, только если `MaterialFile.graph` — `Some`. Старый читатель чанк пропускает (неизвестный FourCC). Версия контейнера `MAT ` остаётся 1.
+
+Детект: `file.is_procedural()` / `file.graph.is_some()`.
+
+Код payload: `src/texgen/ser.rs` (`TexGraphFile`). Bake в сцену: `GpuEval::instantiate` — печёт карты из графа, затем копирует PBR/SSS/CUT/HAIR с рецепта на получившийся `Material`.
+
+```
+u32 ir_version     // 1
+u32 resolution     // bake, clamp 64..=2048 при чтении
+u64 next_serial
+u16 output_id_len + utf8
+u32 node_count
+  повторить node_count раз: фиксированный набор полей GraphNode
+  (без preview-слотов), kind как u8, строки как u16 len + utf8,
+  градиент: u16 count + стопы
+u32 link_count
+  для каждой связи: 4 строки (from_node, from_port, to_node, to_port)
+```
+
+Неизвестный `ir_version` — `MaterialBytesError::Graph(UnsupportedVersion)`. Нет Output — `NoOutput`. Карты `ALB `/`NRM `/`MR  ` при процедурном экспорте из генератора не пишутся: пиксели рождаются на bake.
+
 ---
 
 ## На load
@@ -169,7 +193,7 @@ pad = (4 - (tile_section_bytes % 4)) % 4
 Шаги приложения:
 
 1. Распарсить байты в `MaterialFile` (`from_bytes`).
-2. Для каждого id из `file.texture_ids()` (или прямо из `file.maps`) найти текстуру в `TextureStore` через `get_by_id`, либо загрузить её с диска под этим id и вставить (`TextureStore::insert`) — это ответственность вызывающего кода, формат сам текстуры не грузит.
+2. Если `file.is_procedural()`: `GpuEval::instantiate(device, queue, scene, &file)` — карты из графа, скаляры с рецепта. Иначе для каждого id из `file.texture_ids()` найти текстуру в `TextureStore`.
 3. Собрать `Material { albedo, metallic, roughness, sss_*, alpha_cutoff, shading_model, maps }` вручную, подставив в `MaterialMaps::Single`/`Udim` уже полученные `Handle<Texture>` (или `None`, если id не нашёлся).
 
 Обратный путь: `Material::to_bytes(&self, &TextureStore)` берёт хендлы из `self.maps`, резолвит их в `TextureStore` через `Texture.id` и пишет `MaterialFile` → байты. Текстура без `id` (`""`) в файл не попадает — слот пишется как отсутствующий.
@@ -301,6 +325,8 @@ match MaterialFile::from_bytes(&bytes) {
 | `MixedMaps` | в файле одновременно есть одиночные (`ALB`/`NRM`/`MR`) и UDIM (`UALB`/`UNRM`/`UMR`) чанки |
 | `SizeMismatch` | длина `HAIR`/строки/UDIM-списка не сходится с ожидаемой |
 | `BadUtf8` | id текстуры — не валидный UTF-8 |
+| `NotProcedural` | `instantiate` вызван без чанка `TEXG` |
+| `Graph(_)` | битый / неизвестный IR внутри `TEXG` |
 
 ---
 
@@ -315,6 +341,7 @@ CUT:   size = 4
 HAIR:  size = 44
 ALB/NRM/MR:  size = 2 + id_len
 UALB/UNRM/UMR: size = 4 + Σ (6 + id_len + pad_to_4)
+TEXG:  size = длина IR (`TexGraphFile::to_bytes`)
 ```
 
 ---

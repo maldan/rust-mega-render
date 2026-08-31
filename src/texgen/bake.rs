@@ -7,6 +7,8 @@ use crate::texture::Texture;
 
 use super::gpu::GpuEval;
 use super::graph::TexGraph;
+use crate::io::material::MaterialBytesError;
+use crate::MaterialFile;
 /// Insert albedo / MR / normal / height textures and a standard PBR material.
 pub fn insert_maps(
     scene: &mut Scene,
@@ -83,5 +85,30 @@ impl GpuEval {
         insert_maps(
             scene, albedo, mr, normal, height, res, tess, disp, mode,
         )
+    }
+
+    /// Bake a procedural `MAT ` recipe into `scene`. Needs a `TEXG` chunk.
+    pub fn instantiate(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &mut Scene,
+        file: &MaterialFile,
+    ) -> Result<Handle<Material>, MaterialBytesError> {
+        let Some(proc) = &file.graph else {
+            return Err(MaterialBytesError::NotProcedural);
+        };
+        let h = self.bake_into_scene(device, queue, scene, &proc.graph, proc.resolution);
+        if let Some(mat) = scene.materials.get_mut(h) {
+            mat.albedo = file.albedo;
+            mat.metallic = file.metallic;
+            mat.roughness = file.roughness;
+            mat.sss_strength = file.sss_strength;
+            mat.sss_color = file.sss_color;
+            mat.sss_curvature = file.sss_curvature;
+            mat.alpha_cutoff = file.alpha_cutoff;
+            mat.shading_model = file.shading_model;
+        }
+        Ok(h)
     }
 }

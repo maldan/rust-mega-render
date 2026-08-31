@@ -876,9 +876,10 @@ fn pack_params(n: &GraphNode, res: u32) -> NodeParamsGpu {
             g.octaves = t.x_amount.clamp(1, 32) as u32;
             g.kind = t.y_amount.clamp(1, 32) as u32;
             g.f0 = t.gap.clamp(0.0, 0.4);
-            g.f1 = t.size_rand.clamp(0.0, 1.0);
+            g.f1 = t.size_rand_x.clamp(0.0, 1.0);
             g.f2 = t.offset.clamp(0.0, 1.0);
             g.f3 = t.roundness.clamp(0.0, 1.0);
+            g.f4 = t.size_rand_y.clamp(0.0, 1.0);
             g.seed = t.seed;
         }
         NodeKind::Bricks => {

@@ -163,10 +163,14 @@ impl TessPass {
         draws: &[DrawItem],
         eye: Vec3,
         view_proj: Mat4,
+        enabled: bool,
         target_px: f32,
         viewport: (u32, u32),
     ) {
         self.live.clear();
+        if !enabled {
+            return;
+        }
         struct Job {
             bg: wgpu::BindGroup,
             groups: u32,
